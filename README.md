@@ -100,46 +100,18 @@ What Aris **can't** do yet:
 - Multi-environment support (local + remote)
 - Per-provider settings cards with custom model slug support
 
-## Install
+## Get Aris Code
 
 > [!NOTE]
-> Public binaries land at [github.com/kennysarnoski-jarvis/Aris-Code/releases](https://github.com/kennysarnoski-jarvis/Aris-Code/releases) (and via the package managers below). Until the first release ships, build from source — see [Develop](#develop).
+> **No prebuilt binaries yet.** Signed installers (Homebrew cask, winget, AUR, .dmg / .exe / AppImage) are planned but not yet shipped. For now, Aris Code runs from source — three commands on any platform. Watch [github.com/kennysarnoski-jarvis/Aris-Code/releases](https://github.com/kennysarnoski-jarvis/Aris-Code/releases) for the first packaged release.
 
-### macOS (Homebrew)
-
-```bash
-brew install --cask aris-code
-```
-
-### Windows (winget)
-
-```bash
-winget install Aris.ArisCode
-```
-
-### Arch Linux (AUR)
-
-```bash
-yay -S aris-code-bin
-```
-
-### Quick run (without installing)
-
-```bash
-npx aris-code
-```
-
-## Run from source (until binaries ship)
-
-Until the first packaged releases land at [github.com/kennysarnoski-jarvis/Aris-Code/releases](https://github.com/kennysarnoski-jarvis/Aris-Code/releases), the easiest way to start Aris Code is to clone and run it from source. Same three commands on Mac, Linux, or Windows.
-
-**Prerequisites (all platforms):**
+### Prerequisites (all platforms)
 
 - [Bun](https://bun.sh) ≥ 1.3 — `curl -fsSL https://bun.sh/install | bash`
 - Node.js 22+ — install via [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), or your distro's package manager
 - Git
 
-**Then in a terminal:**
+### Clone and run
 
 ```bash
 git clone https://github.com/kennysarnoski-jarvis/Aris-Code.git
