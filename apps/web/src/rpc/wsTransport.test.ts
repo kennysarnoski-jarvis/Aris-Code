@@ -871,9 +871,10 @@ describe("WsTransport", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(attempts).toBe(1);
-    expect(warnSpy).toHaveBeenCalledWith("WebSocket RPC subscription failed", {
-      error: "Git command failed in GitCore.statusDetails",
-    });
+    expect(warnSpy).toHaveBeenCalledWith(
+      "WebSocket RPC subscription failed: Git command failed in GitCore.statusDetails",
+      expect.any(Error),
+    );
     expect(warnSpy).not.toHaveBeenCalledWith(
       "WebSocket RPC subscription disconnected",
       expect.anything(),

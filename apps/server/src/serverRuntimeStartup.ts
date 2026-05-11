@@ -2,6 +2,7 @@ import {
   CommandId,
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  type IsoDateTime,
   type ModelSelection,
   ProjectId,
   ThreadId,
@@ -27,6 +28,7 @@ import { Open } from "./open";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import { OrchestrationReactor } from "./orchestration/Services/OrchestrationReactor";
+import { ProjectionThreadSessionRepository } from "./persistence/Services/ProjectionThreadSessions";
 import { ServerLifecycleEvents } from "./serverLifecycleEvents";
 import { ServerSettingsService } from "./serverSettings";
 import { ServerEnvironment } from "./environment/Services/ServerEnvironment";
@@ -284,6 +286,7 @@ export const makeServerRuntimeStartup = Effect.gen(function* () {
   const lifecycleEvents = yield* ServerLifecycleEvents;
   const serverSettings = yield* ServerSettingsService;
   const serverEnvironment = yield* ServerEnvironment;
+  const projectionThreadSessions = yield* ProjectionThreadSessionRepository;
 
   const commandGate = yield* makeCommandGate;
   const httpListening = yield* Deferred.make<void>();
@@ -319,6 +322,32 @@ export const makeServerRuntimeStartup = Effect.gen(function* () {
           }),
         ),
         Effect.forkScoped,
+      ),
+    );
+
+    // Any session still marked `running`/`starting` from the previous process
+    // is stranded — the provider adapter that owned it is gone. Flip those
+    // rows to `interrupted` BEFORE the reactors start consuming events so the
+    // UI doesn't render a ghost "Working for Xs" for the duration of boot.
+    yield* Effect.logDebug("startup phase: reconciling dangling sessions");
+    yield* runStartupPhase(
+      "sessions.reconcile",
+      Effect.gen(function* () {
+        const updatedAt = new Date().toISOString() as IsoDateTime;
+        const reconciled = yield* projectionThreadSessions.reconcileDanglingSessions({
+          updatedAt,
+        });
+        if (reconciled > 0) {
+          yield* Effect.logInfo("reconciled dangling provider sessions on boot", {
+            count: reconciled,
+          });
+        }
+      }).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("failed to reconcile dangling provider sessions on boot", {
+            detail: error.message ?? String(error),
+          }),
+        ),
       ),
     );
 
@@ -437,7 +466,7 @@ export const makeServerRuntimeStartup = Effect.gen(function* () {
         const startupBrowserTarget = yield* resolveStartupBrowserTarget;
         if (serverConfig.mode !== "desktop") {
           yield* Effect.logInfo(
-            "Authentication required. Open T3 Code using the pairing URL.",
+            "Authentication required. Open Aris Code using the pairing URL.",
           ).pipe(Effect.annotateLogs({ pairingUrl: startupBrowserTarget }));
         }
         yield* runStartupPhase("browser.open", maybeOpenBrowser(startupBrowserTarget));

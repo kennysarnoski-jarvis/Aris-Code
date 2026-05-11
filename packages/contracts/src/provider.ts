@@ -68,6 +68,14 @@ export const ProviderSendTurnInput = Schema.Struct({
   ),
   modelSelection: Schema.optional(ModelSelection),
   interactionMode: Schema.optional(ProviderInteractionMode),
+  /**
+   * Slice 31 — per-message Thinking toggle from Aris Code's composer.
+   * `true`/`false` overrides the server's default; omitted means "use
+   * server default" (currently True). Only the Aris provider reads
+   * this field today; Codex / Claude adapters ignore it (their model
+   * SDKs handle reasoning differently).
+   */
+  enableThinking: Schema.optional(Schema.Boolean),
 });
 export type ProviderSendTurnInput = typeof ProviderSendTurnInput.Type;
 

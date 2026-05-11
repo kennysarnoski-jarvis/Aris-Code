@@ -16,6 +16,7 @@ import ProjectScriptsControl, { type NewProjectScriptInput } from "../ProjectScr
 import { Toggle } from "../ui/toggle";
 import { SidebarTrigger } from "../ui/sidebar";
 import { OpenInPicker } from "./OpenInPicker";
+import { DeepSeekBalancePill } from "./DeepSeekBalancePill";
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -108,6 +109,11 @@ export const ChatHeader = memo(function ChatHeader({
             openInCwd={openInCwd}
           />
         )}
+        {/* DeepSeek balance pill — sits to the left of git status per
+            Slice 33j placement spec. Self-renders null when DeepSeek
+            isn't enabled/activated, so it doesn't take up header
+            space for users who never touch DeepSeek. */}
+        <DeepSeekBalancePill />
         {activeProjectName && (
           <GitActionsControl
             gitCwd={gitCwd}

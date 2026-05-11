@@ -120,7 +120,30 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         projectId: command.projectId,
       });
       const occurredAt = nowIso();
-      return {
+      const events: Array<Omit<OrchestrationEvent, "sequence">> = [];
+
+      // Cascade: soft-delete every non-deleted thread belonging to this project
+      // before marking the project itself deleted. The engine applies these
+      // events sequentially, so projections stay consistent.
+      for (const thread of readModel.threads) {
+        if (thread.projectId !== command.projectId) continue;
+        if (thread.deletedAt !== null) continue;
+        events.push({
+          ...withEventBase({
+            aggregateKind: "thread",
+            aggregateId: thread.id,
+            occurredAt,
+            commandId: command.commandId,
+          }),
+          type: "thread.deleted",
+          payload: {
+            threadId: thread.id,
+            deletedAt: occurredAt,
+          },
+        });
+      }
+
+      events.push({
         ...withEventBase({
           aggregateKind: "project",
           aggregateId: command.projectId,
@@ -132,7 +155,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           projectId: command.projectId,
           deletedAt: occurredAt,
         },
-      };
+      });
+
+      return events;
     }
 
     case "thread.create": {
@@ -379,6 +404,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           runtimeMode: targetThread.runtimeMode,
           interactionMode: targetThread.interactionMode,
           ...(sourceProposedPlan !== undefined ? { sourceProposedPlan } : {}),
+          ...(command.enableThinking !== undefined
+            ? { enableThinking: command.enableThinking }
+            : {}),
           createdAt: command.createdAt,
         },
       };

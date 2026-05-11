@@ -63,6 +63,22 @@ export interface ProjectionThreadSessionRepositoryShape {
   readonly deleteByThreadId: (
     input: DeleteProjectionThreadSessionInput,
   ) => Effect.Effect<void, ProjectionRepositoryError>;
+
+  /**
+   * Boot-time cleanup: find any sessions in a non-terminal status (`running`,
+   * `starting`) and mark them `interrupted` with `active_turn_id = NULL`.
+   *
+   * Rationale: if the server process was killed mid-turn the in-memory
+   * provider session is gone, but the last persisted status is still
+   * `running`. That makes the UI render "Working for Xs" forever after
+   * restart. Nothing will ever transition these rows because the owning
+   * provider adapter is dead, so we reconcile them here instead.
+   *
+   * Returns the number of rows reconciled (for startup logging).
+   */
+  readonly reconcileDanglingSessions: (input: {
+    readonly updatedAt: IsoDateTime;
+  }) => Effect.Effect<number, ProjectionRepositoryError>;
 }
 
 /**

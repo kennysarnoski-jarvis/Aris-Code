@@ -305,6 +305,31 @@ export const ClaudeAI: Icon = (props) => (
   </svg>
 );
 
+// DeepSeek brand mark — a stylized whale silhouette matching the
+// official navy whale-with-tail-flick. Drawn from approximation of
+// the public asset; swap with the official SVG when sourced. Uses
+// `currentColor` so the picker can tint it for ultrathink etc.
+export const DeepSeekIcon: Icon = (props) => (
+  <svg {...props} viewBox="0 0 24 24" fill="none">
+    <path
+      fill="currentColor"
+      d="M21.5 9.7c-.4-.2-.8-.2-1.2-.1-.5.1-1 .3-1.5.6-.4-.7-1-1.3-1.7-1.7-.9-.5-1.9-.8-3-.8-.5 0-1 .1-1.5.2-.3.1-.5.2-.8.3-1-.7-2.2-1.1-3.4-1.1-1.6 0-3.1.6-4.2 1.7-1.1 1.1-1.7 2.6-1.7 4.2 0 1.5.6 3 1.7 4.1 1 1 2.3 1.6 3.7 1.7-.3.5-.5 1-.5 1.6 0 .3.2.5.5.5h12c.3 0 .5-.2.5-.5 0-1.4-.5-2.7-1.4-3.7.6-.4 1.1-.9 1.6-1.5.7-.9 1.1-2 1.1-3.1 0-.6-.1-1.2-.4-1.7-.2-.3-.5-.6-.8-.7zm-7 5.5c-.5 0-.9-.4-.9-.9s.4-.9.9-.9.9.4.9.9-.4.9-.9.9zm6-3.4c-.4.5-.9.9-1.5 1.2.2-.5.3-1 .3-1.6 0-.5-.1-1-.2-1.5.4-.3.9-.5 1.4-.6.2 0 .3-.1.5 0 .1.1.2.2.2.4 0 .8-.3 1.5-.7 2.1z"
+    />
+  </svg>
+);
+
+// Placeholder Aris glyph — stylized "A" in a rounded square. Replace with final brand
+// asset once the SVG wordmark/icon set for Aris is finalized.
+export const ArisIcon: Icon = (props) => (
+  <svg {...props} viewBox="0 0 24 24" fill="none">
+    <rect x="1.5" y="1.5" width="21" height="21" rx="5" fill="currentColor" />
+    <path
+      d="M12 6.5 6.5 17.5h2.35l1.1-2.3h4.1l1.1 2.3h2.35L12 6.5Zm-1.2 6.95L12 10.6l1.2 2.85h-2.4Z"
+      fill="#fff"
+    />
+  </svg>
+);
+
 export const Gemini: Icon = (props) => (
   <svg {...props} viewBox="0 0 296 298" fill="none">
     <mask

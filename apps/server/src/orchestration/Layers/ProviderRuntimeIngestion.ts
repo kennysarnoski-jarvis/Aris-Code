@@ -19,6 +19,7 @@ import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { EphemeralBroadcast } from "../Services/EphemeralBroadcast.ts";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { isGitRepository } from "../../git/Utils.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
@@ -506,6 +507,7 @@ const make = Effect.fn("make")(function* () {
   const providerService = yield* ProviderService;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
   const serverSettingsService = yield* ServerSettingsService;
+  const ephemeralBroadcast = yield* EphemeralBroadcast;
 
   const turnMessageIdsByTurnKey = yield* Cache.make<string, Set<MessageId>>({
     capacity: TURN_MESSAGE_IDS_BY_TURN_CACHE_CAPACITY,
@@ -876,6 +878,14 @@ const make = Effect.fn("make")(function* () {
   const processRuntimeEvent = Effect.fn("processRuntimeEvent")(function* (
     event: ProviderRuntimeEvent,
   ) {
+    // Cut C, slice 3e-iv-c — Aris no longer emits orchestration runtime
+    // events (its `streamEvents` returns `Stream.empty`). All Aris content
+    // and lifecycle now flow through `ArisEventBus` and the dedicated
+    // `aris.subscribeEvents` WS channel; this worker only ever sees Codex
+    // and Claude events. The previous Aris carve-out (which routed
+    // Aris `content.delta` to `EphemeralBroadcast` here) is gone — there
+    // is nothing to route.
+
     const readModel = yield* orchestrationEngine.getReadModel();
     const thread = readModel.threads.find((entry) => entry.id === event.threadId);
     if (!thread) return;
@@ -1047,6 +1057,19 @@ const make = Effect.fn("make")(function* () {
       yield* appendBufferedProposedPlan(planId, proposedPlanDelta, now);
     }
 
+    const reasoningDelta =
+      event.type === "content.delta" && event.payload.streamKind === "reasoning_text"
+        ? event.payload.delta
+        : undefined;
+
+    if (reasoningDelta && reasoningDelta.length > 0) {
+      yield* ephemeralBroadcast.publishReasoningDelta({
+        threadId: thread.id,
+        turnId: toTurnId(event.turnId) ?? null,
+        delta: reasoningDelta,
+      });
+    }
+
     const assistantCompletion =
       event.type === "item.completed" && event.payload.itemType === "assistant_message"
         ? {
@@ -1106,6 +1129,10 @@ const make = Effect.fn("make")(function* () {
     }
 
     if (event.type === "turn.completed") {
+      yield* ephemeralBroadcast.publishTurnEnded({
+        threadId: thread.id,
+        turnId: toTurnId(event.turnId) ?? null,
+      });
       const turnId = toTurnId(event.turnId);
       if (turnId) {
         const assistantMessageIds = yield* getAssistantMessageIdsForTurn(thread.id, turnId);
@@ -1136,7 +1163,18 @@ const make = Effect.fn("make")(function* () {
       }
     }
 
+    if (event.type === "turn.aborted") {
+      yield* ephemeralBroadcast.publishTurnEnded({
+        threadId: thread.id,
+        turnId: toTurnId(event.turnId) ?? null,
+      });
+    }
+
     if (event.type === "session.exited") {
+      yield* ephemeralBroadcast.publishTurnEnded({
+        threadId: thread.id,
+        turnId: toTurnId(event.turnId) ?? null,
+      });
       yield* clearTurnStateForSession(thread.id);
     }
 

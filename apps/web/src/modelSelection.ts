@@ -45,6 +45,24 @@ const PROVIDER_CUSTOM_MODEL_CONFIG: Record<ProviderKind, ProviderCustomModelConf
     placeholder: "your-claude-model-slug",
     example: "claude-sonnet-5-0",
   },
+  aris: {
+    provider: "aris",
+    title: "Aris",
+    description: "Save additional Aris model slugs for the picker and `/model` command.",
+    placeholder: "your-aris-model-slug",
+    example: "qwen-3.6",
+  },
+  // Cosmetic relabel (2026-05-10): user-facing strings surface as "Aris".
+  // Internal `deepseek` key, slug, placeholder, and example stay unchanged
+  // — the slug shape (`deepseek-v4-pro`) is load-bearing across routing,
+  // settings persistence, and existing thread state.
+  deepseek: {
+    provider: "deepseek",
+    title: "Aris",
+    description: "Save additional Aris model slugs for the picker and `/model` command.",
+    placeholder: "your-deepseek-model-slug",
+    example: "deepseek-v4-pro",
+  },
 };
 
 export const MODEL_PROVIDER_SETTINGS = Object.values(PROVIDER_CUSTOM_MODEL_CONFIG);
@@ -165,6 +183,18 @@ export function getCustomModelOptionsByProvider(
       "claudeAgent",
       selectedProvider === "claudeAgent" ? selectedModel : undefined,
     ),
+    aris: getAppModelOptions(
+      settings,
+      providers,
+      "aris",
+      selectedProvider === "aris" ? selectedModel : undefined,
+    ),
+    deepseek: getAppModelOptions(
+      settings,
+      providers,
+      "deepseek",
+      selectedProvider === "deepseek" ? selectedModel : undefined,
+    ),
   };
 }
 
@@ -192,9 +222,11 @@ export function resolveAppModelSelectionState(
     },
   });
 
+  // ModelSelection is a discriminated union; the provider literal here is only
+  // narrowable at runtime, so the cast is safe given we pair it with its own options.
   return {
     provider,
     model,
     ...(modelOptionsForDispatch ? { options: modelOptionsForDispatch } : {}),
-  };
+  } as ModelSelection;
 }

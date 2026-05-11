@@ -8,12 +8,18 @@
  */
 import { Context } from "effect";
 import type { Effect } from "effect";
-import type { ChatAttachment, ModelSelection } from "@t3tools/contracts";
+import type { ChatAttachment, ModelSelection, ProviderKind } from "@t3tools/contracts";
 
 import type { TextGenerationError } from "@t3tools/contracts";
 
-/** Providers that support git text generation (commit messages, PR content, branch names). */
-export type TextGenerationProvider = "codex" | "claudeAgent";
+/**
+ * Providers that can be routed for git text generation.
+ *
+ * NOTE: Aris does not yet have a dedicated text generation layer. When the
+ * active provider is "aris" the router currently falls back to Codex — revisit
+ * when the Aris server adapter lands (task #15).
+ */
+export type TextGenerationProvider = ProviderKind;
 
 export interface CommitMessageGenerationInput {
   cwd: string;

@@ -236,17 +236,13 @@ const make = Effect.gen(function* () {
       : undefined;
     const requestedModelSelection = options?.modelSelection;
     const threadProvider: ProviderKind = currentProvider ?? thread.modelSelection.provider;
-    if (
-      requestedModelSelection !== undefined &&
-      requestedModelSelection.provider !== threadProvider
-    ) {
-      return yield* new ProviderAdapterRequestError({
-        provider: threadProvider,
-        method: "thread.turn.start",
-        detail: `Thread '${threadId}' is bound to provider '${threadProvider}' and cannot switch to '${requestedModelSelection.provider}'.`,
-      });
-    }
-    const preferredProvider: ProviderKind = currentProvider ?? threadProvider;
+    // Provider lock removed: threads are no longer pinned to the provider that started them.
+    // Reason: rolling-window memory + portable persona means any provider can pick up a thread.
+    // When the requested provider differs from the current one, the restart logic below
+    // (driven by the `providerChanged` flag) tears down the old session and starts a fresh one
+    // with the new provider via `startProviderSession`.
+    const preferredProvider: ProviderKind =
+      requestedModelSelection?.provider ?? currentProvider ?? threadProvider;
     const desiredModelSelection = requestedModelSelection ?? thread.modelSelection;
     const effectiveCwd = resolveThreadWorkspaceCwd({
       thread,
@@ -361,6 +357,7 @@ const make = Effect.gen(function* () {
     readonly attachments?: ReadonlyArray<ChatAttachment>;
     readonly modelSelection?: ModelSelection;
     readonly interactionMode?: "default" | "plan";
+    readonly enableThinking?: boolean;
     readonly createdAt: string;
   }) {
     const thread = yield* resolveThread(input.threadId);
@@ -404,6 +401,7 @@ const make = Effect.gen(function* () {
       ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
       ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
       ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
+      ...(input.enableThinking !== undefined ? { enableThinking: input.enableThinking } : {}),
     });
   });
 
@@ -571,6 +569,9 @@ const make = Effect.gen(function* () {
         ? { modelSelection: event.payload.modelSelection }
         : {}),
       interactionMode: event.payload.interactionMode,
+      ...(event.payload.enableThinking !== undefined
+        ? { enableThinking: event.payload.enableThinking }
+        : {}),
       createdAt: event.payload.createdAt,
     }).pipe(
       Effect.catchCause((cause) =>

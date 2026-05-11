@@ -99,6 +99,21 @@ function createBaseServerConfig(): ServerConfig {
       providers: {
         codex: { enabled: true, binaryPath: "", homePath: "", customModels: [] },
         claudeAgent: { enabled: true, binaryPath: "", customModels: [], launchArgs: "" },
+        aris: {
+          enabled: true,
+          baseUrl: "http://localhost:8000",
+          email: "",
+          apiKey: "",
+          userId: 0,
+          customModels: [],
+        },
+        deepseek: {
+          enabled: false,
+          cloudBaseUrl: "",
+          cloudToken: "",
+          enabledModels: ["deepseek-v4-pro"],
+          customModels: [],
+        },
       },
     },
   };

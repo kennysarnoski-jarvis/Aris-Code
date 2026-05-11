@@ -2,7 +2,7 @@ import type { DesktopAppBranding, DesktopAppStageLabel } from "@t3tools/contract
 
 import { isNightlyDesktopVersion } from "./updateChannels";
 
-const APP_BASE_NAME = "T3 Code";
+const APP_BASE_NAME = "Aris Code";
 
 export function resolveDesktopAppStageLabel(input: {
   readonly isDevelopment: boolean;

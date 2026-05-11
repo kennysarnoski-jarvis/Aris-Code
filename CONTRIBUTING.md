@@ -1,60 +1,87 @@
-# Contributing
+# Contributing to Aris Code
+
+Aris Code is a small project maintained by a solo developer. Contributions are welcome, but please read this whole file before opening an issue or PR — it'll save us both time.
 
 ## Read This First
 
-We are not actively accepting contributions right now.
+This project is still early. Scope, quality, and direction are tightly controlled.
 
-You can still open an issue or PR, but please do so knowing there is a high chance we close it, defer it forever, or never look at it.
+You can absolutely open issues and PRs, but please do so knowing:
 
-If that sounds annoying, that is because it is. This project is still early and we are trying to keep scope, quality, and direction under control.
+- Small, focused bug fixes / reliability / perf improvements have a high acceptance rate
+- Large feature PRs, opinionated rewrites, and drive-by scope expansions almost certainly get closed
+- The Aris cloud (`youraris.com`) is run by the maintainer; client-side changes that depend on new cloud endpoints need a heads-up issue first so we can coordinate
 
-PRs are automatically labeled with a `vouch:*` trust status and a `size:*` diff size based on changed lines.
+## What We're Most Likely To Accept
 
-If you are an external contributor, expect `vouch:unvouched` until we explicitly add you to [.github/VOUCHED.td](.github/VOUCHED.td).
+- Small, focused bug fixes
+- Reliability improvements (connection handling, retry logic, state management)
+- Performance improvements with concrete benchmarks
+- Tightly scoped maintenance work (dep upgrades, lint cleanups, etc.)
+- Documentation fixes — typos, broken links, clearer phrasing
+- New provider integrations that mirror the existing `Codex` / `Claude` adapter pattern
 
-## What We Are Most Likely To Accept
+## What We're Least Likely To Accept
 
-Small, focused bug fixes.
+- Large PRs (anything > ~500 lines, especially with multiple unrelated changes)
+- Drive-by feature additions without prior discussion
+- Opinionated rewrites of working code
+- Anything that expands product scope without an issue accepted first
+- Cloud-side feature requests for `youraris.com` (open an issue for those)
 
-Small reliability fixes.
-
-Small performance improvements.
-
-Tightly scoped maintenance work that clearly improves the project without changing its direction.
-
-## What We Are Least Likely To Accept
-
-Large PRs.
-
-Drive-by feature work.
-
-Opinionated rewrites.
-
-Anything that expands product scope without us asking for it first.
-
-If you open a 1,000+ line PR full of new features, we will probably close it quickly and remember that you ignored the clearly written instructions.
+If you open a 1,000+ line PR full of new features without prior issue discussion, it'll probably be closed quickly.
 
 ## If You Still Want To Open A PR
 
-Keep it small.
+- Keep it small
+- Explain exactly what changed
+- Explain exactly why the change should exist
+- Don't mix unrelated fixes
+- If the PR touches UI, include before/after screenshots
+- If the change depends on motion, timing, transitions, or interaction, include a short video
+- Run `bun fmt`, `bun lint`, `bun typecheck`, and `bun run test` locally first — CI will block on these anyway
 
-Explain exactly what changed.
+## Issues First (for anything non-trivial)
 
-Explain exactly why the change should exist.
+If you're thinking about a non-trivial change, open an issue first.
 
-Do not mix unrelated fixes together.
+That still doesn't guarantee acceptance, but it lets you avoid wasting hours on something we'd reject. Faster for both sides.
 
-If the PR makes anything resembling a UI change, include clear before/after images.
+## Local Setup
 
-If the change depends on motion, timing, transitions, or interaction details, include a short video.
+Requires [Bun](https://bun.sh) ≥ 1.3 and Node 22+.
 
-If we have to guess what changed, we are much less likely to review it.
+```bash
+bun install
+bun dev              # web + server in dev mode
+bun dev:desktop      # Electron shell with hot reload
+bun typecheck
+bun lint
+bun fmt
+bun run test         # NEVER `bun test` directly — use `bun run test` for vitest
+```
 
-## Issues First
+Read [`CLAUDE.md`](./CLAUDE.md) for the architecture overview before making non-trivial changes — it's written for both human contributors and AI coding assistants.
 
-If you are thinking about a non-trivial change, open an issue first.
+## Security Disclosure
 
-That still does not mean we will want the PR, but it gives you a chance to avoid wasting your time.
+**Do not file public GitHub issues for security vulnerabilities.**
+
+If you've found a security issue:
+
+- Aris Code client / desktop app / web UI vulnerabilities → email **kennysarnoski@gmail.com** (subject line should start with `[SECURITY] Aris Code:`)
+- `youraris.com` cloud vulnerabilities → same email, subject line starts with `[SECURITY] Cloud:`
+
+What to include:
+
+- A clear description of the issue
+- Reproduction steps (or a proof-of-concept)
+- Your assessment of impact (RCE? Auth bypass? Information disclosure? Etc.)
+- Whether you've already disclosed it elsewhere
+
+You'll get an acknowledgment within 72 hours. We'll work on a fix and coordinate disclosure timing with you — typically 90 days, faster for actively-exploited issues.
+
+We don't have a formal bug bounty program yet, but we're happy to publicly credit reporters in release notes (unless you prefer anonymity).
 
 ## Be Realistic
 
@@ -62,4 +89,4 @@ Opening a PR does not create an obligation on our side.
 
 We may close it. We may ignore it. We may ask you to shrink it. We may reimplement the idea ourselves later.
 
-If you are fine with that, proceed.
+If you're fine with that, proceed.

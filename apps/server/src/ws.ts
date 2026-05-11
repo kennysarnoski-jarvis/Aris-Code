@@ -1,8 +1,12 @@
 import { Cause, Duration, Effect, Layer, Option, Queue, Ref, Schema, Stream } from "effect";
 import {
+  ARIS_WS_METHODS,
+  ArisApprovalDecideError,
+  ArisArchiveReadError,
   type AuthAccessStreamEvent,
   AuthSessionId,
   CommandId,
+  EPHEMERAL_WS_METHODS,
   EventId,
   type OrchestrationCommand,
   type GitActionProgressEvent,
@@ -27,7 +31,10 @@ import { clamp } from "effect/Number";
 import { HttpRouter, HttpServerRequest } from "effect/unstable/http";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
+import { ArisEventBus } from "./aris/Services/ArisEventBus";
 import { CheckpointDiffQuery } from "./checkpointing/Services/CheckpointDiffQuery";
+import { ArisAdapter } from "./provider/Services/ArisAdapter";
+import { DeepSeekAdapter } from "./provider/Services/DeepSeekAdapter";
 import { ServerConfig } from "./config";
 import { GitCore } from "./git/Services/GitCore";
 import { GitManager } from "./git/Services/GitManager";
@@ -35,6 +42,7 @@ import { GitStatusBroadcaster } from "./git/Services/GitStatusBroadcaster";
 import { Keybindings } from "./keybindings";
 import { Open, resolveAvailableEditors } from "./open";
 import { normalizeDispatchCommand } from "./orchestration/Normalizer";
+import { EphemeralBroadcast } from "./orchestration/Services/EphemeralBroadcast";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import {
@@ -43,6 +51,7 @@ import {
   observeRpcStreamEffect,
 } from "./observability/RpcInstrumentation";
 import { ProviderRegistry } from "./provider/Services/ProviderRegistry";
+import { readActiveWindow } from "./provider/Layers/RollingWindowMemory";
 import { ServerLifecycleEvents } from "./serverLifecycleEvents";
 import { ServerRuntimeStartup } from "./serverRuntimeStartup";
 import { ServerSettingsService } from "./serverSettings";
@@ -139,6 +148,10 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
       const gitManager = yield* GitManager;
       const git = yield* GitCore;
       const gitStatusBroadcaster = yield* GitStatusBroadcaster;
+      const ephemeralBroadcast = yield* EphemeralBroadcast;
+      const arisEventBus = yield* ArisEventBus;
+      const arisAdapter = yield* ArisAdapter;
+      const deepseekAdapter = yield* DeepSeekAdapter;
       const terminalManager = yield* TerminalManager;
       const providerRegistry = yield* ProviderRegistry;
       const config = yield* ServerConfig;
@@ -947,7 +960,11 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
               );
 
               yield* Effect.all(
-                [providerRegistry.refresh("codex"), providerRegistry.refresh("claudeAgent")],
+                [
+                  providerRegistry.refresh("aris"),
+                  providerRegistry.refresh("codex"),
+                  providerRegistry.refresh("claudeAgent"),
+                ],
                 {
                   concurrency: "unbounded",
                   discard: true,
@@ -984,6 +1001,90 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
               return Stream.concat(Stream.fromIterable(snapshotEvents), liveEvents);
             }),
             { "rpc.aggregate": "server" },
+          ),
+        [EPHEMERAL_WS_METHODS.subscribeEphemeralReasoning]: (input) =>
+          observeRpcStream(
+            EPHEMERAL_WS_METHODS.subscribeEphemeralReasoning,
+            ephemeralBroadcast.streamForThread(input.threadId),
+            { "rpc.aggregate": "ephemeral" },
+          ),
+        [ARIS_WS_METHODS.subscribeArisEvents]: (input) =>
+          observeRpcStream(
+            ARIS_WS_METHODS.subscribeArisEvents,
+            arisEventBus.streamForThread(input.threadId),
+            { "rpc.aggregate": "aris" },
+          ),
+        [ARIS_WS_METHODS.decideApproval]: (input) =>
+          observeRpcEffect(
+            ARIS_WS_METHODS.decideApproval,
+            // The aris.* RPC namespace is shared between Aris and DS
+            // (per the shared-bus architecture). Approval decisions
+            // could target either adapter — we don't know which one
+            // owns the thread without a lookup. Try Aris first; if
+            // Aris reports the thread as unknown, fall through to
+            // DeepSeek. This mirrors the parity intent without
+            // requiring a separate `deepseek.approval.decide` RPC.
+            arisAdapter.respondToRequest(input.threadId, input.approvalId, input.decision).pipe(
+              Effect.catch((arisErr) => {
+                const arisErrMsg = arisErr instanceof Error ? arisErr.message : String(arisErr);
+                // Heuristic: "Unknown aris adapter thread" is the
+                // recognizable signal that the thread isn't owned
+                // by Aris — try DeepSeek next. Any other Aris-side
+                // failure (e.g. malformed input) we surface as-is
+                // because retrying on DS won't help.
+                const isUnknownThread = /unknown.*thread/i.test(arisErrMsg);
+                if (!isUnknownThread) {
+                  return Effect.fail(new ArisApprovalDecideError({ detail: arisErrMsg }));
+                }
+                return deepseekAdapter
+                  .respondToRequest(input.threadId, input.approvalId, input.decision)
+                  .pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new ArisApprovalDecideError({
+                          detail: cause instanceof Error ? cause.message : String(cause),
+                        }),
+                    ),
+                  );
+              }),
+            ),
+            { "rpc.aggregate": "aris" },
+          ),
+        // RW-2.5 — Hydrate prior DS messages from the on-disk rolling
+        // window so they survive app restart. Reads ~/.aris/projects/
+        // <key>/sessions/<thread>/active.jsonl, transforms each
+        // PersistedMessage into the ArisArchiveMessage wire shape (which
+        // maps cleanly into the client's ChatMessage type). Returns an
+        // empty messages array when the file doesn't exist yet (fresh
+        // thread that's never sent a turn).
+        [ARIS_WS_METHODS.readArchive]: (input) =>
+          observeRpcEffect(
+            ARIS_WS_METHODS.readArchive,
+            Effect.tryPromise({
+              try: async () => {
+                const persisted = await readActiveWindow(input.cwd, input.threadId);
+                return {
+                  messages: persisted.map((m) => ({
+                    // Persisted messageId is already in the
+                    // canonical "user:turnId" / "assistant:turnId-..."
+                    // form (see DeepSeekAdapter RW-1 writes), so we
+                    // pass it through directly. The brand cast is
+                    // safe because the runtime shape is identical to
+                    // MessageId.
+                    id: m.messageId as never,
+                    role: m.role,
+                    content: m.content,
+                    turnId: m.turnId ?? null,
+                    createdAt: m.timestamp,
+                  })),
+                };
+              },
+              catch: (cause) =>
+                new ArisArchiveReadError({
+                  detail: cause instanceof Error ? cause.message : String(cause),
+                }),
+            }),
+            { "rpc.aggregate": "aris" },
           ),
         [WS_METHODS.subscribeAuthAccess]: (_input) =>
           observeRpcStreamEffect(

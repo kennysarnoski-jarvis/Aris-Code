@@ -13,6 +13,7 @@ import { type ReactNode, useCallback, useMemo, useRef, useState } from "react";
 import {
   PROVIDER_DISPLAY_NAMES,
   type DesktopUpdateChannel,
+  type ModelSelection,
   type ScopedThreadRef,
   type ProviderKind,
   type ServerProvider,
@@ -99,8 +100,11 @@ const TIMESTAMP_FORMAT_LABELS = {
   "24-hour": "24-hour",
 } as const;
 
+// Aris and DeepSeek are HTTP/cloud-based (no binary/home path), so they're
+// excluded from this binary-focused list. Aris has its own dedicated panel
+// further down; DeepSeek's cloud-routed settings card lands with Slice 33h.
 type InstallProviderSettings = {
-  provider: ProviderKind;
+  provider: Exclude<ProviderKind, "aris" | "deepseek">;
   title: string;
   binaryPlaceholder: string;
   binaryDescription: ReactNode;
@@ -142,6 +146,11 @@ const PROVIDER_STATUS_STYLES = {
   },
 } as const;
 
+// Cosmetic relabel (2026-05-10): suppress the legacy `"aris"` provider
+// card (Qwen3.6 / RunPod baseUrl + email/password sign-in) without
+// touching the underlying provider plumbing. Flip to `false` to restore.
+const HIDE_LEGACY_ARIS_CARD = true;
+
 function getProviderSummary(provider: ServerProvider | undefined) {
   if (!provider) {
     return {
@@ -153,7 +162,8 @@ function getProviderSummary(provider: ServerProvider | undefined) {
     return {
       headline: "Disabled",
       detail:
-        provider.message ?? "This provider is installed but disabled for new sessions in T3 Code.",
+        provider.message ??
+        "This provider is installed but disabled for new sessions in Aris Code.",
     };
   }
   if (!provider.installed) {
@@ -514,13 +524,41 @@ export function GeneralSettingsPanel() {
       settings.providers.claudeAgent.customModels.length > 0 ||
       settings.providers.claudeAgent.launchArgs !== "",
     ),
+    aris: Boolean(
+      settings.providers.aris.baseUrl !== DEFAULT_UNIFIED_SETTINGS.providers.aris.baseUrl ||
+      settings.providers.aris.email !== "" ||
+      settings.providers.aris.apiKey.length > 0 ||
+      settings.providers.aris.customModels.length > 0,
+    ),
+    deepseek: Boolean(
+      settings.providers.deepseek.cloudBaseUrl !==
+        DEFAULT_UNIFIED_SETTINGS.providers.deepseek.cloudBaseUrl ||
+      settings.providers.deepseek.cloudToken.length > 0 ||
+      settings.providers.deepseek.customModels.length > 0,
+    ),
   });
   const [customModelInputByProvider, setCustomModelInputByProvider] = useState<
     Record<ProviderKind, string>
   >({
     codex: "",
     claudeAgent: "",
+    aris: "",
+    deepseek: "",
   });
+  // Transient: Aris password is never persisted. Lives only in this component
+  // so the user can type it and hit "Sign in" — the /v1/auth/login call
+  // exchanges it for a token which is what gets saved to settings.
+  const [arisPassword, setArisPassword] = useState("");
+  const [isSigningInAris, setIsSigningInAris] = useState(false);
+  const [arisSignInError, setArisSignInError] = useState<string | null>(null);
+  // DeepSeek activation: user pastes their subscription_key, we exchange
+  // it via cloud's /api/local/auth for a long-lived local_api_key. Same
+  // pattern V1 desktop Aris uses (main_local.py:2824). The
+  // subscription_key is transient — only held in this component while
+  // the user pastes it; only the resulting local_api_key persists.
+  const [deepseekSubscriptionKey, setDeepseekSubscriptionKey] = useState("");
+  const [isActivatingDeepSeek, setIsActivatingDeepSeek] = useState(false);
+  const [deepseekActivationError, setDeepseekActivationError] = useState<string | null>(null);
   const [customModelErrorByProvider, setCustomModelErrorByProvider] = useState<
     Partial<Record<ProviderKind, string | null>>
   >({});
@@ -759,7 +797,7 @@ export function GeneralSettingsPanel() {
       <SettingsSection title="General">
         <SettingsRow
           title="Theme"
-          description="Choose how T3 Code looks across the app."
+          description="Choose how Aris Code looks across the app."
           resetAction={
             theme !== "system" ? (
               <SettingResetButton label="theme" onClick={() => setTheme("system")} />
@@ -1064,7 +1102,7 @@ export function GeneralSettingsPanel() {
                           provider: textGenProvider,
                           model: textGenModel,
                           ...(nextOptions ? { options: nextOptions } : {}),
-                        },
+                        } as ModelSelection,
                       },
                       serverProviders,
                     ),
@@ -1105,6 +1143,637 @@ export function GeneralSettingsPanel() {
           </div>
         }
       >
+        {/*
+          Cosmetic relabel (2026-05-10): the legacy `"aris"` provider card
+          (Qwen3.6 / RunPod baseUrl + email/password sign-in) is hidden from
+          the settings UI. The provider key, settings shape, and adapter
+          remain wired so anything currently using it keeps working — only
+          the user-facing card is suppressed. Flip `HIDE_LEGACY_ARIS_CARD`
+          to false to restore it.
+        */}
+        {!HIDE_LEGACY_ARIS_CARD &&
+          (() => {
+            // ── Aris card ──────────────────────────────────────────────────────
+            // Aris is HTTP-based (baseUrl + email + token from /login), so it
+            // doesn't fit the binary-path shape used for Codex/Claude. Rendered
+            // as a bespoke card above the standard provider loop.
+            //
+            // TODO(aris): wire the "Sign in" button to the real /login call when
+            // the Aris server adapter lands (task #15). For now the button is a
+            // no-op placeholder.
+            const arisConfig = settings.providers.aris;
+            const arisDefaults = DEFAULT_UNIFIED_SETTINGS.providers.aris;
+            const arisIsSignedIn = arisConfig.apiKey.length > 0;
+            const arisIsDirty = !Equal.equals(arisConfig, arisDefaults);
+            const arisStatusKey: keyof typeof PROVIDER_STATUS_STYLES = !arisConfig.enabled
+              ? "disabled"
+              : arisIsSignedIn
+                ? "ready"
+                : "warning";
+            const arisStatusStyle = PROVIDER_STATUS_STYLES[arisStatusKey];
+            const arisSummary = !arisConfig.enabled
+              ? { headline: "Disabled", detail: "Enable Aris to sign in." }
+              : arisIsSignedIn
+                ? { headline: "Signed in", detail: arisConfig.email || null }
+                : {
+                    headline: "Not signed in",
+                    detail: "Enter your email and password to sign in.",
+                  };
+            const arisDisplayName = PROVIDER_DISPLAY_NAMES.aris ?? "Aris";
+            const canSubmitArisSignIn =
+              arisConfig.enabled &&
+              !arisIsSignedIn &&
+              arisConfig.email.length > 0 &&
+              arisPassword.length > 0;
+
+            // Exchange email + password for a session key via the ArisLLM
+            // server's /v1/auth/login endpoint. On success we cache the raw key
+            // into settings.providers.aris.apiKey, which every Aris-bound
+            // request sends as the `X-Aris-Key` header. The user_id is also
+            // returned and cached for display purposes only — the key is the
+            // auth credential.
+            const handleArisSignIn = async () => {
+              setIsSigningInAris(true);
+              setArisSignInError(null);
+              try {
+                const baseUrl = arisConfig.baseUrl.replace(/\/$/, "");
+                const res = await fetch(`${baseUrl}/v1/auth/login`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    email: arisConfig.email,
+                    password: arisPassword,
+                  }),
+                });
+                if (!res.ok) {
+                  let detail = `Sign in failed (${res.status})`;
+                  try {
+                    const body = (await res.json()) as { detail?: unknown };
+                    if (typeof body?.detail === "string" && body.detail.length > 0) {
+                      detail = body.detail;
+                    }
+                  } catch {
+                    // non-JSON body; fall through with the status-based message
+                  }
+                  setArisSignInError(detail);
+                  return;
+                }
+                const data = (await res.json()) as {
+                  user_id?: number;
+                  email?: string;
+                  key?: string;
+                };
+                const key = data?.key;
+                const userId = data?.user_id;
+                if (typeof key !== "string" || key.length === 0) {
+                  setArisSignInError("Server returned no session key");
+                  return;
+                }
+                if (typeof userId !== "number" || userId < 1) {
+                  setArisSignInError("Server returned no user_id");
+                  return;
+                }
+                updateSettings({
+                  providers: {
+                    ...settings.providers,
+                    aris: {
+                      ...arisConfig,
+                      apiKey: key,
+                      userId,
+                      email: typeof data.email === "string" ? data.email : arisConfig.email,
+                    },
+                  },
+                });
+                setArisPassword("");
+              } catch (err) {
+                setArisSignInError(
+                  err instanceof Error ? err.message : "Network error contacting Aris server",
+                );
+              } finally {
+                setIsSigningInAris(false);
+              }
+            };
+
+            // Revoke the current session server-side, then clear local creds.
+            // Server call is best-effort — if it fails (network down, server
+            // restarted, key already revoked), we still clear locally so the
+            // user actually signs out from their UI's perspective. The
+            // server-side row would orphan in that case but is harmless.
+            const handleArisSignOut = async () => {
+              const baseUrl = arisConfig.baseUrl.replace(/\/$/, "");
+              const currentKey = arisConfig.apiKey;
+              if (currentKey.length > 0) {
+                try {
+                  await fetch(`${baseUrl}/v1/auth/logout`, {
+                    method: "POST",
+                    headers: { "X-Aris-Key": currentKey },
+                  });
+                } catch {
+                  // best-effort revocation — ignore failures
+                }
+              }
+              updateSettings({
+                providers: {
+                  ...settings.providers,
+                  aris: { ...arisConfig, apiKey: "", userId: 0 },
+                },
+              });
+              setArisPassword("");
+            };
+
+            return (
+              <div key="aris" className="border-t border-border first:border-t-0">
+                <div className="px-4 py-4 sm:px-5">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex min-h-5 items-center gap-1.5">
+                        <span className={cn("size-2 shrink-0 rounded-full", arisStatusStyle.dot)} />
+                        <h3 className="text-sm font-medium text-foreground">{arisDisplayName}</h3>
+                        <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center">
+                          {arisIsDirty ? (
+                            <SettingResetButton
+                              label={`${arisDisplayName} provider settings`}
+                              onClick={() => {
+                                updateSettings({
+                                  providers: {
+                                    ...settings.providers,
+                                    aris: arisDefaults,
+                                  },
+                                });
+                                setArisPassword("");
+                                setCustomModelErrorByProvider((existing) => ({
+                                  ...existing,
+                                  aris: null,
+                                }));
+                              }}
+                            />
+                          ) : null}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        {arisSummary.headline}
+                        {arisSummary.detail ? ` · ${arisSummary.detail}` : null}
+                      </p>
+                    </div>
+                    <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+                        onClick={() =>
+                          setOpenProviderDetails((existing) => ({
+                            ...existing,
+                            aris: !existing.aris,
+                          }))
+                        }
+                        aria-label={`Toggle ${arisDisplayName} details`}
+                      >
+                        <ChevronDownIcon
+                          className={cn(
+                            "size-3.5 transition-transform",
+                            openProviderDetails.aris && "rotate-180",
+                          )}
+                        />
+                      </Button>
+                      <Switch
+                        checked={arisConfig.enabled}
+                        onCheckedChange={(checked) => {
+                          const isDisabling = !checked;
+                          const shouldClearModelSelection =
+                            isDisabling && textGenProvider === "aris";
+                          updateSettings({
+                            providers: {
+                              ...settings.providers,
+                              aris: { ...arisConfig, enabled: Boolean(checked) },
+                            },
+                            ...(shouldClearModelSelection
+                              ? {
+                                  textGenerationModelSelection:
+                                    DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
+                                }
+                              : {}),
+                          });
+                        }}
+                        aria-label={`Enable ${arisDisplayName}`}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <Collapsible
+                  open={openProviderDetails.aris}
+                  onOpenChange={(open) =>
+                    setOpenProviderDetails((existing) => ({ ...existing, aris: open }))
+                  }
+                >
+                  <CollapsibleContent>
+                    <div className="space-y-0">
+                      <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+                        <label htmlFor="provider-aris-base-url" className="block">
+                          <span className="text-xs font-medium text-foreground">Base URL</span>
+                          <Input
+                            id="provider-aris-base-url"
+                            className="mt-1.5"
+                            value={arisConfig.baseUrl}
+                            onChange={(event) =>
+                              updateSettings({
+                                providers: {
+                                  ...settings.providers,
+                                  aris: { ...arisConfig, baseUrl: event.target.value },
+                                },
+                              })
+                            }
+                            placeholder="http://localhost:8000"
+                            spellCheck={false}
+                          />
+                          <span className="mt-1 block text-xs text-muted-foreground">
+                            URL of the Aris server (defaults to http://localhost:8000).
+                          </span>
+                        </label>
+                      </div>
+
+                      <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+                        <label htmlFor="provider-aris-email" className="block">
+                          <span className="text-xs font-medium text-foreground">Email</span>
+                          <Input
+                            id="provider-aris-email"
+                            className="mt-1.5"
+                            type="email"
+                            autoComplete="email"
+                            value={arisConfig.email}
+                            onChange={(event) =>
+                              updateSettings({
+                                providers: {
+                                  ...settings.providers,
+                                  aris: { ...arisConfig, email: event.target.value },
+                                },
+                              })
+                            }
+                            placeholder="you@example.com"
+                            spellCheck={false}
+                          />
+                        </label>
+                      </div>
+
+                      {arisIsSignedIn ? (
+                        <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-xs font-medium text-foreground">Session</div>
+                              <div className="mt-1 text-xs text-muted-foreground">
+                                Signed in as user #{arisConfig.userId}.
+                              </div>
+                            </div>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="shrink-0"
+                              onClick={() => void handleArisSignOut()}
+                            >
+                              Sign out
+                            </Button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+                          <label htmlFor="provider-aris-password" className="block">
+                            <span className="text-xs font-medium text-foreground">Password</span>
+                            <Input
+                              id="provider-aris-password"
+                              className="mt-1.5"
+                              type="password"
+                              autoComplete="current-password"
+                              value={arisPassword}
+                              onChange={(event) => setArisPassword(event.target.value)}
+                              placeholder="••••••••"
+                              spellCheck={false}
+                              disabled={!arisConfig.enabled}
+                            />
+                            <span className="mt-1 block text-xs text-muted-foreground">
+                              Your password is not stored — it's exchanged for an access token.
+                            </span>
+                          </label>
+                          {arisSignInError ? (
+                            <p role="alert" className="mt-2 text-xs text-destructive">
+                              {arisSignInError}
+                            </p>
+                          ) : null}
+                          <div className="mt-3 flex justify-end">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={!canSubmitArisSignIn || isSigningInAris}
+                              onClick={() => {
+                                void handleArisSignIn();
+                              }}
+                            >
+                              {isSigningInAris ? "Signing in…" : "Sign in"}
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </CollapsibleContent>
+                </Collapsible>
+              </div>
+            );
+          })()}
+        {(() => {
+          // ── DeepSeek card ──────────────────────────────────────────────
+          // DeepSeek is HTTP/cloud-routed. Activation pattern matches V1
+          // desktop Aris: user pastes a subscription_key, cloud
+          // /api/local/auth exchanges it for a long-lived local_api_key,
+          // we cache that key and send it as `Authorization: Bearer` on
+          // every DeepSeek dispatch. POD-independent — DeepSeek works
+          // even when aris_server (the POD) is offline.
+          const deepseekConfig = settings.providers.deepseek;
+          const deepseekDefaults = DEFAULT_UNIFIED_SETTINGS.providers.deepseek;
+          const deepseekIsActivated = deepseekConfig.cloudToken.length > 0;
+          const deepseekIsDirty = !Equal.equals(deepseekConfig, deepseekDefaults);
+          const deepseekStatusKey: keyof typeof PROVIDER_STATUS_STYLES = !deepseekConfig.enabled
+            ? "disabled"
+            : !deepseekConfig.cloudBaseUrl
+              ? "error"
+              : !deepseekIsActivated
+                ? "warning"
+                : "ready";
+          const deepseekStatusStyle = PROVIDER_STATUS_STYLES[deepseekStatusKey];
+          const deepseekSummary = !deepseekConfig.enabled
+            ? { headline: "Disabled", detail: "Enable Aris to dispatch turns." }
+            : !deepseekConfig.cloudBaseUrl
+              ? {
+                  headline: "Cloud URL missing",
+                  detail: "Set the cloud base URL below to enable dispatch.",
+                }
+              : !deepseekIsActivated
+                ? {
+                    headline: "Not activated",
+                    detail: "Paste your subscription key to activate.",
+                  }
+                : { headline: "Activated", detail: "Cloud-routed via local_api_key." };
+          // Cosmetic relabel (2026-05-10): user-facing display name comes
+          // from PROVIDER_DISPLAY_NAMES.deepseek (now "Aris"). Fallback
+          // mirrors that so a missing map entry never leaks the legacy
+          // "DeepSeek" label.
+          const deepseekDisplayName = PROVIDER_DISPLAY_NAMES.deepseek ?? "Aris";
+          const canSubmitDeepSeekActivation =
+            deepseekConfig.enabled &&
+            !deepseekIsActivated &&
+            deepseekConfig.cloudBaseUrl.length > 0 &&
+            deepseekSubscriptionKey.trim().length > 0;
+
+          // Exchange the subscription_key for a long-lived local_api_key
+          // via V1 cloud's /api/local/auth endpoint. Same flow as V1
+          // desktop Aris (main_local.py:2824). The cached local_api_key
+          // authenticates every DeepSeek dispatch; no expiry beyond the
+          // user's subscription lifetime.
+          const handleDeepSeekActivate = async () => {
+            setIsActivatingDeepSeek(true);
+            setDeepseekActivationError(null);
+            try {
+              const baseUrl = deepseekConfig.cloudBaseUrl.replace(/\/$/, "");
+              const res = await fetch(`${baseUrl}/api/local/auth`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  subscription_key: deepseekSubscriptionKey.trim(),
+                }),
+              });
+              if (!res.ok) {
+                let detail = `Activation failed (${res.status})`;
+                try {
+                  const body = (await res.json()) as { detail?: unknown };
+                  if (typeof body?.detail === "string" && body.detail.length > 0) {
+                    detail = body.detail;
+                  }
+                } catch {
+                  // non-JSON body; fall through with the status-based message
+                }
+                setDeepseekActivationError(detail);
+                return;
+              }
+              const data = (await res.json()) as { local_api_key?: string };
+              const key = data?.local_api_key;
+              if (typeof key !== "string" || key.length === 0) {
+                setDeepseekActivationError("Cloud returned no local_api_key");
+                return;
+              }
+              updateSettings({
+                providers: {
+                  ...settings.providers,
+                  deepseek: { ...deepseekConfig, cloudToken: key },
+                },
+              });
+              setDeepseekSubscriptionKey("");
+            } catch (err) {
+              setDeepseekActivationError(
+                err instanceof Error ? err.message : "Network error contacting cloud",
+              );
+            } finally {
+              setIsActivatingDeepSeek(false);
+            }
+          };
+
+          // Sign-out / deactivation is a local operation only — clears
+          // the cached local_api_key. The cloud-side license itself
+          // remains valid (revoking it would require a separate cloud
+          // admin action) but Aris Code stops sending it on dispatches.
+          const handleDeepSeekDeactivate = () => {
+            updateSettings({
+              providers: {
+                ...settings.providers,
+                deepseek: { ...deepseekConfig, cloudToken: "" },
+              },
+            });
+            setDeepseekSubscriptionKey("");
+          };
+
+          return (
+            <div key="deepseek" className="border-t border-border first:border-t-0">
+              <div className="px-4 py-4 sm:px-5">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="flex min-h-5 items-center gap-1.5">
+                      <span
+                        className={cn("size-2 shrink-0 rounded-full", deepseekStatusStyle.dot)}
+                      />
+                      <h3 className="text-sm font-medium text-foreground">{deepseekDisplayName}</h3>
+                      <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center">
+                        {deepseekIsDirty ? (
+                          <SettingResetButton
+                            label={`${deepseekDisplayName} provider settings`}
+                            onClick={() => {
+                              updateSettings({
+                                providers: {
+                                  ...settings.providers,
+                                  deepseek: deepseekDefaults,
+                                },
+                              });
+                              setDeepseekSubscriptionKey("");
+                              setDeepseekActivationError(null);
+                              setCustomModelErrorByProvider((existing) => ({
+                                ...existing,
+                                deepseek: null,
+                              }));
+                            }}
+                          />
+                        ) : null}
+                      </span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {deepseekSummary.headline}
+                      {deepseekSummary.detail ? ` · ${deepseekSummary.detail}` : null}
+                    </p>
+                  </div>
+                  <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+                      onClick={() =>
+                        setOpenProviderDetails((existing) => ({
+                          ...existing,
+                          deepseek: !existing.deepseek,
+                        }))
+                      }
+                      aria-label={`Toggle ${deepseekDisplayName} details`}
+                    >
+                      <ChevronDownIcon
+                        className={cn(
+                          "size-3.5 transition-transform",
+                          openProviderDetails.deepseek && "rotate-180",
+                        )}
+                      />
+                    </Button>
+                    <Switch
+                      checked={deepseekConfig.enabled}
+                      onCheckedChange={(checked) => {
+                        const isDisabling = !checked;
+                        const shouldClearModelSelection =
+                          isDisabling && textGenProvider === "deepseek";
+                        updateSettings({
+                          providers: {
+                            ...settings.providers,
+                            deepseek: { ...deepseekConfig, enabled: Boolean(checked) },
+                          },
+                          ...(shouldClearModelSelection
+                            ? {
+                                textGenerationModelSelection:
+                                  DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
+                              }
+                            : {}),
+                        });
+                      }}
+                      aria-label={`Enable ${deepseekDisplayName}`}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <Collapsible
+                open={openProviderDetails.deepseek}
+                onOpenChange={(open) =>
+                  setOpenProviderDetails((existing) => ({ ...existing, deepseek: open }))
+                }
+              >
+                <CollapsibleContent>
+                  <div className="space-y-0">
+                    <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+                      <label htmlFor="provider-deepseek-cloud-base-url" className="block">
+                        <span className="text-xs font-medium text-foreground">Cloud base URL</span>
+                        <Input
+                          id="provider-deepseek-cloud-base-url"
+                          className="mt-1.5"
+                          value={deepseekConfig.cloudBaseUrl}
+                          onChange={(event) =>
+                            updateSettings({
+                              providers: {
+                                ...settings.providers,
+                                deepseek: {
+                                  ...deepseekConfig,
+                                  cloudBaseUrl: event.target.value,
+                                },
+                              },
+                            })
+                          }
+                          placeholder="https://youraris.com"
+                          spellCheck={false}
+                        />
+                        <span className="mt-1 block text-xs text-muted-foreground">
+                          Cloud trusted-caller endpoint. Calls land at{" "}
+                          <code>/api/local/deepseek/v1/chat/completions</code>.
+                        </span>
+                      </label>
+                    </div>
+
+                    {deepseekIsActivated ? (
+                      <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="text-xs font-medium text-foreground">Activated</div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              Cloud-issued local_api_key cached. Long-lived — no re-activation until
+                              your subscription lapses or you run out of tokens.
+                            </div>
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="shrink-0"
+                            onClick={handleDeepSeekDeactivate}
+                          >
+                            Deactivate
+                          </Button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+                        <label htmlFor="provider-deepseek-subscription-key" className="block">
+                          <span className="text-xs font-medium text-foreground">
+                            Subscription key
+                          </span>
+                          <Input
+                            id="provider-deepseek-subscription-key"
+                            className="mt-1.5 font-mono"
+                            type="password"
+                            autoComplete="off"
+                            value={deepseekSubscriptionKey}
+                            onChange={(event) => setDeepseekSubscriptionKey(event.target.value)}
+                            placeholder="Paste your Sub key here"
+                            spellCheck={false}
+                            disabled={!deepseekConfig.enabled}
+                          />
+                          <span className="mt-1 block text-xs text-muted-foreground">
+                            Paste the key you received with your subscription. We exchange it once
+                            for a long-lived cloud token; the subscription_key itself isn&apos;t
+                            stored.
+                          </span>
+                        </label>
+                        {deepseekActivationError ? (
+                          <p role="alert" className="mt-2 text-xs text-destructive">
+                            {deepseekActivationError}
+                          </p>
+                        ) : null}
+                        <div className="mt-3 flex justify-end">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={!canSubmitDeepSeekActivation || isActivatingDeepSeek}
+                            onClick={() => {
+                              void handleDeepSeekActivate();
+                            }}
+                          >
+                            {isActivatingDeepSeek ? "Activating…" : "Activate"}
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </CollapsibleContent>
+              </Collapsible>
+            </div>
+          );
+        })()}
         {providerCards.map((providerCard) => {
           const customModelInput = customModelInputByProvider[providerCard.provider];
           const customModelError = customModelErrorByProvider[providerCard.provider] ?? null;

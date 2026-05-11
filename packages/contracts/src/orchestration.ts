@@ -1,5 +1,10 @@
 import { Effect, Option, Schema, SchemaIssue, Struct } from "effect";
-import { ClaudeModelOptions, CodexModelOptions } from "./model";
+import {
+  ArisModelOptions,
+  ClaudeModelOptions,
+  CodexModelOptions,
+  DeepSeekModelOptions,
+} from "./model";
 import { RepositoryIdentity } from "./environment";
 import {
   ApprovalRequestId,
@@ -25,7 +30,10 @@ export const ORCHESTRATION_WS_METHODS = {
   subscribeThread: "orchestration.subscribeThread",
 } as const;
 
-export const ProviderKind = Schema.Literals(["codex", "claudeAgent"]);
+// Provider order matches `feedback_aris_first` — Aris stays first in pickers
+// and dropdowns. The order in this literal union is the source of truth other
+// modules iterate against (PROVIDER_ORDER, PROVIDER_OPTIONS, etc.).
+export const ProviderKind = Schema.Literals(["aris", "codex", "claudeAgent", "deepseek"]);
 export type ProviderKind = typeof ProviderKind.Type;
 export const ProviderApprovalPolicy = Schema.Literals([
   "untrusted",
@@ -57,7 +65,26 @@ export const ClaudeModelSelection = Schema.Struct({
 });
 export type ClaudeModelSelection = typeof ClaudeModelSelection.Type;
 
-export const ModelSelection = Schema.Union([CodexModelSelection, ClaudeModelSelection]);
+export const ArisModelSelection = Schema.Struct({
+  provider: Schema.Literal("aris"),
+  model: TrimmedNonEmptyString,
+  options: Schema.optionalKey(ArisModelOptions),
+});
+export type ArisModelSelection = typeof ArisModelSelection.Type;
+
+export const DeepSeekModelSelection = Schema.Struct({
+  provider: Schema.Literal("deepseek"),
+  model: TrimmedNonEmptyString,
+  options: Schema.optionalKey(DeepSeekModelOptions),
+});
+export type DeepSeekModelSelection = typeof DeepSeekModelSelection.Type;
+
+export const ModelSelection = Schema.Union([
+  CodexModelSelection,
+  ClaudeModelSelection,
+  ArisModelSelection,
+  DeepSeekModelSelection,
+]);
 export type ModelSelection = typeof ModelSelection.Type;
 
 export const RuntimeMode = Schema.Literals([
@@ -526,6 +553,13 @@ export const ThreadTurnStartCommand = Schema.Struct({
   ),
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  /**
+   * Slice 31 — per-message Thinking toggle from Aris Code's composer.
+   * `true`/`false` overrides the server's default; omitted means "use
+   * server default" (currently True). Only the Aris provider reads
+   * this field today; Codex / Claude adapters ignore it.
+   */
+  enableThinking: Schema.optional(Schema.Boolean),
   createdAt: IsoDateTime,
 });
 
@@ -545,6 +579,8 @@ const ClientThreadTurnStartCommand = Schema.Struct({
   interactionMode: ProviderInteractionMode,
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  /** Slice 31 — see ThreadTurnStartCommand.enableThinking. */
+  enableThinking: Schema.optional(Schema.Boolean),
   createdAt: IsoDateTime,
 });
 
@@ -844,6 +880,8 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  /** Slice 31 — see ThreadTurnStartCommand.enableThinking. */
+  enableThinking: Schema.optional(Schema.Boolean),
   createdAt: IsoDateTime,
 });
 

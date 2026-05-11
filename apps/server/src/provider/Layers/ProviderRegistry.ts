@@ -7,12 +7,18 @@ import type { ProviderKind, ServerProvider } from "@t3tools/contracts";
 import { Effect, Equal, FileSystem, Layer, Path, PubSub, Ref, Stream } from "effect";
 
 import { ServerConfig } from "../../config";
+import { ArisProviderLive } from "./ArisProvider";
 import { ClaudeProviderLive } from "./ClaudeProvider";
 import { CodexProviderLive } from "./CodexProvider";
+import { DeepSeekProviderLive } from "./DeepSeekProvider";
+import type { ArisProviderShape } from "../Services/ArisProvider";
+import { ArisProvider } from "../Services/ArisProvider";
 import type { ClaudeProviderShape } from "../Services/ClaudeProvider";
 import { ClaudeProvider } from "../Services/ClaudeProvider";
 import type { CodexProviderShape } from "../Services/CodexProvider";
 import { CodexProvider } from "../Services/CodexProvider";
+import type { DeepSeekProviderShape } from "../Services/DeepSeekProvider";
+import { DeepSeekProvider } from "../Services/DeepSeekProvider";
 import { ProviderRegistry, type ProviderRegistryShape } from "../Services/ProviderRegistry";
 import {
   hydrateCachedProvider,
@@ -26,10 +32,18 @@ import {
 const loadProviders = (
   codexProvider: CodexProviderShape,
   claudeProvider: ClaudeProviderShape,
-): Effect.Effect<readonly [ServerProvider, ServerProvider]> =>
-  Effect.all([codexProvider.getSnapshot, claudeProvider.getSnapshot], {
-    concurrency: "unbounded",
-  });
+  arisProvider: ArisProviderShape,
+  deepseekProvider: DeepSeekProviderShape,
+): Effect.Effect<readonly [ServerProvider, ServerProvider, ServerProvider, ServerProvider]> =>
+  Effect.all(
+    [
+      codexProvider.getSnapshot,
+      claudeProvider.getSnapshot,
+      arisProvider.getSnapshot,
+      deepseekProvider.getSnapshot,
+    ],
+    { concurrency: "unbounded" },
+  );
 
 export const haveProvidersChanged = (
   previousProviders: ReadonlyArray<ServerProvider>,
@@ -41,6 +55,8 @@ export const ProviderRegistryLive = Layer.effect(
   Effect.gen(function* () {
     const codexProvider = yield* CodexProvider;
     const claudeProvider = yield* ClaudeProvider;
+    const arisProvider = yield* ArisProvider;
+    const deepseekProvider = yield* DeepSeekProvider;
     const config = yield* ServerConfig;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -48,8 +64,16 @@ export const ProviderRegistryLive = Layer.effect(
       PubSub.unbounded<ReadonlyArray<ServerProvider>>(),
       PubSub.shutdown,
     );
-    const fallbackProviders = yield* loadProviders(codexProvider, claudeProvider);
-    const cachePathByProvider = new Map(
+    const fallbackProviders = yield* loadProviders(
+      codexProvider,
+      claudeProvider,
+      arisProvider,
+      deepseekProvider,
+    );
+    // Keyed by ProviderKind so any provider missing from PROVIDER_CACHE_IDS
+    // returns undefined from .get() instead of tripping the type checker at
+    // call sites.
+    const cachePathByProvider = new Map<ServerProvider["provider"], string>(
       PROVIDER_CACHE_IDS.map(
         (provider) =>
           [
@@ -156,6 +180,14 @@ export const ProviderRegistryLive = Layer.effect(
           return yield* claudeProvider.refresh.pipe(
             Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
           );
+        case "aris":
+          return yield* arisProvider.refresh.pipe(
+            Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
+          );
+        case "deepseek":
+          return yield* deepseekProvider.refresh.pipe(
+            Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
+          );
         default:
           return yield* Effect.all(
             [
@@ -163,6 +195,12 @@ export const ProviderRegistryLive = Layer.effect(
                 Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
               ),
               claudeProvider.refresh.pipe(
+                Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
+              ),
+              arisProvider.refresh.pipe(
+                Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
+              ),
+              deepseekProvider.refresh.pipe(
                 Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
               ),
             ],
@@ -180,6 +218,12 @@ export const ProviderRegistryLive = Layer.effect(
     yield* Stream.runForEach(claudeProvider.streamChanges, (provider) =>
       syncProvider(provider),
     ).pipe(Effect.forkScoped);
+    yield* Stream.runForEach(arisProvider.streamChanges, (provider) => syncProvider(provider)).pipe(
+      Effect.forkScoped,
+    );
+    yield* Stream.runForEach(deepseekProvider.streamChanges, (provider) =>
+      syncProvider(provider),
+    ).pipe(Effect.forkScoped);
 
     return {
       getProviders: Ref.get(providersRef),
@@ -193,4 +237,9 @@ export const ProviderRegistryLive = Layer.effect(
       },
     } satisfies ProviderRegistryShape;
   }),
-).pipe(Layer.provideMerge(CodexProviderLive), Layer.provideMerge(ClaudeProviderLive));
+).pipe(
+  Layer.provideMerge(CodexProviderLive),
+  Layer.provideMerge(ClaudeProviderLive),
+  Layer.provideMerge(ArisProviderLive),
+  Layer.provideMerge(DeepSeekProviderLive),
+);

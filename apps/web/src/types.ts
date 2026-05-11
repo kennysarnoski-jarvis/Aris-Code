@@ -51,6 +51,11 @@ export interface ChatMessage {
   createdAt: string;
   completedAt?: string | undefined;
   streaming: boolean;
+  // Persisted Thinking trace for assistant messages (Aris provider only —
+  // slice 1.13b). Live streaming buffers come from `aris.reasoning.delta`
+  // events; this field carries the same content after settle so the UI can
+  // re-render the collapsible block once `streaming` flips false.
+  reasoning?: string | null;
 }
 
 export interface ProposedPlan {

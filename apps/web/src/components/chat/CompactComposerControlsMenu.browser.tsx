@@ -123,9 +123,12 @@ async function mountMenu(props?: { modelSelection?: ModelSelection; prompt?: str
     <CompactComposerControlsMenu
       activePlan={false}
       interactionMode="default"
+      isPlanModeAvailable={true}
       planSidebarLabel="Plan"
       planSidebarOpen={false}
       runtimeMode="approval-required"
+      showThinkingToggle={false}
+      thinkingEnabled={true}
       traitsMenuContent={
         <TraitsMenuContent
           provider={provider}
@@ -140,6 +143,7 @@ async function mountMenu(props?: { modelSelection?: ModelSelection; prompt?: str
       onToggleInteractionMode={vi.fn()}
       onTogglePlanSidebar={vi.fn()}
       onRuntimeModeChange={vi.fn()}
+      onToggleThinking={vi.fn()}
     />,
     { container: host },
   );

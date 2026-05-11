@@ -36,7 +36,15 @@ function getSlowRpcAckRequestsValue(): ReadonlyArray<SlowRpcAckRequest> {
 }
 
 function shouldTrackRpcAck(tag: string): boolean {
-  return !tag.startsWith("subscribe");
+  // Subscriptions are long-lived streams and never ack the way a
+  // request/response RPC does, so tracking them always trips the slow-ack
+  // threshold. Tags come in two flavors: legacy flat (`subscribeServerConfig`)
+  // and namespaced (`ephemeral.subscribeReasoning`, `orchestration.subscribeShell`).
+  // Only the method portion — the segment after the last `.` — is meaningful
+  // for the subscribe check; `tag.startsWith("subscribe")` misses the
+  // namespaced variants and surfaces phantom slow toasts on app boot.
+  const method = tag.slice(tag.lastIndexOf(".") + 1);
+  return !method.startsWith("subscribe");
 }
 
 export function getSlowRpcAckRequests(): ReadonlyArray<SlowRpcAckRequest> {
@@ -62,6 +70,13 @@ export function trackRpcRequestSent(requestId: string, tag: string): void {
   const timeoutId = setTimeout(() => {
     pendingRpcAckRequests.delete(requestId);
     appendSlowRpcAckRequest(request);
+    // Surface which RPC went slow. The toast aggregates counts only — without
+    // this log we have no way to tell a phantom startup hang (e.g. a provider
+    // session RPC that never ack'd) from a genuinely slow user action.
+    console.warn(
+      `[ws][slow-ack] ${request.tag} has been waiting ${slowRpcAckThresholdMs}ms for an ack`,
+      { requestId: request.requestId, tag: request.tag, startedAt: request.startedAt },
+    );
   }, slowRpcAckThresholdMs);
 
   pendingRpcAckRequests.set(requestId, {

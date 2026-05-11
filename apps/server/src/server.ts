@@ -19,8 +19,10 @@ import { AnalyticsServiceLayerLive } from "./telemetry/Layers/AnalyticsService";
 import { makeEventNdjsonLogger } from "./provider/Layers/EventNdjsonLogger";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory";
 import { ProviderSessionRuntimeRepositoryLive } from "./persistence/Layers/ProviderSessionRuntime";
+import { ArisAdapterLive } from "./provider/Layers/ArisAdapter";
 import { makeCodexAdapterLive } from "./provider/Layers/CodexAdapter";
 import { makeClaudeAdapterLive } from "./provider/Layers/ClaudeAdapter";
+import { DeepSeekAdapterLive } from "./provider/Layers/DeepSeekAdapter";
 import { ProviderAdapterRegistryLive } from "./provider/Layers/ProviderAdapterRegistry";
 import { makeProviderServiceLive } from "./provider/Layers/ProviderService";
 import { CheckpointDiffQueryLive } from "./checkpointing/Layers/CheckpointDiffQuery";
@@ -35,6 +37,7 @@ import { KeybindingsLive } from "./keybindings";
 import { ServerRuntimeStartup, ServerRuntimeStartupLive } from "./serverRuntimeStartup";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor";
 import { RuntimeReceiptBusLive } from "./orchestration/Layers/RuntimeReceiptBus";
+import { EphemeralBroadcastLive } from "./orchestration/Layers/EphemeralBroadcast";
 import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRuntimeIngestion";
 import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderCommandReactor";
 import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor";
@@ -62,6 +65,8 @@ import {
 } from "./auth/http";
 import { ServerSecretStoreLive } from "./auth/Layers/ServerSecretStore";
 import { ServerAuthLive } from "./auth/Layers/ServerAuth";
+import { ArisEventBusLive } from "./aris/Layers/ArisEventBus";
+import { ArisRuntimeLayerLive } from "./aris/runtimeLayer";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer";
 import {
   clearPersistedServerRuntimeState,
@@ -127,12 +132,25 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ProviderCommandReactorLive),
   Layer.provideMerge(CheckpointReactorLive),
   Layer.provideMerge(RuntimeReceiptBusLive),
+  Layer.provideMerge(EphemeralBroadcastLive),
 );
 
 const CheckpointingLayerLive = Layer.empty.pipe(
   Layer.provideMerge(CheckpointDiffQueryLive),
   Layer.provideMerge(CheckpointStoreLive),
 );
+
+// Shared `ArisAdapter` layer — referenced by `adapterRegistryLayer` (so the
+// provider routing knows about Aris) AND by `RuntimeDependenciesLive` below
+// (so ws.ts can call `arisAdapter.respondToRequest` directly for the
+// `aris.approval.decide` RPC handler under Cut C). Effect's Layer memoization
+// guarantees a single instance per runtime build despite the dual reference.
+const ArisAdapterLayerLive = ArisAdapterLive.pipe(Layer.provide(ArisEventBusLive));
+
+// DeepSeek (Slice 33f) shares the Aris event bus per the recon
+// memory's "shared bus" decision — its events flow through the same
+// `aris.*` channel the chat UI already consumes.
+const DeepSeekAdapterLayerLive = DeepSeekAdapterLive.pipe(Layer.provide(ArisEventBusLive));
 
 const ProviderLayerLive = Layer.unwrap(
   Effect.gen(function* () {
@@ -153,6 +171,15 @@ const ProviderLayerLive = Layer.unwrap(
       nativeEventLogger ? { nativeEventLogger } : undefined,
     );
     const adapterRegistryLayer = ProviderAdapterRegistryLive.pipe(
+      // ArisAdapter needs ArisEventBus (Cut C dual-emission) AND must be
+      // visible to ws.ts (Cut C, slice 3e-iii-a) for the `aris.approval.decide`
+      // RPC handler. We reference the shared `ArisAdapterLayerLive` const
+      // (defined below at module scope) here AND at the top of
+      // RuntimeDependenciesLive — Effect's Layer memoization keys on Layer
+      // object identity, so both references resolve to a single ArisAdapter
+      // instance for the whole runtime build.
+      Layer.provide(ArisAdapterLayerLive),
+      Layer.provide(DeepSeekAdapterLayerLive),
       Layer.provide(codexAdapterLayer),
       Layer.provide(claudeAdapterLayer),
       Layer.provideMerge(providerSessionDirectoryLayer),
@@ -196,6 +223,16 @@ const AuthLayerLive = ServerAuthLive.pipe(
 
 const RuntimeDependenciesLive = ReactorLayerLive.pipe(
   // Core Services
+  Layer.provideMerge(ArisRuntimeLayerLive),
+  Layer.provideMerge(ArisAdapterLayerLive),
+  // DS-fix.10 — DeepSeekAdapter must be provided to the runtime so
+  // ws.ts can call `deepseekAdapter.respondToRequest` for the
+  // `aris.approval.decide` RPC fallthrough (the WS handler tries
+  // arisAdapter first, falls through to deepseekAdapter when the
+  // thread isn't owned by Aris). Memoization on Layer object identity
+  // means the same instance the provider registry uses gets reused
+  // here.
+  Layer.provideMerge(DeepSeekAdapterLayerLive),
   Layer.provideMerge(CheckpointingLayerLive),
   Layer.provideMerge(GitLayerLive),
   Layer.provideMerge(OrchestrationLayerLive),

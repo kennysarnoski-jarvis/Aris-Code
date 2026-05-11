@@ -53,6 +53,7 @@ import {
   findSidebarProposedPlan,
   findLatestProposedPlan,
   deriveWorkLogEntries,
+  deriveLatestActivityWorkEntry,
   hasActionableProposedPlan,
   hasToolActivityForTurn,
   isLatestTurnSettled,
@@ -90,11 +91,20 @@ import {
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
 import { useTurnDiffSummaries } from "../hooks/useTurnDiffSummaries";
+import { triggerArisSidebarRefresh } from "../arisSidebarRefreshStore";
+import { useArisPendingApprovals } from "../useArisPendingApprovals";
+import { useArisSessionStatus } from "../useArisSessionStatus";
+import { useArisThreadHistory } from "../useArisThreadHistory";
+import { arisToolStateToWorkLogEntry, useArisToolEvents } from "../useArisToolEvents";
 import { useCommandPaletteStore } from "../commandPaletteStore";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import { BranchToolbar } from "./BranchToolbar";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
+import MemorySidebar from "./memory/MemorySidebar";
+import { CoordinatorActivityPanel } from "./CoordinatorActivityPanel";
+import { ProjectTodosPanel } from "./ProjectTodosPanel";
+import { useArisProjectId } from "../useArisProjectId";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
 import { ChevronDownIcon } from "lucide-react";
 import { cn, randomUUID } from "~/lib/utils";
@@ -138,6 +148,7 @@ import { ChatHeader } from "./chat/ChatHeader";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { NoActiveThreadState } from "./NoActiveThreadState";
 import { resolveEffectiveEnvMode, resolveEnvironmentOptionLabel } from "./BranchToolbar.logic";
+import { DeepSeekLowBalanceBanner } from "./chat/DeepSeekLowBalanceBanner";
 import { ProviderStatusBanner } from "./chat/ProviderStatusBanner";
 import { ThreadErrorBanner } from "./chat/ThreadErrorBanner";
 import {
@@ -180,6 +191,52 @@ const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
 
 type ThreadPlanCatalogEntry = Pick<Thread, "id" | "proposedPlans">;
+
+/**
+ * True when the server's message list already contains an equivalent of the
+ * given optimistic message, so we can drop the optimistic without losing UX.
+ *
+ * ID match is the happy path (Codex/Claude providers share the client-generated
+ * MessageId with their server projection). Aris is the awkward case: aris_db
+ * assigns its own row id on INSERT and the refetch wraps it as
+ * `aris-${rowId}`, so the optimistic UUID will never match by ID. For user
+ * messages we fall back to role+text — user prompts are distinctive enough
+ * that text-equality is effectively a unique key in practice.
+ */
+function optimisticIsSettled(
+  optimistic: ChatMessage,
+  serverMessages: readonly ChatMessage[],
+): boolean {
+  for (const server of serverMessages) {
+    if (server.id === optimistic.id) return true;
+  }
+  if (optimistic.role !== "user") return false;
+  for (const server of serverMessages) {
+    if (server.role === "user" && server.text === optimistic.text) return true;
+  }
+  return false;
+}
+
+/**
+ * Returns an ISO timestamp guaranteed to be strictly after every `createdAt`
+ * in `prior`. Optimistic user messages must slot *below* everything already
+ * rendered — if the client clock is behind server/streaming timestamps, a
+ * naive `Date.now()` can land the new message above the previous assistant
+ * reply. We clamp forward by 1ms to preserve monotonic ordering within the
+ * same millisecond.
+ */
+function monotonicCreatedAtAfter(prior: ReadonlyArray<{ readonly createdAt: string }>): string {
+  const now = Date.now();
+  let maxMs = now;
+  for (const entry of prior) {
+    const parsed = Date.parse(entry.createdAt);
+    if (Number.isFinite(parsed) && parsed > maxMs) {
+      maxMs = parsed;
+    }
+  }
+  const effectiveMs = maxMs === now ? now : maxMs + 1;
+  return new Date(effectiveMs).toISOString();
+}
 
 function useThreadPlanCatalog(threadIds: readonly ThreadId[]): ThreadPlanCatalogEntry[] {
   return useStore(
@@ -767,8 +824,14 @@ export default function ChatView(props: ChatViewProps) {
             threadId,
             draftThread,
             fallbackDraftProject?.defaultModelSelection ?? {
-              provider: "codex",
-              model: DEFAULT_MODEL_BY_PROVIDER.codex,
+              // Slice 1.16: aris-first default per the user's stated
+              // provider-ordering preference. Was "codex" — kept "codex"
+              // as the absolute fallback below since the t3code platform
+              // shipped originally with codex as primary, but new
+              // projects on an aris-configured deployment should default
+              // to aris.
+              provider: "aris",
+              model: DEFAULT_MODEL_BY_PROVIDER.aris,
             },
             localDraftError,
           )
@@ -793,7 +856,29 @@ export default function ChatView(props: ChatViewProps) {
     const existingThreadKeys = new Set<string>([...serverThreadKeys, ...draftThreadKeys]);
     return openTerminalThreadKeys.filter((nextThreadKey) => existingThreadKeys.has(nextThreadKey));
   }, [draftThreadKeys, openTerminalThreadKeys, serverThreadKeys]);
-  const activeLatestTurn = activeThread?.latestTurn ?? null;
+  // Slice 3e-iv-b-i — for Aris-provider threads, derive session + latest-turn
+  // state from the dedicated bus instead of the orchestration projection.
+  // The hook self-disables for non-Aris providers (returns null fields), so
+  // the branching below falls through cleanly.
+  const arisSessionStatus = useArisSessionStatus({
+    environmentId,
+    threadId: activeThread?.id ?? null,
+    provider: activeThread?.session?.provider ?? null,
+  });
+  // DeepSeek shares ArisEventBus + the same session/turn-state derivation
+  // (per Slice 33-fix.5). Without DS in this allowlist, DS threads fall
+  // through to the orchestration projection — which never updates for
+  // DS — and the composer's local-dispatch acknowledgement never flips,
+  // so the send-button spinner sticks indefinitely after a DS turn
+  // completes. Mirror the gating in `useArisSessionStatus`.
+  const isArisChannelThread =
+    activeThread?.session?.provider === "aris" || activeThread?.session?.provider === "deepseek";
+  const effectiveSession = isArisChannelThread
+    ? arisSessionStatus.session
+    : (activeThread?.session ?? null);
+  const activeLatestTurn = isArisChannelThread
+    ? arisSessionStatus.latestTurn
+    : (activeThread?.latestTurn ?? null);
   const threadPlanCatalog = useThreadPlanCatalog(
     useMemo(() => {
       const threadIds: ThreadId[] = [];
@@ -822,7 +907,7 @@ export default function ChatView(props: ChatViewProps) {
         : nextThreadIds;
     });
   }, [activeThreadKey, existingOpenTerminalThreadKeys, terminalState.terminalOpen]);
-  const latestTurnSettled = isLatestTurnSettled(activeLatestTurn, activeThread?.session ?? null);
+  const latestTurnSettled = isLatestTurnSettled(activeLatestTurn, effectiveSession);
   const activeProjectRef = activeThread
     ? scopeProjectRef(activeThread.environmentId, activeThread.projectId)
     : null;
@@ -1033,19 +1118,48 @@ export default function ChatView(props: ChatViewProps) {
     selectedProviderByThreadId ?? threadProvider ?? "codex",
   );
   const selectedProvider: ProviderKind = lockedProvider ?? unlockedSelectedProvider;
-  const phase = derivePhase(activeThread?.session ?? null);
+  const phase = derivePhase(effectiveSession);
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const workLogEntries = useMemo(
     () => deriveWorkLogEntries(threadActivities, activeLatestTurn?.turnId ?? undefined),
+    [activeLatestTurn?.turnId, threadActivities],
+  );
+  const liveStatusEntry = useMemo(
+    () => deriveLatestActivityWorkEntry(threadActivities, activeLatestTurn?.turnId ?? undefined),
     [activeLatestTurn?.turnId, threadActivities],
   );
   const latestTurnHasToolActivity = useMemo(
     () => hasToolActivityForTurn(threadActivities, activeLatestTurn?.turnId),
     [activeLatestTurn?.turnId, threadActivities],
   );
-  const pendingApprovals = useMemo(
+  // Slice 3e-iii-b-ii — pending-approval state from the dedicated Aris bus.
+  // Add/remove driven by `aris.approval.requested` / `aris.approval.resolved`
+  // events. The hook is gated internally on provider==="aris" so for other
+  // providers it returns the empty array and we fall through to the
+  // orchestration-derived list below.
+  const arisPendingApprovals = useArisPendingApprovals({
+    environmentId,
+    threadId: activeThread?.id ?? null,
+    provider: activeThread?.session?.provider ?? null,
+  });
+  const orchestrationPendingApprovals = useMemo(
     () => derivePendingApprovals(threadActivities),
     [threadActivities],
+  );
+  // DeepSeek shares ArisEventBus including approval events — when we add
+  // the approval gate for DS bash/write_file (Slice 22), this branch must
+  // surface DS approvals from arisPendingApprovals, not the orchestration
+  // pipeline (which DS doesn't use).
+  const pendingApprovals = useMemo(
+    () =>
+      activeThread?.session?.provider === "aris" || activeThread?.session?.provider === "deepseek"
+        ? arisPendingApprovals.pendingApprovals
+        : orchestrationPendingApprovals,
+    [
+      activeThread?.session?.provider,
+      arisPendingApprovals.pendingApprovals,
+      orchestrationPendingApprovals,
+    ],
   );
   const pendingUserInputs = useMemo(
     () => derivePendingUserInputs(threadActivities),
@@ -1134,6 +1248,22 @@ export default function ChatView(props: ChatViewProps) {
     activeThread?.session ?? null,
     localDispatchStartedAt,
   );
+
+  // Slice 31 — per-turn snapshot of the user's Thinking toggle. Overwritten
+  // at every Aris dispatch with the composer's current value at send time.
+  // Drives the rolling-reasoning idle phrase: "Thinking…" when ON, a
+  // non-reasoning verb ("Working…") when OFF, so the live status doesn't
+  // lie about what the model is actually doing. `null` means unknown /
+  // never set this session — RollingReasoning falls back to its default.
+  //
+  // We deliberately don't clear between turns: an earlier attempt that
+  // cleared on `!isWorking` raced the local-dispatch → server-acknowledged
+  // handoff, where `isWorking` momentarily flips false (localDispatch is
+  // reset before the orchestration phase stabilizes to "running"), which
+  // wiped the snapshot mid-turn. The working row only renders during an
+  // active turn anyway, so a stale value between turns is invisible — and
+  // the next dispatch overwrites it before it could be displayed.
+  const [activeTurnThinkingEnabled, setActiveTurnThinkingEnabled] = useState<boolean | null>(null);
   useEffect(() => {
     attachmentPreviewHandoffByMessageIdRef.current = attachmentPreviewHandoffByMessageId;
   }, [attachmentPreviewHandoffByMessageId]);
@@ -1193,7 +1323,138 @@ export default function ChatView(props: ChatViewProps) {
       return next;
     });
   }, []);
-  const serverMessages = activeThread?.messages;
+  // Aris-provider threads store their canonical chat content in aris_memory.db,
+  // not in state.sqlite's projection_thread_messages. Fetch directly from the
+  // Aris HTTP API and swap it in once the turn settles — during an active turn
+  // we keep showing the event-driven projection view so streaming stays live.
+  const arisProviderSettings = useSettings((s) => s.providers.aris);
+  const arisHistory = useArisThreadHistory({
+    threadId: activeThread?.id ?? null,
+    provider: activeThread?.session?.provider ?? null,
+    baseUrl: arisProviderSettings.baseUrl,
+    apiKey: arisProviderSettings.apiKey,
+    // RW-2.5 — DS history hydration uses local backend WS, keyed by
+    // the active project's cwd (active.jsonl lives at
+    // ~/.aris/projects/<cwd-key>/sessions/<thread>/). Aris uses HTTP
+    // and ignores these.
+    cwd: activeProject?.cwd ?? null,
+    environmentId,
+  });
+  // Slice 3e-ii-c-2 — accumulate per-tool-call state from the dedicated
+  // Aris bus and feed it into the renderer in place of the orchestration-
+  // derived work-log entries (only for Aris threads; other providers stay
+  // on the existing path).
+  const arisToolEvents = useArisToolEvents({
+    environmentId,
+    threadId: activeThread?.id ?? null,
+    provider: activeThread?.session?.provider ?? null,
+  });
+  const arisRefetch = arisHistory.refetch;
+  // Both Aris and DeepSeek emit tool events through ArisEventBus and
+  // we already wired `useArisToolEvents` to subscribe for both. Without
+  // including DeepSeek here, the synthesized work-log entries get
+  // skipped for DS threads — tool events flow into the void in the UI.
+  const isArisThread =
+    activeThread?.session?.provider === "aris" || activeThread?.session?.provider === "deepseek";
+  // Cut C, slice 3e-ii-c-2 — for Aris threads, replace the orchestration-
+  // derived work-log entries with synthesized ones from the dedicated
+  // `aris.tool.*` event stream. Other providers stay on the existing
+  // orchestration path (Codex/Claude depend on it). Filter by latest turn
+  // so the entries scope matches the orchestration version's behavior.
+  const effectiveWorkLogEntries = useMemo(() => {
+    if (!isArisThread) return workLogEntries;
+    const latestTurnId = activeLatestTurn?.turnId;
+    // Filter by latest turn when both ids are known. Defensive: if a tool
+    // event lacks `turnId` (timing race between turn.started and tool.started
+    // events, or aris_server emitting a tool before the turn-id propagates),
+    // include the call rather than silently drop it. The previous strict
+    // `state.turnId === latestTurnId` check was eating legit tool calls
+    // when the turnId wasn't yet bound on the event side, leaving the
+    // chat UI with no tool cards even though `aris.tool.*` events were
+    // firing on the bus (slice 1.12 follow-up — discovered during the
+    // reasoning-UI fix).
+    return arisToolEvents.toolCalls
+      .filter((state) => {
+        if (!latestTurnId) return true;
+        if (!state.turnId) return true; // unscoped event → include defensively
+        return state.turnId === latestTurnId;
+      })
+      .map(arisToolStateToWorkLogEntry);
+  }, [isArisThread, workLogEntries, arisToolEvents.toolCalls, activeLatestTurn?.turnId]);
+  // Stabilize arisRefetch in a ref. TanStack Query's `refetch` callback
+  // is a new function reference on most renders, which would otherwise
+  // re-run the effects below on every render and cause an infinite
+  // update loop (when the second useEffect lacks a per-render guard).
+  // The ref pattern keeps the latest callback accessible without putting
+  // the unstable reference into the dep array.
+  const arisRefetchRef = useRef(arisRefetch);
+  useEffect(() => {
+    arisRefetchRef.current = arisRefetch;
+  });
+  const wasLatestTurnSettledRef = useRef(latestTurnSettled);
+  useEffect(() => {
+    if (latestTurnSettled && !wasLatestTurnSettledRef.current) {
+      console.log("[aris-refetch] turn-settled fired, refetching", {
+        threadId: activeThread?.id,
+        turnId: activeLatestTurn?.turnId,
+      });
+      arisRefetchRef.current();
+      // Cut C punch list (Phase 3b) — also poke the sidebar so it picks
+      // up `lastActiveAt` updates and any auto-generated title that
+      // landed during this turn. Cheap (one /v1/threads fetch) and only
+      // fires once per settle.
+      if (isArisThread) {
+        triggerArisSidebarRefresh();
+      }
+    }
+    wasLatestTurnSettledRef.current = latestTurnSettled;
+  }, [latestTurnSettled, isArisThread]);
+  // Refetch on turn START too. aris_server persists the user message to
+  // aris_memory.db BEFORE the agentic loop runs, but the hook above only
+  // refetches on turn END. Without this, during an active turn the fetched
+  // history is stale (missing the just-sent user bubble), which makes the
+  // working/reasoning row appear to float far above the last assistant reply.
+  const activeLatestTurnId = activeLatestTurn?.turnId ?? null;
+  useEffect(() => {
+    if (isArisThread && activeLatestTurnId) {
+      arisRefetchRef.current();
+    }
+  }, [isArisThread, activeLatestTurnId]);
+
+  // Sidebar thread-list refresh on `aris.thread.persisted`. ArisAdapter
+  // publishes that event the moment it receives the first SSE envelope
+  // frame from aris_server containing `conversation_id` — which is the
+  // earliest the client can KNOW the conversation row was persisted to
+  // aris_memory.db. Refreshing here (instead of on `aris.turn.started`
+  // like an earlier attempt) avoids the race where /v1/threads is queried
+  // before the row exists and returns empty for a brand-new thread on
+  // a brand-new project.
+  const activeThreadEnvironmentId = activeThread?.environmentId ?? null;
+  useEffect(() => {
+    if (!isArisThread || !activeThreadId || !activeThreadEnvironmentId) {
+      return;
+    }
+    const api = readEnvironmentApi(activeThreadEnvironmentId);
+    if (!api) {
+      return;
+    }
+    const unsubscribe = api.aris.subscribeEvents({ threadId: activeThreadId }, (event) => {
+      if (event.type === "aris.thread.persisted") {
+        triggerArisSidebarRefresh();
+      }
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, [isArisThread, activeThreadId, activeThreadEnvironmentId]);
+  // Aris: aris_memory.db is always the source of truth for chat content.
+  // No latestTurnSettled guard — there's no projection to fall back to,
+  // so we render the fetched history whenever it's loaded, even mid-turn.
+  // In-flight streaming content is rendered as a synthetic in-flight assistant
+  // row inside MessagesTimeline's `rows` (driven by `useLiveAssistantBuffer`),
+  // not as a separate buffer in the list footer.
+  const serverMessages =
+    isArisThread && arisHistory.messages !== null ? arisHistory.messages : activeThread?.messages;
   useEffect(() => {
     if (typeof Image === "undefined" || !serverMessages || serverMessages.length === 0) {
       return;
@@ -1321,8 +1582,9 @@ export default function ChatView(props: ChatViewProps) {
     if (optimisticUserMessages.length === 0) {
       return serverMessagesWithPreviewHandoff;
     }
-    const serverIds = new Set(serverMessagesWithPreviewHandoff.map((message) => message.id));
-    const pendingMessages = optimisticUserMessages.filter((message) => !serverIds.has(message.id));
+    const pendingMessages = optimisticUserMessages.filter(
+      (message) => !optimisticIsSettled(message, serverMessagesWithPreviewHandoff),
+    );
     if (pendingMessages.length === 0) {
       return serverMessagesWithPreviewHandoff;
     }
@@ -1330,8 +1592,12 @@ export default function ChatView(props: ChatViewProps) {
   }, [serverMessages, attachmentPreviewHandoffByMessageId, optimisticUserMessages]);
   const timelineEntries = useMemo(
     () =>
-      deriveTimelineEntries(timelineMessages, activeThread?.proposedPlans ?? [], workLogEntries),
-    [activeThread?.proposedPlans, timelineMessages, workLogEntries],
+      deriveTimelineEntries(
+        timelineMessages,
+        activeThread?.proposedPlans ?? [],
+        effectiveWorkLogEntries,
+      ),
+    [activeThread?.proposedPlans, timelineMessages, effectiveWorkLogEntries],
   );
   const { turnDiffSummaries, inferredCheckpointTurnCountByTurnId } =
     useTurnDiffSummaries(activeThread);
@@ -1411,6 +1677,19 @@ export default function ChatView(props: ChatViewProps) {
   const activeProjectCwd = activeProject?.cwd ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
   const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;
+
+  // Resolve the Aris project_id for the active thread's cwd so the memory
+  // sidebar can request the hybrid (globals + this-project) graph slice
+  // from `/v1/memory/graph?project_id=N` instead of the unscoped grab-bag
+  // that lets other projects' rows bleed in. Returns null on non-Aris
+  // threads, before the lookup resolves, and on lookup failure — sidebar
+  // handles null by omitting the query param (i.e. unscoped fallback).
+  const arisProjectId = useArisProjectId({
+    provider: activeThread?.session?.provider ?? null,
+    baseUrl: arisProviderSettings.baseUrl,
+    apiKey: arisProviderSettings.apiKey,
+    cwd: activeProjectCwd,
+  });
   const activeTerminalLaunchContext =
     terminalLaunchContext?.threadId === activeThreadId
       ? terminalLaunchContext
@@ -2016,17 +2295,22 @@ export default function ChatView(props: ChatViewProps) {
 
   useEffect(() => {
     if (!activeThread?.id) return;
-    if (activeThread.messages.length === 0) {
+    // Use `serverMessages` (not `activeThread.messages`) so Aris threads — whose
+    // canonical source is aris_memory.db, not the state.sqlite projection —
+    // actually participate in optimistic cleanup. Without this, optimistic user
+    // messages piled up across turns and rendered as a tail of stale duplicates.
+    if (!serverMessages || serverMessages.length === 0) {
       return;
     }
-    const serverIds = new Set(activeThread.messages.map((message) => message.id));
-    const removedMessages = optimisticUserMessages.filter((message) => serverIds.has(message.id));
+    const removedMessages = optimisticUserMessages.filter((message) =>
+      optimisticIsSettled(message, serverMessages),
+    );
     if (removedMessages.length === 0) {
       return;
     }
     const timer = window.setTimeout(() => {
       setOptimisticUserMessages((existing) =>
-        existing.filter((message) => !serverIds.has(message.id)),
+        existing.filter((message) => !optimisticIsSettled(message, serverMessages)),
       );
     }, 0);
     for (const removedMessage of removedMessages) {
@@ -2040,7 +2324,7 @@ export default function ChatView(props: ChatViewProps) {
     return () => {
       window.clearTimeout(timer);
     };
-  }, [activeThread?.id, activeThread?.messages, handoffAttachmentPreviews, optimisticUserMessages]);
+  }, [activeThread?.id, serverMessages, handoffAttachmentPreviews, optimisticUserMessages]);
 
   useEffect(() => {
     setOptimisticUserMessages((existing) => {
@@ -2336,7 +2620,17 @@ export default function ChatView(props: ChatViewProps) {
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     const api = readEnvironmentApi(environmentId);
-    if (!api || !activeThread || isSendBusy || isConnecting || sendInFlightRef.current) return;
+    // Slice 9.14: use `isWorking` instead of just isSendBusy/isConnecting.
+    // `isWorking` includes phase==="running" — the actual "agentic turn is
+    // mid-flight" state. Without this, user messages sent while Aris is
+    // doing client-tool round-trips (read_file/edit_file) slip through in
+    // the brief gaps between SSE round-trips and pile up un-responded-to
+    // until the agentic chain fully settles. Result is the user feels
+    // ignored even though Aris is actively working. Blocking sends here
+    // forces "interrupt then resend" workflow which is the correct UX.
+    if (!api || !activeThread || isWorking || sendInFlightRef.current) {
+      return;
+    }
     if (activePendingProgress) {
       onAdvanceActivePendingUserInput();
       return;
@@ -2351,6 +2645,7 @@ export default function ChatView(props: ChatViewProps) {
       selectedProviderModels: ctxSelectedProviderModels,
       selectedPromptEffort: ctxSelectedPromptEffort,
       selectedModelSelection: ctxSelectedModelSelection,
+      enableThinking: ctxEnableThinking,
     } = sendCtx;
     const promptForSend = promptRef.current;
     const {
@@ -2429,7 +2724,10 @@ export default function ChatView(props: ChatViewProps) {
       composerTerminalContextsSnapshot,
     );
     const messageIdForSend = newMessageId();
-    const messageCreatedAt = new Date().toISOString();
+    const messageCreatedAt = monotonicCreatedAtAfter([
+      ...(serverMessages ?? []),
+      ...optimisticUserMessagesRef.current,
+    ]);
     const outgoingMessageText = formatOutgoingPrompt({
       provider: ctxSelectedProvider,
       model: ctxSelectedModel,
@@ -2510,16 +2808,21 @@ export default function ChatView(props: ChatViewProps) {
         }
       }
       const title = truncate(titleSeed);
-      const threadCreateModelSelection: ModelSelection = {
+      const threadCreateModelSelection = {
         provider: ctxSelectedProvider,
+        // Slice 1.16: model fallback uses the provider-specific default
+        // (aris → DEFAULT_MODEL_BY_PROVIDER.aris, codex → ...codex), not
+        // the hardcoded codex one. Pre-fix the fallback always returned
+        // a codex model slug regardless of which provider was selected.
         model:
           ctxSelectedModel ||
           activeProject.defaultModelSelection?.model ||
+          DEFAULT_MODEL_BY_PROVIDER[ctxSelectedProvider] ||
           DEFAULT_MODEL_BY_PROVIDER.codex,
         ...(ctxSelectedModelSelection.options
           ? { options: ctxSelectedModelSelection.options }
           : {}),
-      };
+      } as ModelSelection;
 
       // Auto-title from first message
       if (isFirstMessage && isServerThread) {
@@ -2572,6 +2875,9 @@ export default function ChatView(props: ChatViewProps) {
             }
           : undefined;
       beginLocalDispatch({ preparingWorktree: false });
+      if (ctxSelectedProvider === "aris") {
+        setActiveTurnThinkingEnabled(ctxEnableThinking);
+      }
       await api.orchestration.dispatchCommand({
         type: "thread.turn.start",
         commandId: newCommandId(),
@@ -2586,6 +2892,10 @@ export default function ChatView(props: ChatViewProps) {
         titleSeed: title,
         runtimeMode,
         interactionMode,
+        // Slice 31 — only attach the toggle when the active provider is Aris.
+        // Codex / Claude adapters ignore the field, but threading it through
+        // unconditionally would muddy event payloads; keep it provider-scoped.
+        ...(ctxSelectedProvider === "aris" ? { enableThinking: ctxEnableThinking } : {}),
         ...(bootstrap ? { bootstrap } : {}),
         createdAt: messageCreatedAt,
       });
@@ -2618,10 +2928,25 @@ export default function ChatView(props: ChatViewProps) {
           detectTrigger: true,
         });
       }
-      setThreadError(
-        threadIdForSend,
-        err instanceof Error ? err.message : "Failed to send message.",
-      );
+      const errorMessage = err instanceof Error ? err.message : "Failed to send message.";
+      setThreadError(threadIdForSend, errorMessage);
+      // Also surface a global toast — when the bootstrap path fails (e.g.
+      // worktree creation against a branch that doesn't exist), the
+      // freshly-created thread is rolled back via `cleanupCreatedThread`,
+      // so the per-thread `ThreadErrorBanner` has no surface to render
+      // against by the time the user sees anything. The toast is route-
+      // independent and survives the kick-to-/, so the user sees the
+      // actual cause regardless of where they land.
+      //
+      // Timeout is doubled vs. the Base UI default (5000ms) — error
+      // messages can be long and worth pausing on, and the user may want
+      // a moment to copy or screenshot the cause.
+      toastManager.add({
+        type: "error",
+        title: "Couldn't send message",
+        description: errorMessage,
+        timeout: 10_000,
+      });
     });
     sendInFlightRef.current = false;
     if (!turnStartSucceeded) {
@@ -2648,24 +2973,39 @@ export default function ChatView(props: ChatViewProps) {
       setRespondingRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
       );
-      await api.orchestration
-        .dispatchCommand({
-          type: "thread.approval.respond",
-          commandId: newCommandId(),
-          threadId: activeThreadId,
-          requestId,
-          decision,
-          createdAt: new Date().toISOString(),
-        })
-        .catch((err: unknown) => {
-          setThreadError(
-            activeThreadId,
-            err instanceof Error ? err.message : "Failed to submit approval decision.",
-          );
-        });
+      // Cut C, slice 3e-iii-b-ii — Aris threads use the dedicated
+      // `aris.approval.decide` RPC straight to ArisAdapter.respondToRequest,
+      // bypassing the orchestration command/reactor pipeline. Other providers
+      // continue to dispatch through orchestration.
+      // DeepSeek shares ArisAdapter's approval RPC pipeline (same event
+      // bus, same pendingApprovals map). When we add the DS approval
+      // gate (Slice 22), this branch must dispatch through aris.* not
+      // orchestration — DS threads don't have orchestration sessions
+      // and the dispatch would silently drop.
+      const responsePromise =
+        activeThread?.session?.provider === "aris" || activeThread?.session?.provider === "deepseek"
+          ? api.aris.decideApproval({
+              threadId: activeThreadId,
+              approvalId: requestId,
+              decision,
+            })
+          : api.orchestration.dispatchCommand({
+              type: "thread.approval.respond",
+              commandId: newCommandId(),
+              threadId: activeThreadId,
+              requestId,
+              decision,
+              createdAt: new Date().toISOString(),
+            });
+      await responsePromise.catch((err: unknown) => {
+        setThreadError(
+          activeThreadId,
+          err instanceof Error ? err.message : "Failed to submit approval decision.",
+        );
+      });
       setRespondingRequestIds((existing) => existing.filter((id) => id !== requestId));
     },
-    [activeThreadId, environmentId, setThreadError],
+    [activeThread?.session?.provider, activeThreadId, environmentId, setThreadError],
   );
 
   const onRespondToUserInput = useCallback(
@@ -2837,11 +3177,15 @@ export default function ChatView(props: ChatViewProps) {
         selectedProviderModels: ctxSelectedProviderModels,
         selectedPromptEffort: ctxSelectedPromptEffort,
         selectedModelSelection: ctxSelectedModelSelection,
+        enableThinking: ctxEnableThinking,
       } = sendCtx;
 
       const threadIdForSend = activeThread.id;
       const messageIdForSend = newMessageId();
-      const messageCreatedAt = new Date().toISOString();
+      const messageCreatedAt = monotonicCreatedAtAfter([
+        ...(serverMessages ?? []),
+        ...optimisticUserMessagesRef.current,
+      ]);
       const outgoingMessageText = formatOutgoingPrompt({
         provider: ctxSelectedProvider,
         model: ctxSelectedModel,
@@ -2887,6 +3231,9 @@ export default function ChatView(props: ChatViewProps) {
           nextInteractionMode,
         );
 
+        if (ctxSelectedProvider === "aris") {
+          setActiveTurnThinkingEnabled(ctxEnableThinking);
+        }
         await api.orchestration.dispatchCommand({
           type: "thread.turn.start",
           commandId: newCommandId(),
@@ -2901,6 +3248,8 @@ export default function ChatView(props: ChatViewProps) {
           titleSeed: activeThread.title,
           runtimeMode,
           interactionMode: nextInteractionMode,
+          // Slice 31 — only attach the Thinking toggle for Aris.
+          ...(ctxSelectedProvider === "aris" ? { enableThinking: ctxEnableThinking } : {}),
           ...(nextInteractionMode === "default" && activeProposedPlan
             ? {
                 sourceProposedPlan: {
@@ -2972,6 +3321,7 @@ export default function ChatView(props: ChatViewProps) {
       selectedProviderModels: ctxSelectedProviderModels,
       selectedPromptEffort: ctxSelectedPromptEffort,
       selectedModelSelection: ctxSelectedModelSelection,
+      enableThinking: ctxEnableThinking,
     } = sendCtx;
 
     const createdAt = new Date().toISOString();
@@ -3010,6 +3360,9 @@ export default function ChatView(props: ChatViewProps) {
         createdAt,
       })
       .then(() => {
+        if (ctxSelectedProvider === "aris") {
+          setActiveTurnThinkingEnabled(ctxEnableThinking);
+        }
         return api.orchestration.dispatchCommand({
           type: "thread.turn.start",
           commandId: newCommandId(),
@@ -3024,6 +3377,8 @@ export default function ChatView(props: ChatViewProps) {
           titleSeed: nextThreadTitle,
           runtimeMode,
           interactionMode: "default",
+          // Slice 31 — only attach the Thinking toggle for Aris.
+          ...(ctxSelectedProvider === "aris" ? { enableThinking: ctxEnableThinking } : {}),
           sourceProposedPlan: {
             threadId: activeThread.id,
             planId: activeProposedPlan.id,
@@ -3231,6 +3586,11 @@ export default function ChatView(props: ChatViewProps) {
         error={activeThread.error}
         onDismiss={() => setThreadError(activeThread.id, null)}
       />
+      {/* BAL-4 (2026-05-10): low-balance warning for the Aris (DeepSeek)
+          provider. Renders only when the provider is activated AND the
+          fetched balance is at or below 50¢. Informational only —
+          enforcement at $0 lives cloud-side. */}
+      <DeepSeekLowBalanceBanner />
       {/* Main content area with optional plan sidebar */}
       <div className="flex min-h-0 min-w-0 flex-1">
         {/* Chat column */}
@@ -3243,13 +3603,17 @@ export default function ChatView(props: ChatViewProps) {
               isWorking={isWorking}
               activeTurnInProgress={isWorking || !latestTurnSettled}
               activeTurnId={activeLatestTurn?.turnId ?? null}
+              activeThreadId={activeThread.id}
               activeTurnStartedAt={activeWorkStartedAt}
               listRef={legendListRef}
               timelineEntries={timelineEntries}
+              liveStatusEntry={liveStatusEntry}
               completionDividerBeforeEntryId={completionDividerBeforeEntryId}
               completionSummary={completionSummary}
               turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
               activeThreadEnvironmentId={activeThread.environmentId}
+              activeThreadProvider={activeThread.session?.provider ?? null}
+              activeTurnThinkingEnabled={activeTurnThinkingEnabled}
               routeThreadKey={routeThreadKey}
               onOpenTurnDiff={onOpenTurnDiff}
               revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
@@ -3410,6 +3774,45 @@ export default function ChatView(props: ChatViewProps) {
                 activePlan?.turnId ?? sidebarProposedPlan?.turnId ?? "__dismissed__";
             }}
           />
+        ) : null}
+
+        {/* Aris context sidebar — persistent right panel for the LEGACY
+            "aris" provider only (Qwen3.6 / POD-backed memory graph). DS
+            uses jsonl files for memory and gets its own COORD-6 sidebar
+            below, so this panel would render empty for DS. Narrowed
+            from `isArisThread` (which is true for both aris+deepseek
+            for event-channel-sharing reasons) to a strict provider
+            check so the DS-as-Aris UI doesn't carry a leftover empty
+            "Aris Context" pane. 2026-05-11. */}
+        {activeThread?.session?.provider === "aris" ? (
+          <MemorySidebar
+            provider={activeThread?.session?.provider ?? null}
+            arisBaseUrl={arisProviderSettings.baseUrl}
+            arisApiKey={arisProviderSettings.apiKey}
+            {...(arisProjectId !== null ? { projectId: arisProjectId } : {})}
+            environmentId={activeThread?.environmentId ?? null}
+            threadId={activeThreadId}
+          />
+        ) : null}
+
+        {/* COORD-6.3 — Right-sidebar panels for DeepSeek threads.
+            Coordinator activity (live workers + session scratchpad)
+            on top, project todos below. Both gated to provider ===
+            "deepseek" — they have nothing to show for Aris/Codex/
+            Claude threads. */}
+        {activeThread?.session?.provider === "deepseek" ? (
+          <div className="w-72 flex-shrink-0 border-l border-zinc-200 dark:border-zinc-800 overflow-y-auto flex flex-col gap-4 py-3">
+            <CoordinatorActivityPanel
+              threadId={activeThreadId}
+              environmentId={activeThread?.environmentId ?? null}
+              provider={activeThread?.session?.provider ?? null}
+            />
+            <ProjectTodosPanel
+              threadId={activeThreadId}
+              environmentId={activeThread?.environmentId ?? null}
+              provider={activeThread?.session?.provider ?? null}
+            />
+          </div>
         ) : null}
       </div>
       {/* end horizontal flex container */}

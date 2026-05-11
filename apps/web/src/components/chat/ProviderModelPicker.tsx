@@ -18,7 +18,16 @@ import {
   MenuSubTrigger,
   MenuTrigger,
 } from "../ui/menu";
-import { ClaudeAI, CursorIcon, Gemini, Icon, OpenAI, OpenCodeIcon } from "../Icons";
+import {
+  ArisIcon,
+  ClaudeAI,
+  CursorIcon,
+  DeepSeekIcon,
+  Gemini,
+  Icon,
+  OpenAI,
+  OpenCodeIcon,
+} from "../Icons";
 import { cn } from "~/lib/utils";
 import { getProviderSnapshot } from "../../providerModels";
 
@@ -26,18 +35,32 @@ function isAvailableProviderOption(option: (typeof PROVIDER_OPTIONS)[number]): o
   value: ProviderKind;
   label: string;
   available: true;
+  hidden?: boolean;
 } {
   return option.available;
+}
+
+// Cosmetic relabel (2026-05-10): hidden options (currently the legacy
+// `"aris"` provider) are filtered out of every list the picker renders.
+// They stay in PROVIDER_OPTIONS so TypeScript exhaustiveness across
+// ProviderKind keeps working.
+function isVisibleProviderOption(option: (typeof PROVIDER_OPTIONS)[number]): boolean {
+  return option.hidden !== true;
 }
 
 const PROVIDER_ICON_BY_PROVIDER: Record<ProviderPickerKind, Icon> = {
   codex: OpenAI,
   claudeAgent: ClaudeAI,
+  aris: ArisIcon,
+  deepseek: DeepSeekIcon,
   cursor: CursorIcon,
 };
 
-export const AVAILABLE_PROVIDER_OPTIONS = PROVIDER_OPTIONS.filter(isAvailableProviderOption);
-const UNAVAILABLE_PROVIDER_OPTIONS = PROVIDER_OPTIONS.filter((option) => !option.available);
+export const AVAILABLE_PROVIDER_OPTIONS =
+  PROVIDER_OPTIONS.filter(isVisibleProviderOption).filter(isAvailableProviderOption);
+const UNAVAILABLE_PROVIDER_OPTIONS = PROVIDER_OPTIONS.filter(isVisibleProviderOption).filter(
+  (option) => !option.available,
+);
 const COMING_SOON_PROVIDER_OPTIONS = [
   { id: "opencode", label: "OpenCode", icon: OpenCodeIcon },
   { id: "gemini", label: "Gemini", icon: Gemini },

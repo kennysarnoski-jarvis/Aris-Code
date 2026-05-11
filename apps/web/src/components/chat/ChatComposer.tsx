@@ -85,6 +85,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
 import {
   BotIcon,
+  BrainIcon,
   CircleAlertIcon,
   ListTodoIcon,
   type LucideIcon,
@@ -160,16 +161,27 @@ const terminalContextIdListsEqual = (
 
 const ComposerFooterModeControls = memo(function ComposerFooterModeControls(props: {
   interactionMode: ProviderInteractionMode;
+  isPlanModeAvailable: boolean;
   runtimeMode: RuntimeMode;
   showPlanToggle: boolean;
   planSidebarLabel: string;
   planSidebarOpen: boolean;
+  /** Slice 31 — only render the Thinking toggle for the Aris provider. */
+  showThinkingToggle: boolean;
+  thinkingEnabled: boolean;
   onToggleInteractionMode: () => void;
   onRuntimeModeChange: (mode: RuntimeMode) => void;
   onTogglePlanSidebar: () => void;
+  onToggleThinking: () => void;
 }) {
   const runtimeModeOption = runtimeModeConfig[props.runtimeMode];
   const RuntimeModeIcon = runtimeModeOption.icon;
+  const interactionModeLabel = props.interactionMode === "plan" ? "Plan" : "Build";
+  const interactionModeTitle = !props.isPlanModeAvailable
+    ? "Plan mode is not available for Aris."
+    : props.interactionMode === "plan"
+      ? "Plan mode — click to return to normal build mode"
+      : "Default mode — click to enter plan mode";
 
   return (
     <>
@@ -177,20 +189,15 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
 
       <Button
         variant="ghost"
-        className="shrink-0 whitespace-nowrap px-2 text-muted-foreground/70 hover:text-foreground/80 sm:px-3"
+        className="shrink-0 whitespace-nowrap px-2 text-muted-foreground/70 hover:text-foreground/80 disabled:opacity-40 disabled:hover:text-muted-foreground/70 sm:px-3"
         size="sm"
         type="button"
         onClick={props.onToggleInteractionMode}
-        title={
-          props.interactionMode === "plan"
-            ? "Plan mode — click to return to normal build mode"
-            : "Default mode — click to enter plan mode"
-        }
+        disabled={!props.isPlanModeAvailable}
+        title={interactionModeTitle}
       >
         <BotIcon />
-        <span className="sr-only sm:not-sr-only">
-          {props.interactionMode === "plan" ? "Plan" : "Build"}
-        </span>
+        <span className="sr-only sm:not-sr-only">{interactionModeLabel}</span>
       </Button>
 
       <Separator orientation="vertical" className="mx-0.5 hidden h-4 sm:block" />
@@ -229,6 +236,35 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
           })}
         </SelectPopup>
       </Select>
+
+      {props.showThinkingToggle ? (
+        <>
+          <Separator orientation="vertical" className="mx-0.5 hidden h-4 sm:block" />
+          <Button
+            variant="ghost"
+            className={cn(
+              "shrink-0 whitespace-nowrap px-2 sm:px-3",
+              props.thinkingEnabled
+                ? "text-violet-400 hover:text-violet-300"
+                : "text-muted-foreground/70 hover:text-foreground/80",
+            )}
+            size="sm"
+            type="button"
+            onClick={props.onToggleThinking}
+            title={
+              props.thinkingEnabled
+                ? "Thinking ON — Aris reasons before responding (slower, deeper). Click to turn off."
+                : "Thinking OFF — Aris responds without an explicit reasoning pass (faster, shallower). Click to turn on."
+            }
+            aria-pressed={props.thinkingEnabled}
+          >
+            <BrainIcon />
+            <span className="sr-only sm:not-sr-only">
+              Think{props.thinkingEnabled ? "" : " off"}
+            </span>
+          </Button>
+        </>
+      ) : null}
 
       {props.showPlanToggle ? (
         <>
@@ -336,6 +372,11 @@ export interface ChatComposerHandle {
     selectedProvider: ProviderKind;
     selectedModel: string;
     selectedProviderModels: ReadonlyArray<ServerProvider["models"][number]>;
+    /**
+     * Slice 31 — per-message Thinking toggle. `true` / `false` overrides the
+     * server's default (currently ON); only the Aris provider acts on it.
+     */
+    enableThinking: boolean;
   };
 }
 
@@ -559,6 +600,16 @@ export const ChatComposer = memo(
     );
     const selectedProvider: ProviderKind = lockedProvider ?? unlockedSelectedProvider;
 
+    // Plan mode is a Codex/Claude capability; Qwen 3.6 isn't trained for it,
+    // so we'd rather show an honest "not available for Aris" affordance than
+    // silently fall through to Build. The toggle is disabled and the displayed
+    // mode is forced to "default" when Aris is selected, regardless of any
+    // stale "plan" value persisted on the thread draft.
+    const isPlanModeAvailable = selectedProvider !== "aris";
+    const effectiveInteractionMode: ProviderInteractionMode = isPlanModeAvailable
+      ? interactionMode
+      : "default";
+
     const { modelOptions: composerModelOptions, selectedModel } = useEffectiveComposerModelState({
       threadRef: composerDraftTarget,
       providers: providerStatuses,
@@ -589,11 +640,12 @@ export const ChatComposer = memo(
     const selectedPromptEffort = composerProviderState.promptEffort;
     const selectedModelOptionsForDispatch = composerProviderState.modelOptionsForDispatch;
     const selectedModelSelection = useMemo<ModelSelection>(
-      () => ({
-        provider: selectedProvider,
-        model: selectedModel,
-        ...(selectedModelOptionsForDispatch ? { options: selectedModelOptionsForDispatch } : {}),
-      }),
+      () =>
+        ({
+          provider: selectedProvider,
+          model: selectedModel,
+          ...(selectedModelOptionsForDispatch ? { options: selectedModelOptionsForDispatch } : {}),
+        }) as ModelSelection,
       [selectedModel, selectedModelOptionsForDispatch, selectedProvider],
     );
     const selectedModelForPicker = selectedModel;
@@ -604,6 +656,9 @@ export const ChatComposer = memo(
         codex: providerStatuses.find((provider) => provider.provider === "codex")?.models ?? [],
         claudeAgent:
           providerStatuses.find((provider) => provider.provider === "claudeAgent")?.models ?? [],
+        aris: providerStatuses.find((provider) => provider.provider === "aris")?.models ?? [],
+        deepseek:
+          providerStatuses.find((provider) => provider.provider === "deepseek")?.models ?? [],
       }),
       [providerStatuses],
     );
@@ -655,6 +710,13 @@ export const ChatComposer = memo(
     const [isDragOverComposer, setIsDragOverComposer] = useState(false);
     const [isComposerFooterCompact, setIsComposerFooterCompact] = useState(false);
     const [isComposerPrimaryActionsCompact, setIsComposerPrimaryActionsCompact] = useState(false);
+    // Slice 31 — per-message Thinking toggle. Defaults ON; persists across
+    // messages within the composer session and resets on remount. Only the
+    // Aris provider reads this value server-side; Codex / Claude ignore it.
+    const [thinkingEnabled, setThinkingEnabled] = useState(true);
+    const toggleThinkingEnabled = useCallback(() => {
+      setThinkingEnabled((value) => !value);
+    }, []);
 
     // ------------------------------------------------------------------
     // Refs
@@ -1690,6 +1752,7 @@ export const ChatComposer = memo(
           selectedProvider,
           selectedModel,
           selectedProviderModels,
+          enableThinking: thinkingEnabled,
         }),
       }),
       [
@@ -1708,6 +1771,7 @@ export const ChatComposer = memo(
         selectedPromptEffort,
         selectedProvider,
         selectedProviderModels,
+        thinkingEnabled,
       ],
     );
 
@@ -1929,14 +1993,18 @@ export const ChatComposer = memo(
                   {isComposerFooterCompact ? (
                     <CompactComposerControlsMenu
                       activePlan={showPlanSidebarToggle}
-                      interactionMode={interactionMode}
+                      interactionMode={effectiveInteractionMode}
+                      isPlanModeAvailable={isPlanModeAvailable}
                       planSidebarLabel={planSidebarLabel}
                       planSidebarOpen={planSidebarOpen}
                       runtimeMode={runtimeMode}
                       traitsMenuContent={providerTraitsMenuContent}
+                      showThinkingToggle={selectedProvider === "aris"}
+                      thinkingEnabled={thinkingEnabled}
                       onToggleInteractionMode={toggleInteractionMode}
                       onTogglePlanSidebar={togglePlanSidebar}
                       onRuntimeModeChange={handleRuntimeModeChange}
+                      onToggleThinking={toggleThinkingEnabled}
                     />
                   ) : (
                     <>
@@ -1950,14 +2018,18 @@ export const ChatComposer = memo(
                         </>
                       ) : null}
                       <ComposerFooterModeControls
-                        interactionMode={interactionMode}
+                        interactionMode={effectiveInteractionMode}
+                        isPlanModeAvailable={isPlanModeAvailable}
                         runtimeMode={runtimeMode}
                         showPlanToggle={showPlanSidebarToggle}
                         planSidebarLabel={planSidebarLabel}
                         planSidebarOpen={planSidebarOpen}
+                        showThinkingToggle={selectedProvider === "aris"}
+                        thinkingEnabled={thinkingEnabled}
                         onToggleInteractionMode={toggleInteractionMode}
                         onRuntimeModeChange={handleRuntimeModeChange}
                         onTogglePlanSidebar={togglePlanSidebar}
+                        onToggleThinking={toggleThinkingEnabled}
                       />
                     </>
                   )}

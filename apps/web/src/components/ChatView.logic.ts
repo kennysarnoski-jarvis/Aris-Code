@@ -226,15 +226,33 @@ export function threadHasStarted(thread: Thread | null | undefined): boolean {
   );
 }
 
-export function deriveLockedProvider(input: {
+export function deriveLockedProvider(_input: {
   thread: Thread | null | undefined;
   selectedProvider: ProviderKind | null;
   threadProvider: ProviderKind | null;
 }): ProviderKind | null {
-  if (!threadHasStarted(input.thread)) {
-    return null;
-  }
-  return input.thread?.session?.provider ?? input.threadProvider ?? input.selectedProvider ?? null;
+  // The provider lock used to pin a started thread to whichever
+  // provider created it (Aris-created → Aris-locked, etc.) on the
+  // theory that mid-conversation provider swaps would corrupt state.
+  //
+  // Removed because the assumption no longer holds:
+  //   1. With the rolling-window memory architecture, conversation
+  //      history is or is becoming provider-agnostic JSONL on disk —
+  //      any provider can read it back.
+  //   2. The lock was actively hostile when a provider became
+  //      unreachable (POD off, etc.) — users got stranded in old
+  //      threads with no way to keep working.
+  //   3. The persona is portable across providers (the Aris persona
+  //      injects the same way for DS as it does for Aris-on-POD), so
+  //      "this thread was started by Aris" doesn't carry runtime
+  //      semantics worth protecting.
+  //
+  // Returning null = picker is always unrestricted. Users can switch
+  // provider mid-thread; if the new provider has no local copy of
+  // this thread's history (e.g. switching an aris_memory.db-backed
+  // Aris thread to DS), it just starts fresh until file-based history
+  // migration lands.
+  return null;
 }
 
 export async function waitForStartedServerThread(

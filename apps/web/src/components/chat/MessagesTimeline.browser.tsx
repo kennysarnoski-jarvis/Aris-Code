@@ -1,6 +1,6 @@
 import "../../index.css";
 
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { createRef } from "react";
 import type { LegendListRef } from "@legendapp/list/react";
 import { page } from "vitest/browser";
@@ -54,6 +54,7 @@ function buildProps() {
     activeTurnInProgress: false,
     activeTurnId: null,
     activeTurnStartedAt: null,
+    liveStatusEntry: null,
     listRef: createRef<LegendListRef | null>(),
     completionDividerBeforeEntryId: null,
     completionSummary: null,
@@ -65,6 +66,8 @@ function buildProps() {
     isRevertingCheckpoint: false,
     onImageExpand: vi.fn(),
     activeThreadEnvironmentId: EnvironmentId.make("environment-local"),
+    activeThreadId: ThreadId.make("thread-1"),
+    activeThreadProvider: null,
     markdownCwd: undefined,
     resolvedTheme: "dark" as const,
     timestampFormat: "24-hour" as const,

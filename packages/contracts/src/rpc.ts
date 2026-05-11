@@ -3,7 +3,13 @@ import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 
 import { OpenError, OpenInEditorInput } from "./editor";
+import {
+  WsArisApprovalDecideRpc,
+  WsArisArchiveReadRpc,
+  WsSubscribeArisEventsRpc,
+} from "./arisEvent";
 import { AuthAccessStreamEvent } from "./auth";
+import { WsSubscribeEphemeralReasoningRpc } from "./ephemeral";
 import { FilesystemBrowseInput, FilesystemBrowseResult, FilesystemBrowseError } from "./filesystem";
 import {
   GitActionProgressEvent,
@@ -389,4 +395,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationReplayEventsRpc,
   WsOrchestrationSubscribeShellRpc,
   WsOrchestrationSubscribeThreadRpc,
+  WsSubscribeEphemeralReasoningRpc,
+  WsSubscribeArisEventsRpc,
+  WsArisApprovalDecideRpc,
+  WsArisArchiveReadRpc,
 );

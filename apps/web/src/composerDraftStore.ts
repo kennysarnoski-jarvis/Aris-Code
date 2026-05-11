@@ -2,6 +2,7 @@ import {
   CODEX_REASONING_EFFORT_OPTIONS,
   type ClaudeCodeEffort,
   type CodexReasoningEffort,
+  type DeepSeekReasoningEffort,
   DEFAULT_MODEL_BY_PROVIDER,
   type EnvironmentId,
   ModelSelection,
@@ -528,7 +529,9 @@ function shouldRemoveDraft(draft: ComposerThreadDraftState): boolean {
 }
 
 function normalizeProviderKind(value: unknown): ProviderKind | null {
-  return value === "codex" || value === "claudeAgent" ? value : null;
+  return value === "codex" || value === "claudeAgent" || value === "aris" || value === "deepseek"
+    ? value
+    : null;
 }
 
 function normalizeProviderModelOptions(
@@ -544,6 +547,14 @@ function normalizeProviderModelOptions(
   const claudeCandidate =
     candidate?.claudeAgent && typeof candidate.claudeAgent === "object"
       ? (candidate.claudeAgent as Record<string, unknown>)
+      : null;
+  const arisCandidate =
+    candidate?.aris && typeof candidate.aris === "object"
+      ? (candidate.aris as Record<string, unknown>)
+      : null;
+  const deepseekCandidate =
+    candidate?.deepseek && typeof candidate.deepseek === "object"
+      ? (candidate.deepseek as Record<string, unknown>)
       : null;
 
   const codexReasoningEffort: CodexReasoningEffort | undefined =
@@ -613,12 +624,30 @@ function normalizeProviderModelOptions(
         }
       : undefined;
 
-  if (!codex && !claude) {
+  const arisThinking =
+    arisCandidate?.thinking === true ? true : arisCandidate?.thinking === false ? false : undefined;
+  const aris = arisThinking !== undefined ? { thinking: arisThinking } : undefined;
+
+  // DeepSeek effort — keep the allow-list aligned with
+  // DEEPSEEK_REASONING_EFFORT_OPTIONS in @t3tools/contracts.
+  // Without this branch the picker write { deepseek: { effort } } gets
+  // dropped on the next normalize pass and the picker reverts.
+  const deepseekEffort: DeepSeekReasoningEffort | undefined =
+    deepseekCandidate?.effort === "light" ||
+    deepseekCandidate?.effort === "high" ||
+    deepseekCandidate?.effort === "max"
+      ? deepseekCandidate.effort
+      : undefined;
+  const deepseek = deepseekEffort !== undefined ? { effort: deepseekEffort } : undefined;
+
+  if (!codex && !claude && !aris && !deepseek) {
     return null;
   }
   return {
     ...(codex ? { codex } : {}),
     ...(claude ? { claudeAgent: claude } : {}),
+    ...(aris ? { aris } : {}),
+    ...(deepseek ? { deepseek } : {}),
   };
 }
 
@@ -649,12 +678,17 @@ function normalizeModelSelection(
     provider,
     provider === "codex" ? legacy?.legacyCodex : undefined,
   );
-  const options = provider === "codex" ? modelOptions?.codex : modelOptions?.claudeAgent;
+  const options =
+    provider === "codex"
+      ? modelOptions?.codex
+      : provider === "claudeAgent"
+        ? modelOptions?.claudeAgent
+        : modelOptions?.aris;
   return {
     provider,
     model,
     ...(options ? { options } : {}),
-  };
+  } as ModelSelection;
 }
 
 // ── Legacy sync helpers (used only during migration from v2 storage) ──
@@ -671,7 +705,7 @@ function legacySyncModelSelectionOptions(
     provider: modelSelection.provider,
     model: modelSelection.model,
     ...(options ? { options } : {}),
-  };
+  } as ModelSelection;
 }
 
 function legacyMergeModelSelectionIntoProviderModelOptions(
@@ -715,7 +749,7 @@ function legacyToModelSelectionByProvider(
   const result: Partial<Record<ProviderKind, ModelSelection>> = {};
   // Add entries from the options bag (for non-active providers)
   if (modelOptions) {
-    for (const provider of ["codex", "claudeAgent"] as const) {
+    for (const provider of ["codex", "claudeAgent", "aris", "deepseek"] as const) {
       const options = modelOptions[provider];
       if (options && Object.keys(options).length > 0) {
         result[provider] = {
@@ -725,7 +759,7 @@ function legacyToModelSelectionByProvider(
               ? modelSelection.model
               : DEFAULT_MODEL_BY_PROVIDER[provider],
           options,
-        };
+        } as ModelSelection;
       }
     }
   }
@@ -2221,7 +2255,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                   provider: normalized.provider,
                   model: normalized.model,
                   ...(current?.options ? { options: current.options } : {}),
-                };
+                } as ModelSelection;
               }
             }
             const nextActiveProvider = normalized?.provider ?? base.activeProvider;
@@ -2258,7 +2292,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             }
             const base = existing ?? createEmptyThreadDraft();
             const nextMap = { ...base.modelSelectionByProvider };
-            for (const provider of ["codex", "claudeAgent"] as const) {
+            for (const provider of ["codex", "claudeAgent", "aris", "deepseek"] as const) {
               // Only touch providers explicitly present in the input
               if (!normalizedOpts || !(provider in normalizedOpts)) continue;
               const opts = normalizedOpts[provider];
@@ -2268,7 +2302,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                   provider,
                   model: current?.model ?? DEFAULT_MODEL_BY_PROVIDER[provider],
                   options: opts,
-                };
+                } as ModelSelection;
               } else if (current?.options) {
                 // Remove options but keep the selection
                 const { options: _, ...rest } = current;
@@ -2319,7 +2353,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                 provider: normalizedProvider,
                 model: currentForProvider?.model ?? DEFAULT_MODEL_BY_PROVIDER[normalizedProvider],
                 options: providerOpts,
-              };
+              } as ModelSelection;
             } else if (currentForProvider?.options) {
               const { options: _, ...rest } = currentForProvider;
               nextMap[normalizedProvider] = rest as ModelSelection;
@@ -2342,7 +2376,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                   ...stickyBase,
                   provider: normalizedProvider,
                   options: providerOpts,
-                };
+                } as ModelSelection;
               } else if (stickyBase.options) {
                 const { options: _, ...rest } = stickyBase;
                 nextStickyMap[normalizedProvider] = rest as ModelSelection;

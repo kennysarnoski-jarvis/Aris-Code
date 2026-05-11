@@ -187,6 +187,47 @@ const make = Effect.gen(function* () {
     return cwd;
   });
 
+  // Dispatches a turn-diff-complete command without doing any git work. Used
+  // for non-git workspaces where we can't capture a real checkpoint but still
+  // need latestTurn.completedAt to flow so the client-side turn lifecycle can
+  // settle (isLatestTurnSettled short-circuits on !completedAt). Without this,
+  // turns in non-git folders never settle, arisRefetch never fires, and the
+  // UI stays stuck in streaming state forever.
+  const dispatchNonGitTurnDiffComplete = Effect.fn("dispatchNonGitTurnDiffComplete")(
+    function* (input: {
+      readonly threadId: ThreadId;
+      readonly turnId: TurnId;
+      readonly turnCount: number;
+      readonly createdAt: string;
+      readonly assistantMessageId: MessageId | undefined;
+    }) {
+      const checkpointRef = checkpointRefForThreadTurn(input.threadId, input.turnCount);
+      const assistantMessageId =
+        input.assistantMessageId ?? MessageId.make(`assistant:${input.turnId}`);
+
+      yield* orchestrationEngine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: serverCommandId("checkpoint-turn-diff-complete-no-git"),
+        threadId: input.threadId,
+        turnId: input.turnId,
+        completedAt: input.createdAt,
+        checkpointRef,
+        status: "missing",
+        files: [],
+        assistantMessageId,
+        checkpointTurnCount: input.turnCount,
+        createdAt: input.createdAt,
+      });
+      yield* receiptBus.publish({
+        type: "turn.processing.quiesced",
+        threadId: input.threadId,
+        turnId: input.turnId,
+        checkpointTurnCount: input.turnCount,
+        createdAt: input.createdAt,
+      });
+    },
+  );
+
   // Shared tail for both capture paths: creates the git checkpoint ref, diffs
   // it against the previous turn, then dispatches the domain events to update
   // the orchestration read model.
@@ -352,18 +393,8 @@ const make = Effect.gen(function* () {
         return;
       }
 
-      const checkpointCwd = yield* resolveCheckpointCwd({
-        threadId: thread.id,
-        thread,
-        projects: readModel.projects,
-        preferSessionRuntime: true,
-      });
-      if (!checkpointCwd) {
-        return;
-      }
-
-      // If a placeholder checkpoint exists for this turn, reuse its turn count
-      // instead of incrementing past it.
+      // Compute turn count up front — used by both the git-backed path and the
+      // non-git placeholder path.
       const existingPlaceholder = thread.checkpoints.find(
         (checkpoint) => checkpoint.turnId === turnId && checkpoint.status === "missing",
       );
@@ -374,6 +405,28 @@ const make = Effect.gen(function* () {
       const nextTurnCount = existingPlaceholder
         ? existingPlaceholder.checkpointTurnCount
         : currentTurnCount + 1;
+
+      const checkpointCwd = yield* resolveCheckpointCwd({
+        threadId: thread.id,
+        thread,
+        projects: readModel.projects,
+        preferSessionRuntime: true,
+      });
+
+      if (!checkpointCwd) {
+        // Non-git workspace (or no cwd). Dispatch a minimal turn-diff-complete
+        // so latestTurn.completedAt propagates and the client can settle. No
+        // git ops, no "checkpoint captured" activity — we didn't actually
+        // capture anything, we're just unblocking the turn lifecycle.
+        yield* dispatchNonGitTurnDiffComplete({
+          threadId: thread.id,
+          turnId,
+          turnCount: nextTurnCount,
+          createdAt: event.createdAt,
+          assistantMessageId: undefined,
+        });
+        return;
+      }
 
       yield* captureAndDispatchCheckpoint({
         threadId: thread.id,

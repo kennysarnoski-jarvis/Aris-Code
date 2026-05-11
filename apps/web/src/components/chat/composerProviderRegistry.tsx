@@ -1,4 +1,7 @@
 import {
+  type ArisModelOptions,
+  type ClaudeModelOptions,
+  type CodexModelOptions,
   type ProviderKind,
   type ProviderModelOptions,
   type ScopedThreadRef,
@@ -81,8 +84,16 @@ function getProviderStateFromCapabilities(
   // Normalize options for dispatch
   const normalizedOptions =
     provider === "codex"
-      ? normalizeCodexModelOptionsWithCapabilities(caps, providerOptions)
-      : normalizeClaudeModelOptionsWithCapabilities(caps, providerOptions);
+      ? normalizeCodexModelOptionsWithCapabilities(
+          caps,
+          providerOptions as CodexModelOptions | undefined,
+        )
+      : provider === "claudeAgent"
+        ? normalizeClaudeModelOptionsWithCapabilities(
+            caps,
+            providerOptions as ClaudeModelOptions | undefined,
+          )
+        : (providerOptions as ArisModelOptions | undefined); // aris: pass through ArisModelOptions as-is for now
 
   // Ultrathink styling (driven by capabilities data, not provider identity)
   const ultrathinkActive =
@@ -181,6 +192,59 @@ const composerProviderRegistry: Record<ProviderKind, ProviderRegistryEntry> = {
       !hasComposerTraitsTarget({ threadRef, draftId }) ? null : (
         <TraitsPicker
           provider="claudeAgent"
+          models={models}
+          {...(threadRef ? { threadRef } : {})}
+          {...(draftId ? { draftId } : {})}
+          model={model}
+          modelOptions={modelOptions}
+          prompt={prompt}
+          onPromptChange={onPromptChange}
+        />
+      ),
+  },
+  aris: {
+    getState: (input) => getProviderStateFromCapabilities(input),
+    // Aris has no traits UI yet (only a `thinking` toggle on ArisModelOptions).
+    // Task #16 will add a proper picker/menu; for now return null to keep the
+    // composer surface clean and typecheck happy.
+    renderTraitsMenuContent: () => null,
+    renderTraitsPicker: () => null,
+  },
+  deepseek: {
+    getState: (input) => getProviderStateFromCapabilities(input),
+    renderTraitsMenuContent: ({
+      threadRef,
+      draftId,
+      model,
+      models,
+      modelOptions,
+      prompt,
+      onPromptChange,
+    }) =>
+      !hasComposerTraitsTarget({ threadRef, draftId }) ? null : (
+        <TraitsMenuContent
+          provider="deepseek"
+          models={models}
+          {...(threadRef ? { threadRef } : {})}
+          {...(draftId ? { draftId } : {})}
+          model={model}
+          modelOptions={modelOptions}
+          prompt={prompt}
+          onPromptChange={onPromptChange}
+        />
+      ),
+    renderTraitsPicker: ({
+      threadRef,
+      draftId,
+      model,
+      models,
+      modelOptions,
+      prompt,
+      onPromptChange,
+    }) =>
+      !hasComposerTraitsTarget({ threadRef, draftId }) ? null : (
+        <TraitsPicker
+          provider="deepseek"
           models={models}
           {...(threadRef ? { threadRef } : {})}
           {...(draftId ? { draftId } : {})}

@@ -45,6 +45,16 @@ export function createEnvironmentApi(rpcClient: WsRpcClient): EnvironmentApi {
       subscribeThread: (input, callback, options) =>
         rpcClient.orchestration.subscribeThread(input, callback, options),
     },
+    ephemeral: {
+      subscribeReasoning: (input, callback, options) =>
+        rpcClient.ephemeral.subscribeReasoning(input, callback, options),
+    },
+    aris: {
+      subscribeEvents: (input, callback, options) =>
+        rpcClient.aris.subscribeEvents(input, callback, options),
+      decideApproval: (input) => rpcClient.aris.decideApproval(input),
+      readArchive: (input) => rpcClient.aris.readArchive(input),
+    },
   };
 }
 

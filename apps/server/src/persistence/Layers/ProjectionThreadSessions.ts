@@ -94,10 +94,36 @@ const makeProjectionThreadSessionRepository = Effect.gen(function* () {
       ),
     );
 
+  const reconcileDanglingSessions: ProjectionThreadSessionRepositoryShape["reconcileDanglingSessions"] =
+    ({ updatedAt }) =>
+      Effect.gen(function* () {
+        // `RETURNING 1` gives us one row per affected record so the caller can
+        // log how many sessions were reconciled. SQLite 3.35+ supports
+        // RETURNING on UPDATE statements.
+        const rows = yield* sql<{ readonly reconciled: number }>`
+          UPDATE projection_thread_sessions
+          SET
+            status = 'interrupted',
+            active_turn_id = NULL,
+            last_error = COALESCE(last_error, 'Server restarted while turn was running.'),
+            updated_at = ${updatedAt}
+          WHERE status IN ('running', 'starting')
+          RETURNING 1 AS reconciled
+        `;
+        return rows.length;
+      }).pipe(
+        Effect.mapError(
+          toPersistenceSqlError(
+            "ProjectionThreadSessionRepository.reconcileDanglingSessions:query",
+          ),
+        ),
+      );
+
   return {
     upsert,
     getByThreadId,
     deleteByThreadId,
+    reconcileDanglingSessions,
   } satisfies ProjectionThreadSessionRepositoryShape;
 });
 

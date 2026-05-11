@@ -20,6 +20,7 @@ import {
   type ServerSettings as ContractServerSettings,
 } from "@t3tools/contracts";
 import * as PlatformError from "effect/PlatformError";
+import { FetchHttpClient } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { deepMerge } from "@t3tools/shared/Struct";
 
@@ -440,7 +441,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
           assert.strictEqual(status.auth.status, "unknown");
           assert.strictEqual(
             status.message,
-            "Codex CLI v0.36.0 is too old for T3 Code. Upgrade to v0.37.0 or newer and restart T3 Code.",
+            "Codex CLI v0.36.0 is too old for Aris Code. Upgrade to v0.37.0 or newer and restart Aris Code.",
           );
         }).pipe(
           Effect.provide(
@@ -576,6 +577,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
                 prefix: "t3-provider-registry-",
               }),
             ),
+            Layer.provideMerge(FetchHttpClient.layer),
             Layer.provideMerge(
               mockCommandSpawnerLayer((command, args) => {
                 spawnCount += 1;
@@ -630,6 +632,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
                 prefix: "t3-provider-registry-",
               }),
             ),
+            Layer.provideMerge(FetchHttpClient.layer),
             Layer.provideMerge(
               mockCommandSpawnerLayer((command, args) => {
                 const joined = args.join(" ");
@@ -709,7 +712,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
           assert.strictEqual(status.enabled, false);
           assert.strictEqual(status.status, "disabled");
           assert.strictEqual(status.installed, false);
-          assert.strictEqual(status.message, "Codex is disabled in T3 Code settings.");
+          assert.strictEqual(status.message, "Codex is disabled in Aris Code settings.");
         }),
       );
     });

@@ -22,3 +22,9 @@ apps/web/src/components/__screenshots__
 __screenshots__/
 .tanstack
 squashfs-root/
+
+# Electron build artifacts — bundled JS embeds full source + local paths.
+# These get rebuilt on every dev/build run; never commit them.
+apps/*/dist-electron/
+apps/*/.electron-runtime/
+.fuse_hidden*

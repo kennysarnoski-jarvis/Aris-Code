@@ -50,6 +50,18 @@ describe("requestLatencyState", () => {
     expect(getSlowRpcAckRequests()).toEqual([]);
   });
 
+  it("ignores namespaced subscribe tags (e.g. ephemeral.subscribeReasoning)", () => {
+    // Regression: the original filter used tag.startsWith("subscribe") and
+    // surfaced phantom slow-ack toasts for any namespaced subscription RPC,
+    // because those tags start with their namespace ("ephemeral.", "orchestration.").
+    trackRpcRequestSent("1", "ephemeral.subscribeReasoning");
+    trackRpcRequestSent("2", "orchestration.subscribeShell");
+    trackRpcRequestSent("3", "orchestration.subscribeThread");
+    vi.advanceTimersByTime(SLOW_RPC_ACK_THRESHOLD_MS * 2);
+
+    expect(getSlowRpcAckRequests()).toEqual([]);
+  });
+
   it("evicts the oldest pending requests once the tracker reaches capacity", () => {
     for (let index = 0; index < MAX_TRACKED_RPC_ACK_REQUESTS + 1; index += 1) {
       trackRpcRequestSent(String(index), "server.getConfig");

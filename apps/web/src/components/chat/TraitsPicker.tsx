@@ -1,6 +1,7 @@
 import {
   type ClaudeModelOptions,
   type CodexModelOptions,
+  type DeepSeekModelOptions,
   type ProviderKind,
   type ProviderModelOptions,
   type ScopedThreadRef,
@@ -53,6 +54,9 @@ function getRawEffort(
   if (provider === "codex") {
     return trimOrNull((modelOptions as CodexModelOptions | undefined)?.reasoningEffort);
   }
+  if (provider === "deepseek") {
+    return trimOrNull((modelOptions as DeepSeekModelOptions | undefined)?.effort);
+  }
   return trimOrNull((modelOptions as ClaudeModelOptions | undefined)?.effort);
 }
 
@@ -73,6 +77,12 @@ function buildNextOptions(
 ): ProviderOptions {
   if (provider === "codex") {
     return { ...(modelOptions as CodexModelOptions | undefined), ...patch } as CodexModelOptions;
+  }
+  if (provider === "deepseek") {
+    return {
+      ...(modelOptions as DeepSeekModelOptions | undefined),
+      ...patch,
+    } as DeepSeekModelOptions;
   }
   return { ...(modelOptions as ClaudeModelOptions | undefined), ...patch } as ClaudeModelOptions;
 }

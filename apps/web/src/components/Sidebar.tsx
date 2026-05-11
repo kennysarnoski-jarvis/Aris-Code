@@ -53,7 +53,7 @@ import {
 } from "@t3tools/contracts/settings";
 import { usePrimaryEnvironmentId } from "../environments/primary";
 import { isElectron } from "../env";
-import { APP_STAGE_LABEL, APP_VERSION } from "../branding";
+import { APP_BASE_NAME, APP_STAGE_LABEL, APP_VERSION } from "../branding";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import { isMacPlatform, newCommandId } from "../lib/utils";
 import {
@@ -141,6 +141,10 @@ import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
 import { CommandDialogTrigger } from "./ui/command";
 import { readEnvironmentApi } from "../environmentApi";
 import { useSettings, useUpdateSettings } from "~/hooks/useSettings";
+import { triggerArisSidebarRefresh } from "../arisSidebarRefreshStore";
+import { renameArisThread } from "../arisThreadsFetch";
+import { useArisProjectThreads } from "../useArisProjectThreads";
+import { useArisProjectId } from "../useArisProjectId";
 import { useServerKeybindings } from "../rpc/serverState";
 import { deriveLogicalProjectKey } from "../logicalProject";
 import {
@@ -1102,10 +1106,61 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       ),
     ),
   );
-  const allSidebarThreads = useMemo(
+  const orchestrationSidebarThreads = useMemo(
     () =>
       otherMemberThreads.length === 0 ? sidebarThreads : [...sidebarThreads, ...otherMemberThreads],
     [sidebarThreads, otherMemberThreads],
+  );
+  // Cut C, slice 3e-iv-d-ii — for Aris-provider projects, the sidebar
+  // thread list comes straight from `aris_server` (`/v1/threads`) instead
+  // of state.sqlite's `projection_threads`. The orchestration projection
+  // stopped updating Aris rows in 3e-iv-b-ii, so reading from it would
+  // surface stale state. Other providers (Codex/Claude) still use the
+  // orchestration-derived list above.
+  const arisProviderSettings = useSettings((s) => s.providers.aris);
+  // Cut C — gate on "is Aris configured at all" rather than on the project's
+  // `defaultModelSelection.provider`. The project default is the user's
+  // preferred provider for NEW turns; the actual threads in `aris_memory.db`
+  // exist regardless of that setting (and for legacy projects the default
+  // may still read "codex" even though every thread is Aris). Treating
+  // any Aris-configured user's projects as "Aris-source" matches Kenny's
+  // single-provider setup. Multi-provider users with mixed thread sources
+  // per project will need a finer gate (e.g. check if the orchestration
+  // thread list for this project has any non-Aris threads) — deferred to
+  // the next time someone reports it.
+  const isArisProject =
+    project.defaultModelSelection?.provider === "aris" ||
+    (typeof arisProviderSettings.apiKey === "string" && arisProviderSettings.apiKey.length > 0);
+
+  // Resolve the Aris-server numeric `project_id` for this project's cwd.
+  // Without this, useArisProjectThreads below would call `GET /v1/threads`
+  // with no filter and receive every Aris thread the user owns across
+  // every project — each project's sidebar would then render every
+  // project's threads. The cross-project bleed manifested as soon as a
+  // user had >1 Aris project. Resolving once via the cwd-keyed,
+  // idempotent /v1/projects/find-or-create endpoint and threading it
+  // through scopes the fetch to the right rows.
+  const arisProjectId = useArisProjectId({
+    provider: isArisProject ? "aris" : null,
+    baseUrl: arisProviderSettings.baseUrl,
+    apiKey: arisProviderSettings.apiKey,
+    cwd: project.cwd,
+  });
+
+  const arisProjectThreads = useArisProjectThreads({
+    provider: isArisProject ? "aris" : null,
+    baseUrl: arisProviderSettings.baseUrl,
+    apiKey: arisProviderSettings.apiKey,
+    environmentId: project.environmentId,
+    projectId: project.id,
+    ...(arisProjectId !== null ? { arisProjectId } : {}),
+  });
+  const allSidebarThreads = useMemo(
+    () =>
+      isArisProject && arisProjectThreads.threads !== null
+        ? arisProjectThreads.threads
+        : orchestrationSidebarThreads,
+    [isArisProject, arisProjectThreads.threads, orchestrationSidebarThreads],
   );
   const sidebarThreadByKey = useMemo(
     () =>
@@ -1342,7 +1397,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         }
         if (clicked !== "delete") return;
 
-        if (projectThreads.length > 0) {
+        if (visibleProjectThreads.length > 0) {
           toastManager.add({
             type: "warning",
             title: "Project is not empty",
@@ -1392,7 +1447,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       project.environmentId,
       project.id,
       project.name,
-      projectThreads.length,
+      visibleProjectThreads.length,
       suppressProjectClickForContextMenuRef,
     ],
   );
@@ -1604,13 +1659,28 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         finishRename();
         return;
       }
+      // Aris threads bypass the orchestration command path and hit
+      // `aris_server` directly so the title write lands in `aris_memory.db`,
+      // which is what the sidebar reads from (Cut C).
+      const renamedThread = sidebarThreadByKeyRef.current.get(threadKey);
+      const isArisThreadRename = renamedThread?.session?.provider === "aris";
       try {
-        await api.orchestration.dispatchCommand({
-          type: "thread.meta.update",
-          commandId: newCommandId(),
-          threadId: threadRef.threadId,
-          title: trimmed,
-        });
+        if (isArisThreadRename) {
+          await renameArisThread({
+            baseUrl: arisProviderSettings.baseUrl,
+            apiKey: arisProviderSettings.apiKey,
+            threadId: threadRef.threadId,
+            title: trimmed,
+          });
+          triggerArisSidebarRefresh();
+        } else {
+          await api.orchestration.dispatchCommand({
+            type: "thread.meta.update",
+            commandId: newCommandId(),
+            threadId: threadRef.threadId,
+            title: trimmed,
+          });
+        }
       } catch (error) {
         toastManager.add({
           type: "error",
@@ -1620,7 +1690,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
       finishRename();
     },
-    [],
+    [arisProviderSettings],
   );
 
   const handleThreadContextMenu = useCallback(
@@ -1829,20 +1899,8 @@ const SidebarProjectListRow = memo(function SidebarProjectListRow(props: Sidebar
   );
 });
 
-function T3Wordmark() {
-  return (
-    <svg
-      aria-label="T3"
-      className="h-2.5 w-auto shrink-0 text-foreground"
-      viewBox="15.5309 37 94.3941 56.96"
-      xmlns="http://www.w3.org/2000/svg"
-    >
-      <path
-        d="M33.4509 93V47.56H15.5309V37H64.3309V47.56H46.4109V93H33.4509ZM86.7253 93.96C82.832 93.96 78.9653 93.4533 75.1253 92.44C71.2853 91.3733 68.032 89.88 65.3653 87.96L70.4053 78.04C72.5386 79.5867 75.0186 80.8133 77.8453 81.72C80.672 82.6267 83.5253 83.08 86.4053 83.08C89.6586 83.08 92.2186 82.44 94.0853 81.16C95.952 79.88 96.8853 78.12 96.8853 75.88C96.8853 73.7467 96.0586 72.0667 94.4053 70.84C92.752 69.6133 90.0853 69 86.4053 69H80.4853V60.44L96.0853 42.76L97.5253 47.4H68.1653V37H107.365V45.4L91.8453 63.08L85.2853 59.32H89.0453C95.9253 59.32 101.125 60.8667 104.645 63.96C108.165 67.0533 109.925 71.0267 109.925 75.88C109.925 79.0267 109.099 81.9867 107.445 84.76C105.792 87.48 103.259 89.6933 99.8453 91.4C96.432 93.1067 92.0586 93.96 86.7253 93.96Z"
-        fill="currentColor"
-      />
-    </svg>
-  );
+function AppLogo() {
+  return <img alt={APP_BASE_NAME} className="h-4 w-auto shrink-0" src="/aris-icon-1024.png" />;
 }
 
 type SortableProjectHandleProps = Pick<
@@ -1970,9 +2028,9 @@ const SidebarChromeHeader = memo(function SidebarChromeHeader({
               className="ml-1 flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded-md outline-hidden ring-ring transition-colors hover:text-foreground focus-visible:ring-2"
               to="/"
             >
-              <T3Wordmark />
-              <span className="truncate text-sm font-medium tracking-tight text-muted-foreground">
-                Code
+              <AppLogo />
+              <span className="truncate text-sm font-medium tracking-tight text-foreground">
+                {APP_BASE_NAME}
               </span>
               <span className="rounded-full bg-muted/50 px-1.5 py-0.5 text-[8px] font-medium uppercase tracking-[0.18em] text-muted-foreground/60">
                 {APP_STAGE_LABEL}

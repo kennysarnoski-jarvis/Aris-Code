@@ -252,7 +252,9 @@ describe("deriveMessagesTimelineRows", () => {
       ],
       completionDividerBeforeEntryId: "assistant-final-entry",
       isWorking: false,
+      activeTurnId: null,
       activeTurnStartedAt: null,
+      liveStatusEntry: null,
       turnDiffSummaryByAssistantMessageId: new Map(),
       revertTurnCountByUserMessageId: new Map(),
     });
@@ -309,7 +311,9 @@ describe("deriveMessagesTimelineRows", () => {
       ],
       completionDividerBeforeEntryId: null,
       isWorking: false,
+      activeTurnId: null,
       activeTurnStartedAt: null,
+      liveStatusEntry: null,
       turnDiffSummaryByAssistantMessageId: new Map([
         ["assistant-1" as never, assistantTurnDiffSummary],
       ]),
@@ -366,7 +370,9 @@ describe("computeStableMessagesTimelineRows", () => {
       ],
       completionDividerBeforeEntryId: null,
       isWorking: false,
+      activeTurnId: null,
       activeTurnStartedAt: null,
+      liveStatusEntry: null,
       turnDiffSummaryByAssistantMessageId: new Map(),
       revertTurnCountByUserMessageId: new Map(),
     });
@@ -417,7 +423,9 @@ describe("computeStableMessagesTimelineRows", () => {
       ],
       completionDividerBeforeEntryId: null,
       isWorking: false,
+      activeTurnId: null,
       activeTurnStartedAt: null,
+      liveStatusEntry: null,
       turnDiffSummaryByAssistantMessageId: new Map(),
       revertTurnCountByUserMessageId: new Map(),
     });

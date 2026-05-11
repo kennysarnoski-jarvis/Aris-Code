@@ -208,6 +208,15 @@ function createMockEnvironmentApi(input: {
       subscribeThread: (() => () =>
         undefined) as EnvironmentApi["orchestration"]["subscribeThread"],
     },
+    ephemeral: {
+      subscribeReasoning: (() => () =>
+        undefined) as EnvironmentApi["ephemeral"]["subscribeReasoning"],
+    },
+    aris: {
+      subscribeEvents: (() => () => undefined) as EnvironmentApi["aris"]["subscribeEvents"],
+      decideApproval: (async () => undefined) as EnvironmentApi["aris"]["decideApproval"],
+      readArchive: (async () => ({ messages: [] })) as EnvironmentApi["aris"]["readArchive"],
+    },
   };
 }
 
@@ -5412,7 +5421,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
       snapshot: createSnapshotWithPlanFollowUpPrompt({
         modelSelection: { provider: "codex", model: "gpt-5.3-codex-spark" },
         planMarkdown:
-          "# Imaginary Long-Range Plan: T3 Code Adaptive Orchestration and Safe-Delay Execution Initiative",
+          "# Imaginary Long-Range Plan: Aris Code Adaptive Orchestration and Safe-Delay Execution Initiative",
       }),
     });
 
@@ -5442,7 +5451,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
       snapshot: createSnapshotWithPlanFollowUpPrompt({
         modelSelection: { provider: "codex", model: "gpt-5.3-codex-spark" },
         planMarkdown:
-          "# Imaginary Long-Range Plan: T3 Code Adaptive Orchestration and Safe-Delay Execution Initiative",
+          "# Imaginary Long-Range Plan: Aris Code Adaptive Orchestration and Safe-Delay Execution Initiative",
       }),
     });
 

@@ -22,13 +22,22 @@ import type {
 
 export type ProviderPickerKind = ProviderKind | "cursor";
 
+// Cosmetic relabel (2026-05-10): the legacy `"aris"` provider (Qwen3.6 /
+// RunPod) is `hidden` so it doesn't render in the picker or settings. The
+// `"deepseek"` provider is surfaced to users as "Aris" — internal key,
+// channel names, and routing all stay `"deepseek"`. Hidden options stay
+// in the array so TypeScript exhaustiveness checks across `ProviderKind`
+// remain intact; consumers filter on `hidden`.
 export const PROVIDER_OPTIONS: Array<{
   value: ProviderPickerKind;
   label: string;
   available: boolean;
+  hidden?: boolean;
 }> = [
+  { value: "aris", label: "Aris", available: true, hidden: true },
   { value: "codex", label: "Codex", available: true },
   { value: "claudeAgent", label: "Claude", available: true },
+  { value: "deepseek", label: "Aris", available: true },
   { value: "cursor", label: "Cursor", available: false },
 ];
 
@@ -116,11 +125,39 @@ export function formatDuration(durationMs: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
+/**
+ * Normalize a SQLite UTC timestamp (`'YYYY-MM-DD HH:MM:SS'`) to ISO-8601
+ * with explicit `'Z'` so JS `Date.parse` is consistent across engines.
+ * Pass-through for already-ISO strings and for empty/null. The Aris
+ * server normalizes its API output (see `_iso_utc` in aris_server.py),
+ * but this is a defense-in-depth in case any timestamp slips through
+ * raw — the chat-timeline renders broken durations like
+ * `"29628121m 56s"` if a timestamp parses to epoch 0.
+ */
+function _normalizeSqliteTs(raw: string | null | undefined): string {
+  if (!raw) return "";
+  // Already ISO with timezone? Pass through.
+  if (raw.includes("T") && (/Z$/.test(raw) || /[+-]\d{2}:?\d{2}$/.test(raw))) {
+    return raw;
+  }
+  // SQLite "YYYY-MM-DD HH:MM:SS" → "YYYY-MM-DDTHH:MM:SSZ"
+  return raw.replace(" ", "T") + "Z";
+}
+
 export function formatElapsed(startIso: string, endIso: string | undefined): string | null {
   if (!endIso) return null;
-  const startedAt = Date.parse(startIso);
-  const endedAt = Date.parse(endIso);
+  const startedAt = Date.parse(_normalizeSqliteTs(startIso));
+  const endedAt = Date.parse(_normalizeSqliteTs(endIso));
   if (Number.isNaN(startedAt) || Number.isNaN(endedAt) || endedAt < startedAt) {
+    return null;
+  }
+  // Sanity floor: if parsing produced an obviously-bogus epoch-0-ish
+  // result (some engines silently coerce malformed strings to 0 instead
+  // of NaN), the resulting "duration" is decades. Anything older than
+  // 100 years can't be a real chat-message duration; bail rather than
+  // render nonsense.
+  const ONE_HUNDRED_YEARS_MS = 100 * 365.25 * 24 * 60 * 60 * 1_000;
+  if (endedAt - startedAt > ONE_HUNDRED_YEARS_MS) {
     return null;
   }
   return formatDuration(endedAt - startedAt);
@@ -461,6 +498,34 @@ export function hasActionableProposedPlan(
   proposedPlan: LatestProposedPlanState | Pick<ProposedPlan, "implementedAt"> | null,
 ): boolean {
   return proposedPlan !== null && proposedPlan.implementedAt === null;
+}
+
+/**
+ * Find the most recent activity on the active turn that's relevant to display
+ * as a "what is Aris doing right now" status line. Unlike `deriveWorkLogEntries`,
+ * this does NOT filter out `tool.started` — that's the whole point: while a
+ * tool is in flight, the started event is the only signal available, and we
+ * want it surfaced for the rolling status line.
+ */
+export function deriveLatestActivityWorkEntry(
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+  latestTurnId: TurnId | undefined,
+): WorkLogEntry | null {
+  const ordered = [...activities].toSorted(compareActivitiesByOrder);
+  const candidates = ordered
+    .filter((activity) => (latestTurnId ? activity.turnId === latestTurnId : true))
+    .filter((activity) => activity.kind !== "task.started")
+    .filter((activity) => activity.kind !== "context-window.updated")
+    .filter((activity) => activity.kind !== "tool.completed")
+    .filter((activity) => activity.summary !== "Checkpoint captured")
+    .filter((activity) => !isPlanBoundaryToolActivity(activity));
+
+  const latest = candidates[candidates.length - 1];
+  if (!latest) return null;
+
+  const derived = toDerivedWorkLogEntry(latest);
+  const { activityKind: _activityKind, collapseKey: _collapseKey, ...entry } = derived;
+  return entry;
 }
 
 export function deriveWorkLogEntries(

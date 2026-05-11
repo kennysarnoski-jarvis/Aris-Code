@@ -1,4 +1,4 @@
-import { EnvironmentId, MessageId } from "@t3tools/contracts";
+import { EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
 import { createRef } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -80,6 +80,7 @@ function buildProps() {
     activeTurnInProgress: false,
     activeTurnId: null,
     activeTurnStartedAt: null,
+    liveStatusEntry: null,
     listRef: createRef<LegendListRef | null>(),
     completionDividerBeforeEntryId: null,
     completionSummary: null,
@@ -91,6 +92,8 @@ function buildProps() {
     isRevertingCheckpoint: false,
     onImageExpand: () => {},
     activeThreadEnvironmentId: ACTIVE_THREAD_ENVIRONMENT_ID,
+    activeThreadId: ThreadId.make("thread-1"),
+    activeThreadProvider: null,
     markdownCwd: undefined,
     resolvedTheme: "light" as const,
     timestampFormat: "locale" as const,

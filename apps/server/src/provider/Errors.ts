@@ -69,6 +69,28 @@ export class ProviderAdapterRequestError extends Schema.TaggedErrorClass<Provide
 }
 
 /**
+ * ProviderAdapterRateLimitError - Provider returned HTTP 429 (rate limit).
+ *
+ * Carries the `Retry-After` value the provider sent so the surfacing layer
+ * (toast, status pill, etc.) can show a clean "try again in N seconds" message
+ * instead of leaking raw HTTP body text.
+ */
+export class ProviderAdapterRateLimitError extends Schema.TaggedErrorClass<ProviderAdapterRateLimitError>()(
+  "ProviderAdapterRateLimitError",
+  {
+    provider: Schema.String,
+    method: Schema.String,
+    retryAfterSeconds: Schema.Number,
+    cause: Schema.optional(Schema.Defect),
+  },
+) {
+  override get message(): string {
+    const noun = this.retryAfterSeconds === 1 ? "second" : "seconds";
+    return `You've hit your rate limit. Try again in ${this.retryAfterSeconds} ${noun}.`;
+  }
+}
+
+/**
  * ProviderAdapterProcessError - Provider process lifecycle failure.
  */
 export class ProviderAdapterProcessError extends Schema.TaggedErrorClass<ProviderAdapterProcessError>()(
@@ -152,6 +174,7 @@ export type ProviderAdapterError =
   | ProviderAdapterSessionNotFoundError
   | ProviderAdapterSessionClosedError
   | ProviderAdapterRequestError
+  | ProviderAdapterRateLimitError
   | ProviderAdapterProcessError;
 
 export type ProviderServiceError =

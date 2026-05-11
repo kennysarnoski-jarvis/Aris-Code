@@ -548,6 +548,13 @@ function ChatMarkdown({ text, cwd, isStreaming = false }: ChatMarkdownProps) {
           </MarkdownCodeBlock>
         );
       },
+      table({ node: _node, children, ...props }) {
+        return (
+          <div className="chat-markdown-table-wrapper">
+            <table {...props}>{children}</table>
+          </div>
+        );
+      },
     }),
     [
       diffThemeName,

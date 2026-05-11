@@ -1326,17 +1326,37 @@ describe("deriveActiveWorkStartedAt", () => {
 });
 
 describe("PROVIDER_OPTIONS", () => {
-  it("advertises Claude as available while keeping Cursor as a placeholder", () => {
+  it("hides legacy aris, surfaces deepseek as 'Aris' in the picker, and keeps Cursor as a placeholder", () => {
+    // Cosmetic relabel (2026-05-10): the legacy `"aris"` provider entry
+    // stays in the array (kept for type-exhaustiveness across ProviderKind)
+    // but is flagged `hidden` so the picker filters it out. The
+    // `"deepseek"` entry surfaces to users as "Aris"; the internal key,
+    // channel names, and routing are unchanged.
+    const aris = PROVIDER_OPTIONS.find((option) => option.value === "aris");
     const claude = PROVIDER_OPTIONS.find((option) => option.value === "claudeAgent");
+    const deepseek = PROVIDER_OPTIONS.find((option) => option.value === "deepseek");
     const cursor = PROVIDER_OPTIONS.find((option) => option.value === "cursor");
     expect(PROVIDER_OPTIONS).toEqual([
+      { value: "aris", label: "Aris", available: true, hidden: true },
       { value: "codex", label: "Codex", available: true },
       { value: "claudeAgent", label: "Claude", available: true },
+      { value: "deepseek", label: "Aris", available: true },
       { value: "cursor", label: "Cursor", available: false },
     ]);
+    expect(aris).toEqual({
+      value: "aris",
+      label: "Aris",
+      available: true,
+      hidden: true,
+    });
     expect(claude).toEqual({
       value: "claudeAgent",
       label: "Claude",
+      available: true,
+    });
+    expect(deepseek).toEqual({
+      value: "deepseek",
+      label: "Aris",
       available: true,
     });
     expect(cursor).toEqual({

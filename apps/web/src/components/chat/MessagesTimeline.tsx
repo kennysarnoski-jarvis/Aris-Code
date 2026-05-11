@@ -1,4 +1,4 @@
-import { type EnvironmentId, type MessageId, type TurnId } from "@t3tools/contracts";
+import { type EnvironmentId, type MessageId, type ThreadId, type TurnId } from "@t3tools/contracts";
 import {
   createContext,
   memo,
@@ -11,7 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
-import { deriveTimelineEntries, formatElapsed } from "../../session-logic";
+import { deriveTimelineEntries, formatElapsed, type WorkLogEntry } from "../../session-logic";
 import { type TurnDiffSummary } from "../../types";
 import { summarizeTurnDiffStats } from "../../lib/turnDiffTree";
 import ChatMarkdown from "../ChatMarkdown";
@@ -32,6 +32,14 @@ import {
 import { Button } from "../ui/button";
 import { buildExpandedImagePreview, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { ProposedPlanCard } from "./ProposedPlanCard";
+import { RollingReasoning } from "./RollingReasoning";
+import { useLiveAssistantBuffer } from "./LiveAssistantContent";
+import {
+  type LiveReasoningBuffer,
+  LiveReasoningBlock,
+  useLiveReasoningBuffer,
+} from "./LiveReasoningContent";
+import { useArisCompactionStatus } from "../../useArisCompactionStatus";
 import { ChangedFilesTree } from "./ChangedFilesTree";
 import { DiffStatLabel, hasNonZeroStat } from "./DiffStatLabel";
 import { MessageCopyButton } from "./MessageCopyButton";
@@ -66,12 +74,13 @@ import { formatWorkspaceRelativePath } from "../../filePathDisplay";
 // Context — shared state consumed by every row component via useContext.
 // Propagates through LegendList's memo boundaries for shared callbacks and
 // non-row-scoped state. `nowIso` is intentionally excluded — self-ticking
-// components (WorkingTimer, LiveElapsed) handle it.
+// components (LiveMessageMeta, RollingReasoning) handle it.
 // ---------------------------------------------------------------------------
 
 interface TimelineRowSharedState {
   activeTurnInProgress: boolean;
   activeTurnId: TurnId | null | undefined;
+  activeThreadId: ThreadId;
   isWorking: boolean;
   isRevertingCheckpoint: boolean;
   completionSummary: string | null;
@@ -81,6 +90,17 @@ interface TimelineRowSharedState {
   resolvedTheme: "light" | "dark";
   workspaceRoot: string | undefined;
   activeThreadEnvironmentId: EnvironmentId;
+  activeThreadProvider: string | null;
+  /** Slice 31 — snapshotted Thinking toggle for the in-flight Aris turn.
+   *  `null` when not Aris / no active turn; `true` / `false` mirrors the
+   *  composer toggle at dispatch time. RollingReasoning swaps its idle
+   *  phrase based on this so "Thinking…" doesn't lie when thinking=false. */
+  activeTurnThinkingEnabled: boolean | null;
+  /** Live `aris.reasoning.delta` accumulator for the active thread.
+   *  Drives the in-flight "Thinking" block above the streaming
+   *  assistant message (slice 1.12). Empty when no reasoning has been
+   *  emitted yet, when not on an Aris-provider thread, or between turns. */
+  liveReasoningBuffer: LiveReasoningBuffer;
   onRevertUserMessage: (messageId: MessageId) => void;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
@@ -96,9 +116,11 @@ interface MessagesTimelineProps {
   isWorking: boolean;
   activeTurnInProgress: boolean;
   activeTurnId?: TurnId | null;
+  activeThreadId: ThreadId;
   activeTurnStartedAt: string | null;
   listRef: React.RefObject<LegendListRef | null>;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
+  liveStatusEntry: WorkLogEntry | null;
   completionDividerBeforeEntryId: string | null;
   completionSummary: string | null;
   turnDiffSummaryByAssistantMessageId: Map<MessageId, TurnDiffSummary>;
@@ -109,6 +131,18 @@ interface MessagesTimelineProps {
   isRevertingCheckpoint: boolean;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   activeThreadEnvironmentId: EnvironmentId;
+  /**
+   * Provider for the active thread (e.g. "aris", "codex", "claudeAgent"),
+   * or null when unknown. Used to route the live assistant buffer to the
+   * correct event channel — Aris threads consume the dedicated `aris.event`
+   * stream while other providers stay on the existing ephemeral broadcast.
+   */
+  activeThreadProvider: string | null;
+  /** Slice 31 — see TimelineRowSharedState.activeTurnThinkingEnabled.
+   *  Optional so existing fixtures and other providers can omit it; defaults
+   *  to `null`, which leaves RollingReasoning on its standard "Thinking…"
+   *  copy. */
+  activeTurnThinkingEnabled?: boolean | null;
   markdownCwd: string | undefined;
   resolvedTheme: "light" | "dark";
   timestampFormat: TimestampFormat;
@@ -124,9 +158,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   isWorking,
   activeTurnInProgress,
   activeTurnId,
+  activeThreadId,
   activeTurnStartedAt,
   listRef,
   timelineEntries,
+  liveStatusEntry,
   completionDividerBeforeEntryId,
   completionSummary,
   turnDiffSummaryByAssistantMessageId,
@@ -137,29 +173,70 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   isRevertingCheckpoint,
   onImageExpand,
   activeThreadEnvironmentId,
+  activeThreadProvider,
+  activeTurnThinkingEnabled = null,
   markdownCwd,
   resolvedTheme,
   timestampFormat,
   workspaceRoot,
   onIsAtEndChange,
 }: MessagesTimelineProps) {
+  // Subscribe to the live assistant content stream. The buffer drives a
+  // synthetic in-flight assistant row inside the timeline data array (see
+  // `deriveMessagesTimelineRows`), so the streaming → settled handoff is
+  // height-neutral — same row, content updates in place.
+  const liveAssistantBuffer = useLiveAssistantBuffer(
+    activeThreadId,
+    activeThreadEnvironmentId,
+    activeThreadProvider,
+  );
+
+  // Slice 1.12: subscribe to `aris.reasoning.delta` for the active thread
+  // and accumulate reasoning text per turn. Rendered above the streaming
+  // assistant row as a collapsible "Thinking" block. Aris-only — Codex /
+  // Claude have their own reasoning paths through the orchestration
+  // pipeline (out of scope for this slice).
+  const liveReasoningBuffer = useLiveReasoningBuffer(
+    activeThreadId,
+    activeThreadEnvironmentId,
+    activeThreadProvider,
+  );
+
+  // Slice 9.2: subscribe to compaction-block lifecycle events. Steady
+  // boolean — true between `aris.compaction.started` and `.completed`,
+  // false otherwise. Drives the inline "Compacting earlier turns…"
+  // indicator below; null/false for non-Aris threads.
+  const isCompacting = useArisCompactionStatus({
+    threadId: activeThreadId,
+    environmentId: activeThreadEnvironmentId,
+    provider: activeThreadProvider,
+  });
+
   const rawRows = useMemo(
     () =>
       deriveMessagesTimelineRows({
         timelineEntries,
         completionDividerBeforeEntryId,
         isWorking,
+        activeTurnId: activeTurnId ?? null,
         activeTurnStartedAt,
+        liveStatusEntry,
         turnDiffSummaryByAssistantMessageId,
         revertTurnCountByUserMessageId,
+        liveAssistantBufferText: liveAssistantBuffer.text,
+        liveAssistantBufferTurnId: liveAssistantBuffer.turnId,
       }),
     [
       timelineEntries,
       completionDividerBeforeEntryId,
       isWorking,
+      activeTurnId,
       activeTurnStartedAt,
+      liveStatusEntry,
       turnDiffSummaryByAssistantMessageId,
       revertTurnCountByUserMessageId,
+      liveAssistantBuffer.text,
+      liveAssistantBuffer.turnId,
     ],
   );
   const rows = useStableRows(rawRows);
@@ -171,15 +248,17 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     }
   }, [listRef, onIsAtEndChange]);
 
-  const previousRowCountRef = useRef(rows.length);
+  // Initial-paint scroll: when a thread with content first becomes visible,
+  // land at the bottom (latest message). Tracked with a one-shot ref instead
+  // of the LegendList `initialScrollAtEnd` prop because that prop has been
+  // observed to re-fire when the data array reference changes (e.g. after
+  // `arisRefetch()` at turn-end), which scrolls the chat to the bottom and
+  // pulls the user-message-anchor offscreen.
+  const hasDoneInitialScrollRef = useRef(false);
   useEffect(() => {
-    const previousRowCount = previousRowCountRef.current;
-    previousRowCountRef.current = rows.length;
-
-    if (previousRowCount > 0 || rows.length === 0) {
-      return;
-    }
-
+    if (hasDoneInitialScrollRef.current) return;
+    if (rows.length === 0) return;
+    hasDoneInitialScrollRef.current = true;
     onIsAtEndChange(true);
     const frameId = window.requestAnimationFrame(() => {
       void listRef.current?.scrollToEnd?.({ animated: false });
@@ -189,12 +268,90 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     };
   }, [listRef, onIsAtEndChange, rows.length]);
 
+  // Reset the initial-scroll latch when the active thread changes so the
+  // next thread also lands at the bottom on first paint.
+  const initialScrollThreadIdRef = useRef(activeThreadId);
+  useEffect(() => {
+    if (initialScrollThreadIdRef.current !== activeThreadId) {
+      initialScrollThreadIdRef.current = activeThreadId;
+      hasDoneInitialScrollRef.current = false;
+    }
+  }, [activeThreadId]);
+
+  // ChatGPT-style scroll anchoring: when a new user message arrives, anchor it
+  // near the top of the viewport with smooth animation. The streaming assistant
+  // response then fills the empty space below it (provided by the bottom
+  // spacer in ListFooterComponent) without auto-scrolling, so the reading
+  // surface stays stable while content flows in.
+  //
+  // Thread switches reset the tracking ref but don't trigger a scroll —
+  // initialScrollAtEnd handles the landing position for an opened thread.
+  //
+  // Row-count guard: an optimistic user message gets a client-generated id,
+  // and is later replaced in-place by the server-confirmed version with a
+  // different id. Without the guard we'd treat that swap as a "new" user
+  // message and re-fire the scroll-to-top mid-stream / post-stream, which
+  // manifests as the chat moving when streaming ends. We only scroll when
+  // rows actually grew — i.e., a genuinely new message landed.
+  const previousThreadIdRef = useRef(activeThreadId);
+  const previousLatestUserMessageIdRef = useRef<string | null>(null);
+  const previousRowCountForUserScrollRef = useRef(rows.length);
+  useEffect(() => {
+    if (previousThreadIdRef.current !== activeThreadId) {
+      previousThreadIdRef.current = activeThreadId;
+      previousLatestUserMessageIdRef.current = null;
+      previousRowCountForUserScrollRef.current = rows.length;
+      // Pre-seed with the current latest user message id so the next effect
+      // run treats new arrivals as new (not as the seeded value).
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const row = rows[i];
+        if (!row) continue;
+        if (row.kind === "message" && row.message.role === "user") {
+          previousLatestUserMessageIdRef.current = row.id;
+          break;
+        }
+      }
+      return;
+    }
+
+    const previousRowCount = previousRowCountForUserScrollRef.current;
+    previousRowCountForUserScrollRef.current = rows.length;
+
+    let latestUserMessageIndex = -1;
+    let latestUserMessageId: string | null = null;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      if (!row) continue;
+      if (row.kind === "message" && row.message.role === "user") {
+        latestUserMessageIndex = i;
+        latestUserMessageId = row.id;
+        break;
+      }
+    }
+
+    if (latestUserMessageId === null) return;
+    if (latestUserMessageId === previousLatestUserMessageIdRef.current) return;
+    previousLatestUserMessageIdRef.current = latestUserMessageId;
+
+    // Only scroll if rows genuinely grew — ignore optimistic→server id swaps
+    // and mid-stream row replacements that don't represent a new message.
+    if (rows.length <= previousRowCount) return;
+
+    void listRef.current?.scrollToIndex?.({
+      index: latestUserMessageIndex,
+      viewPosition: 0,
+      viewOffset: 16,
+      animated: true,
+    });
+  }, [activeThreadId, listRef, rows]);
+
   // Memoised context value — only changes on state transitions, NOT on
   // every streaming chunk. Callbacks from ChatView are useCallback-stable.
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
       activeTurnInProgress,
       activeTurnId: activeTurnId ?? null,
+      activeThreadId,
       isWorking,
       isRevertingCheckpoint,
       completionSummary,
@@ -204,6 +361,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       resolvedTheme,
       workspaceRoot,
       activeThreadEnvironmentId,
+      activeThreadProvider,
+      activeTurnThinkingEnabled,
+      liveReasoningBuffer,
       onRevertUserMessage,
       onImageExpand,
       onOpenTurnDiff,
@@ -211,6 +371,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [
       activeTurnInProgress,
       activeTurnId,
+      activeThreadId,
       isWorking,
       isRevertingCheckpoint,
       completionSummary,
@@ -220,6 +381,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       resolvedTheme,
       workspaceRoot,
       activeThreadEnvironmentId,
+      activeThreadProvider,
+      activeTurnThinkingEnabled,
+      liveReasoningBuffer,
       onRevertUserMessage,
       onImageExpand,
       onOpenTurnDiff,
@@ -255,14 +419,56 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         keyExtractor={keyExtractor}
         renderItem={renderItem}
         estimatedItemSize={90}
-        initialScrollAtEnd
-        maintainScrollAtEnd
-        maintainScrollAtEndThreshold={0.1}
-        maintainVisibleContentPosition
+        // initialScrollAtEnd intentionally omitted — we drive the initial
+        // scroll-to-end from a manual one-shot effect above. The library
+        // prop re-fires on data array reference changes (e.g. after
+        // `arisRefetch()` at turn-end), which yanked the chat to the bottom
+        // and pulled the user-message anchor offscreen.
+        //
+        // Stabilize scroll during size/layout changes — load-bearing for
+        // keeping the user message anchored at the top while the assistant
+        // streams below it (the synthetic in-flight assistant row grows in
+        // height as tokens flow in, and without size stabilization the
+        // scroll position drifts and the user message scrolls offscreen
+        // above the viewport).
+        //
+        // `data: false` — do NOT auto-anchor when the rows array changes.
+        // Anchoring on data changes was causing larger visible jumps when
+        // `arisRefetch()` replaced the array at turn-end.
+        maintainVisibleContentPosition={{ size: true, data: false }}
         onScroll={handleScroll}
-        className="h-full overflow-x-hidden overscroll-y-contain px-3 sm:px-5"
+        className="h-full scroll-smooth overflow-x-hidden overscroll-y-contain px-3 sm:px-5"
         ListHeaderComponent={<div className="h-3 sm:h-4" />}
-        ListFooterComponent={<div className="h-3 sm:h-4" />}
+        ListFooterComponent={
+          <div>
+            {/* Slice 9.2: compaction-block indicator. Sits ABOVE the
+                bottom buffer so it lands right where the next assistant
+                response would render — between the user's just-sent
+                message and empty viewport. Only visible when the server
+                has emitted `aris.compaction.started` and not yet matched
+                it with `.completed`. Common path: never visible (hits
+                only when the user fires a follow-up faster than the
+                previous turn's background compaction finished). */}
+            {isCompacting ? (
+              <div className="mx-auto w-full max-w-3xl px-1 py-2">
+                <div className="flex items-center gap-2 rounded-md border border-border/30 bg-background/30 px-3 py-2 text-[12px] text-muted-foreground/70">
+                  <span className="inline-flex items-center gap-[3px]">
+                    <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-pulse" />
+                    <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-pulse [animation-delay:200ms]" />
+                    <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-pulse [animation-delay:400ms]" />
+                  </span>
+                  <span className="italic">Compacting earlier turns…</span>
+                </div>
+              </div>
+            ) : null}
+            {/* Bottom buffer: gives the most recent user message room to be
+                scrolled to the top of the viewport, even when no assistant
+                response has arrived yet. Without this, scroll-to-top is a
+                no-op for the last message because there's nothing below to
+                fill the rest of the viewport. */}
+            <div aria-hidden="true" className="min-h-[70dvh]" />
+          </div>
+        }
       />
     </TimelineRowCtx.Provider>
   );
@@ -380,15 +586,10 @@ function TimelineRowContent({ row }: { row: TimelineRow }) {
         row.message.role === "assistant" &&
         (() => {
           const messageText = row.message.text || (row.message.streaming ? "" : "(empty response)");
-          const assistantTurnStillInProgress =
-            ctx.activeTurnInProgress &&
-            ctx.activeTurnId !== null &&
-            ctx.activeTurnId !== undefined &&
-            row.message.turnId === ctx.activeTurnId;
           const assistantCopyState = resolveAssistantMessageCopyState({
             text: row.message.text ?? null,
             showCopyButton: row.showAssistantCopyButton,
-            streaming: row.message.streaming || assistantTurnStillInProgress,
+            streaming: Boolean(row.message.streaming),
           });
           return (
             <>
@@ -402,6 +603,18 @@ function TimelineRowContent({ row }: { row: TimelineRow }) {
                 </div>
               )}
               <div className="min-w-0 px-1 py-0.5">
+                {/* Slice 1.12: live reasoning block above the assistant
+                    message — rendered while the row is streaming using the
+                    in-memory delta buffer. Slice 1.13b: once settled, fall
+                    back to the persisted Thinking trace from `messages.reasoning`
+                    so users can still expand the trace after the live
+                    buffer unmounts (or after a page reload). Both branches
+                    render the same component; only the source of `text` differs. */}
+                {row.message.streaming && ctx.liveReasoningBuffer.text ? (
+                  <LiveReasoningBlock text={ctx.liveReasoningBuffer.text} streaming />
+                ) : !row.message.streaming && row.message.reasoning ? (
+                  <LiveReasoningBlock text={row.message.reasoning} streaming={false} />
+                ) : null}
                 <ChatMarkdown
                   text={messageText}
                   cwd={ctx.markdownCwd}
@@ -457,23 +670,20 @@ function TimelineRowContent({ row }: { row: TimelineRow }) {
       )}
 
       {row.kind === "working" && (
-        <div className="py-0.5 pl-1.5">
-          <div className="flex items-center gap-2 pt-1 text-[11px] text-muted-foreground/70">
-            <span className="inline-flex items-center gap-[3px]">
-              <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse" />
-              <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse [animation-delay:200ms]" />
-              <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse [animation-delay:400ms]" />
-            </span>
-            <span>
-              {row.createdAt ? (
-                <>
-                  Working for <WorkingTimer createdAt={row.createdAt} />
-                </>
-              ) : (
-                "Working..."
-              )}
-            </span>
-          </div>
+        <div className="flex items-center gap-2 py-1 pl-1.5">
+          <span className="inline-flex items-center gap-[3px]">
+            <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse" />
+            <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse [animation-delay:200ms]" />
+            <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse [animation-delay:400ms]" />
+          </span>
+          <RollingReasoning
+            threadId={ctx.activeThreadId}
+            environmentId={ctx.activeThreadEnvironmentId}
+            provider={ctx.activeThreadProvider}
+            thinkingEnabled={ctx.activeTurnThinkingEnabled}
+            latestWorkEntry={row.latestWorkEntry}
+            className="flex-1"
+          />
         </div>
       )}
     </div>
@@ -485,16 +695,6 @@ function TimelineRowContent({ row }: { row: TimelineRow }) {
 // Each owns a `nowMs` state value consumed in the render output so the
 // React Compiler cannot elide the re-render as a no-op.
 // ---------------------------------------------------------------------------
-
-/** Live "Working for Xs" label. */
-function WorkingTimer({ createdAt }: { createdAt: string }) {
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNowMs(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [createdAt]);
-  return <>{formatWorkingTimer(createdAt, new Date(nowMs).toISOString()) ?? "0s"}</>;
-}
 
 /** Live timestamp + elapsed duration for a streaming assistant message. */
 function LiveMessageMeta({
@@ -797,29 +997,6 @@ function useStableRows(rows: MessagesTimelineRow[]): MessagesTimelineRow[] {
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
-
-function formatWorkingTimer(startIso: string, endIso: string): string | null {
-  const startedAtMs = Date.parse(startIso);
-  const endedAtMs = Date.parse(endIso);
-  if (!Number.isFinite(startedAtMs) || !Number.isFinite(endedAtMs)) {
-    return null;
-  }
-
-  const elapsedSeconds = Math.max(0, Math.floor((endedAtMs - startedAtMs) / 1000));
-  if (elapsedSeconds < 60) {
-    return `${elapsedSeconds}s`;
-  }
-
-  const hours = Math.floor(elapsedSeconds / 3600);
-  const minutes = Math.floor((elapsedSeconds % 3600) / 60);
-  const seconds = elapsedSeconds % 60;
-
-  if (hours > 0) {
-    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
-  }
-
-  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
-}
 
 function formatMessageMeta(
   createdAt: string,

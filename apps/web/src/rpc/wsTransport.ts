@@ -157,9 +157,12 @@ export class WsTransport {
 
           const formattedError = formatErrorMessage(error);
           if (!isTransportConnectionErrorMessage(formattedError)) {
-            console.warn("WebSocket RPC subscription failed", {
-              error: formattedError,
-            });
+            // Slice 20 — log the error message inline (not wrapped in
+            // an object) so the screenshot shows the actual cause
+            // without DevTools needing the "Object" tree expanded. The
+            // raw error is still passed as a second arg for stack
+            // walking when expansion IS used.
+            console.warn(`WebSocket RPC subscription failed: ${formattedError}`, error);
             return;
           }
 

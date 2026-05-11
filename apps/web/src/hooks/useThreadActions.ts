@@ -4,6 +4,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "@tanstack/react-router";
 import { useCallback, useRef } from "react";
 
+import { triggerArisSidebarRefresh } from "../arisSidebarRefreshStore";
+import { archiveArisThread, deleteArisThread, unarchiveArisThread } from "../arisThreadsFetch";
 import { getFallbackThreadIdAfterDelete } from "../components/Sidebar.logic";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "./useHandleNewThread";
@@ -26,6 +28,11 @@ import { useSettings } from "./useSettings";
 export function useThreadActions() {
   const sidebarThreadSortOrder = useSettings((settings) => settings.sidebarThreadSortOrder);
   const confirmThreadDelete = useSettings((settings) => settings.confirmThreadDelete);
+  // Cut C punch list (Phase 3a) — Aris write actions hit `aris_server`
+  // directly via `arisThreadsFetch` instead of dispatching orchestration
+  // commands. Pulling the settings here so the action callbacks can
+  // forward `baseUrl` + `apiKey` to the fetch helpers.
+  const arisProviderSettings = useSettings((settings) => settings.providers.aris);
   const clearComposerDraftForThread = useComposerDraftStore((store) => store.clearDraftThread);
   const clearProjectDraftThreadById = useComposerDraftStore(
     (store) => store.clearProjectDraftThreadById,
@@ -68,11 +75,23 @@ export function useThreadActions() {
         throw new Error("Cannot archive a running thread.");
       }
 
-      await api.orchestration.dispatchCommand({
-        type: "thread.archive",
-        commandId: newCommandId(),
-        threadId: threadRef.threadId,
-      });
+      // Aris threads bypass the orchestration command path and hit
+      // `aris_server` directly so the write lands in `aris_memory.db`,
+      // which is what the sidebar reads from (Cut C).
+      if (thread.session?.provider === "aris") {
+        await archiveArisThread({
+          baseUrl: arisProviderSettings.baseUrl,
+          apiKey: arisProviderSettings.apiKey,
+          threadId: threadRef.threadId,
+        });
+        triggerArisSidebarRefresh();
+      } else {
+        await api.orchestration.dispatchCommand({
+          type: "thread.archive",
+          commandId: newCommandId(),
+          threadId: threadRef.threadId,
+        });
+      }
       const currentRouteThreadRef = getCurrentRouteThreadRef();
 
       if (
@@ -82,18 +101,35 @@ export function useThreadActions() {
         await handleNewThreadRef.current(scopeProjectRef(thread.environmentId, thread.projectId));
       }
     },
-    [getCurrentRouteThreadRef, resolveThreadTarget],
+    [arisProviderSettings, getCurrentRouteThreadRef, resolveThreadTarget],
   );
 
-  const unarchiveThread = useCallback(async (target: ScopedThreadRef) => {
-    const api = readEnvironmentApi(target.environmentId);
-    if (!api) return;
-    await api.orchestration.dispatchCommand({
-      type: "thread.unarchive",
-      commandId: newCommandId(),
-      threadId: target.threadId,
-    });
-  }, []);
+  const unarchiveThread = useCallback(
+    async (target: ScopedThreadRef) => {
+      const api = readEnvironmentApi(target.environmentId);
+      if (!api) return;
+      const resolved = resolveThreadTarget(target);
+      // For Aris threads we route around orchestration, but if the thread
+      // can't be resolved from the store (e.g. stale archived row) we still
+      // need to act — fall back to the orchestration command so the user
+      // isn't blocked.
+      if (resolved?.thread.session?.provider === "aris") {
+        await unarchiveArisThread({
+          baseUrl: arisProviderSettings.baseUrl,
+          apiKey: arisProviderSettings.apiKey,
+          threadId: target.threadId,
+        });
+        triggerArisSidebarRefresh();
+        return;
+      }
+      await api.orchestration.dispatchCommand({
+        type: "thread.unarchive",
+        commandId: newCommandId(),
+        threadId: target.threadId,
+      });
+    },
+    [arisProviderSettings, resolveThreadTarget],
+  );
 
   const deleteThread = useCallback(
     async (target: ScopedThreadRef, opts: { deletedThreadKeys?: ReadonlySet<string> } = {}) => {
@@ -170,11 +206,25 @@ export function useThreadActions() {
         deletedThreadIds,
         sortOrder: sidebarThreadSortOrder,
       });
-      await api.orchestration.dispatchCommand({
-        type: "thread.delete",
-        commandId: newCommandId(),
-        threadId: threadRef.threadId,
-      });
+      // Aris threads bypass the orchestration command path and hit
+      // `aris_server` directly so the row vanishes from `aris_memory.db`
+      // (and therefore from the sidebar's `/v1/threads` list). Other
+      // pre/post-delete cleanup (session stop, terminal close, navigation,
+      // worktree removal) is provider-agnostic and stays unchanged.
+      if (thread.session?.provider === "aris") {
+        await deleteArisThread({
+          baseUrl: arisProviderSettings.baseUrl,
+          apiKey: arisProviderSettings.apiKey,
+          threadId: threadRef.threadId,
+        });
+        triggerArisSidebarRefresh();
+      } else {
+        await api.orchestration.dispatchCommand({
+          type: "thread.delete",
+          commandId: newCommandId(),
+          threadId: threadRef.threadId,
+        });
+      }
       clearComposerDraftForThread(threadRef);
       clearProjectDraftThreadById(
         scopeProjectRef(threadRef.environmentId, thread.projectId),
@@ -233,6 +283,7 @@ export function useThreadActions() {
       }
     },
     [
+      arisProviderSettings,
       clearComposerDraftForThread,
       clearProjectDraftThreadById,
       clearTerminalState,

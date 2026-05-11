@@ -1,4 +1,6 @@
 import {
+  ARIS_WS_METHODS,
+  EPHEMERAL_WS_METHODS,
   type GitActionProgressEvent,
   type GitRunStackedActionInput,
   type GitRunStackedActionResult,
@@ -118,6 +120,16 @@ export interface WsRpcClient {
     readonly getFullThreadDiff: RpcUnaryMethod<typeof ORCHESTRATION_WS_METHODS.getFullThreadDiff>;
     readonly subscribeShell: RpcStreamMethod<typeof ORCHESTRATION_WS_METHODS.subscribeShell>;
     readonly subscribeThread: RpcInputStreamMethod<typeof ORCHESTRATION_WS_METHODS.subscribeThread>;
+  };
+  readonly ephemeral: {
+    readonly subscribeReasoning: RpcInputStreamMethod<
+      typeof EPHEMERAL_WS_METHODS.subscribeEphemeralReasoning
+    >;
+  };
+  readonly aris: {
+    readonly subscribeEvents: RpcInputStreamMethod<typeof ARIS_WS_METHODS.subscribeArisEvents>;
+    readonly decideApproval: RpcUnaryMethod<typeof ARIS_WS_METHODS.decideApproval>;
+    readonly readArchive: RpcUnaryMethod<typeof ARIS_WS_METHODS.readArchive>;
   };
 }
 
@@ -251,6 +263,26 @@ export function createWsRpcClient(transport: WsTransport): WsRpcClient {
           listener,
           options,
         ),
+    },
+    ephemeral: {
+      subscribeReasoning: (input, listener, options) =>
+        transport.subscribe(
+          (client) => client[EPHEMERAL_WS_METHODS.subscribeEphemeralReasoning](input),
+          listener,
+          options,
+        ),
+    },
+    aris: {
+      subscribeEvents: (input, listener, options) =>
+        transport.subscribe(
+          (client) => client[ARIS_WS_METHODS.subscribeArisEvents](input),
+          listener,
+          options,
+        ),
+      decideApproval: (input) =>
+        transport.request((client) => client[ARIS_WS_METHODS.decideApproval](input)),
+      readArchive: (input) =>
+        transport.request((client) => client[ARIS_WS_METHODS.readArchive](input)),
     },
   };
 }

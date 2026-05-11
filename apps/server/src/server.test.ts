@@ -58,6 +58,10 @@ import {
 import { GitCore, type GitCoreShape } from "./git/Services/GitCore.ts";
 import { GitManager, type GitManagerShape } from "./git/Services/GitManager.ts";
 import { GitStatusBroadcasterLive } from "./git/Layers/GitStatusBroadcaster.ts";
+import { ArisEventBusLive } from "./aris/Layers/ArisEventBus.ts";
+import { ArisAdapter } from "./provider/Services/ArisAdapter.ts";
+import { DeepSeekAdapter } from "./provider/Services/DeepSeekAdapter.ts";
+import { EphemeralBroadcastLive } from "./orchestration/Layers/EphemeralBroadcast.ts";
 import {
   GitStatusBroadcaster,
   type GitStatusBroadcasterShape,
@@ -495,6 +499,30 @@ const buildAppUnderTest = (options?: {
       ),
       Layer.provideMerge(authTestLayer),
       Layer.provide(workspaceAndProjectServicesLayer),
+      Layer.provideMerge(EphemeralBroadcastLive),
+      Layer.provideMerge(ArisEventBusLive),
+      Layer.provideMerge(
+        Layer.mock(ArisAdapter)({
+          // ws.ts now yields ArisAdapter for the `aris.approval.decide` RPC
+          // handler (Cut C, slice 3e-iii-a). Tests don't exercise that flow
+          // so a void stub for `respondToRequest` is enough; the other
+          // required shape fields just need to be present and shape-correct.
+          provider: "aris",
+          capabilities: { sessionModelSwitch: "in-session" },
+          respondToRequest: () => Effect.void,
+        }),
+      ),
+      // DS-fix.10 — ws.ts also yields DeepSeekAdapter for the
+      // approval-decide fallthrough (try Aris first, fall through to
+      // DeepSeek if "Unknown thread"). Same pattern as the Aris mock
+      // above: void stub for the test layer.
+      Layer.provideMerge(
+        Layer.mock(DeepSeekAdapter)({
+          provider: "deepseek",
+          capabilities: { sessionModelSwitch: "in-session" },
+          respondToRequest: () => Effect.void,
+        }),
+      ),
       Layer.provideMerge(FetchHttpClient.layer),
       Layer.provide(layerConfig),
     );

@@ -51,7 +51,14 @@ import type {
   OrchestrationSubscribeThreadInput,
   OrchestrationThreadStreamItem,
 } from "./orchestration";
-import type { EnvironmentId } from "./baseSchemas";
+import type {
+  ArisApprovalDecisionRequest,
+  ArisArchiveReadInput,
+  ArisArchiveReadOutput,
+  ArisEvent,
+} from "./arisEvent";
+import type { EnvironmentId, ThreadId } from "./baseSchemas";
+import type { EphemeralReasoningStreamEvent } from "./ephemeral";
 import { EditorId } from "./editor";
 import { ClientSettings, ServerSettings, ServerSettingsPatch } from "./settings";
 
@@ -287,5 +294,40 @@ export interface EnvironmentApi {
         onResubscribe?: () => void;
       },
     ) => () => void;
+  };
+  ephemeral: {
+    subscribeReasoning: (
+      input: { readonly threadId: ThreadId },
+      callback: (event: EphemeralReasoningStreamEvent) => void,
+      options?: {
+        onResubscribe?: () => void;
+      },
+    ) => () => void;
+  };
+  /**
+   * Dedicated Aris event channel (Cut C). Per-thread subscription that
+   * delivers `ArisEvent` shapes from `ArisEventBus` straight to the web
+   * renderer without going through the orchestration projection pipeline.
+   * `decideApproval` delivers the user's response to a previously-pushed
+   * `aris.approval.requested` event back to `ArisAdapter.respondToRequest`.
+   */
+  aris: {
+    subscribeEvents: (
+      input: { readonly threadId: ThreadId },
+      callback: (event: ArisEvent) => void,
+      options?: {
+        onResubscribe?: () => void;
+      },
+    ) => () => void;
+    decideApproval: (input: ArisApprovalDecisionRequest) => Promise<void>;
+    /**
+     * Read the per-thread rolling-window archive (active.jsonl). Used
+     * by the web client on thread mount to hydrate prior DS messages
+     * so they survive app restart. Currently only DS writes archives;
+     * Aris persists chat history through aris_memory.db on the
+     * POD/cloud side. Returns an empty messages array for threads that
+     * have no on-disk archive (first turn never sent, fresh thread).
+     */
+    readArchive: (input: ArisArchiveReadInput) => Promise<ArisArchiveReadOutput>;
   };
 }
