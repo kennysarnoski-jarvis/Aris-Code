@@ -1,10 +1,12 @@
 import { type ProviderKind, type ServerProvider } from "@t3tools/contracts";
 import { resolveSelectableModel } from "@t3tools/shared/model";
-import { memo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import type { VariantProps } from "class-variance-authority";
 import { type ProviderPickerKind, PROVIDER_OPTIONS } from "../../session-logic";
 import { ChevronDownIcon } from "lucide-react";
 import { Button, buttonVariants } from "../ui/button";
+import { useSettings } from "../../hooks/useSettings";
+import { useDeepSeekBalance } from "../../lib/deepseekBalanceState";
 import {
   Menu,
   MenuGroup,
@@ -89,6 +91,32 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const activeProvider = props.lockedProvider ?? props.provider;
   const selectedProviderOptions = props.modelOptionsByProvider[activeProvider];
+
+  // Aris-exclusive mode (2026-05-11): once the user has activated Aris
+  // (subscription key entered AND cloud has verified it by returning a
+  // balance), collapse the provider sub-menu down to Aris only — Codex
+  // and Claude entries become noise for a paying Aris user. Existing
+  // Codex/Claude threads keep working via `props.lockedProvider`, which
+  // bypasses this filter (locked branch below).
+  //
+  // Verification is strict on purpose: `balanceCents !== null` proves the
+  // cloud accepted the token. A user with a typo'd key won't get locked
+  // out of the other providers — they'll see all three until the key
+  // verifies.
+  const deepseekSettings = useSettings((s) => s.providers.deepseek);
+  const deepseekBalance = useDeepSeekBalance();
+  const arisExclusive =
+    deepseekSettings.enabled &&
+    deepseekSettings.cloudToken.length > 0 &&
+    deepseekBalance.balanceCents !== null;
+
+  const visibleProviderOptions = useMemo(
+    () =>
+      arisExclusive
+        ? AVAILABLE_PROVIDER_OPTIONS.filter((option) => option.value === "deepseek")
+        : AVAILABLE_PROVIDER_OPTIONS,
+    [arisExclusive],
+  );
   const selectedModelLabel =
     selectedProviderOptions.find((option) => option.slug === props.model)?.name ?? props.model;
   const ProviderIcon = PROVIDER_ICON_BY_PROVIDER[activeProvider];
@@ -169,7 +197,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
           </MenuGroup>
         ) : (
           <>
-            {AVAILABLE_PROVIDER_OPTIONS.map((option) => {
+            {visibleProviderOptions.map((option) => {
               const OptionIcon = PROVIDER_ICON_BY_PROVIDER[option.value];
               const liveProvider = props.providers
                 ? getProviderSnapshot(props.providers, option.value)
