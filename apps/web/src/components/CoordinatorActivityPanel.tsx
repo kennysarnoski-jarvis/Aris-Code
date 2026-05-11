@@ -73,9 +73,16 @@ export function CoordinatorActivityPanel(props: CoordinatorActivityPanelProps) {
                     </span>
                     <StatusPill status={w.status} />
                   </div>
-                  <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-0.5 flex items-center gap-2">
+                  <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-0.5 flex items-center gap-2 flex-wrap">
                     <span>{formatElapsed(elapsedMs)}</span>
                     {w.toolCalls != null && <span>· {w.toolCalls} tool calls</span>}
+                    {/* 2026-05-11: surface the worker's turn budget so BUDGET
+                        outcomes are interpretable. The cap is set per-worker
+                        when Aris spawns it (default 50, see CoordinatorTypes).
+                        Without this, "cap 25 vs cap 100" was invisible and
+                        BUDGET looked like it fired at random tool-call
+                        counts. */}
+                    {w.turnCap != null && <span>· cap {w.turnCap} turns</span>}
                     {w.outputBytes != null && <span>· {formatBytes(w.outputBytes)}</span>}
                   </div>
                   {w.errorMessage && (

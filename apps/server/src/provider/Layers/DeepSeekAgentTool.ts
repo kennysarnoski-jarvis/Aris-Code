@@ -191,8 +191,11 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
         .nullable()
         .optional()
         .describe(
-          `Optional cap on worker iterations. Default ${DEFAULT_WORKER_MAX_TURNS}. ` +
-            "Bump higher for deep research or complex implementation tasks.",
+          `Optional cap on worker LLM turns (each turn can emit multiple ` +
+            `parallel tool calls). Default ${DEFAULT_WORKER_MAX_TURNS}. ` +
+            `Bump higher for deep research or sprawling refactors. If a task ` +
+            `wouldn't fit in ~100 turns even with room to spare, decompose it ` +
+            `into multiple narrower workers instead of raising this cap further.`,
         ),
     }),
     async execute({ description, prompt, tools, system_prompt, max_turns }) {

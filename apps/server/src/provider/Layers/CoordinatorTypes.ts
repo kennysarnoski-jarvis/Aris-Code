@@ -96,16 +96,24 @@ export interface WorkerUsage {
 
 /**
  * Default `max_turns` for a spawned worker when the model doesn't
- * specify. The Rust ref's default was 10, but COORD-1 live testing
- * showed workers spin on simple "audit X for Y" tasks when the
- * directory has no matches — turn 1 grep returns nothing, worker
- * doesn't trust the empty result, burns the rest of its budget
- * trying variants. Bumped to 25 to give breathing room.
+ * specify. Bump history:
+ *   - Rust ref: 10
+ *   - COORD-1 (initial): 25 — workers spun on empty-grep "audit X
+ *     for Y" tasks; turn 1 returned nothing, worker didn't trust the
+ *     empty result and burned the rest of its budget trying variants.
+ *     25 fixed that.
+ *   - 2026-05-11: 50 — live three-worker refactor (swap `errorMessage`
+ *     across web/) showed legitimate read → plan → edit → verify → fix
+ *     work needs ~30-40 turns to land. Workers were making real
+ *     progress but ran out of rope. 50 gives implementation tasks
+ *     headroom while keeping spinning workers bounded.
  *
- * Workers that need more iterations (deep research, complex
- * implementation) should pass `max_turns` explicitly.
+ * Workers that need more iterations (deep research, sprawling
+ * refactors) should still pass `max_turns` explicitly. Tasks that
+ * don't fit in ~100 turns are the wrong shape — decompose them into
+ * multiple narrower workers rather than raising the cap.
  */
-export const DEFAULT_WORKER_MAX_TURNS = 25;
+export const DEFAULT_WORKER_MAX_TURNS = 50;
 
 /**
  * Tool names that are NEVER given to a spawned worker, regardless of
