@@ -216,6 +216,7 @@ function createMockEnvironmentApi(input: {
       subscribeEvents: (() => () => undefined) as EnvironmentApi["aris"]["subscribeEvents"],
       decideApproval: (async () => undefined) as EnvironmentApi["aris"]["decideApproval"],
       readArchive: (async () => ({ messages: [] })) as EnvironmentApi["aris"]["readArchive"],
+      readFacts: (async () => ({ facts: [] })) as EnvironmentApi["aris"]["readFacts"],
     },
   };
 }

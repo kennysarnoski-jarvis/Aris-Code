@@ -459,7 +459,17 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         // `arisRefetch()` replaced the array at turn-end.
         maintainVisibleContentPosition={{ size: true, data: false }}
         onScroll={handleScroll}
-        className="h-full scroll-smooth overflow-x-hidden overscroll-y-contain px-3 sm:px-5"
+        // 2026-05-12 — `scroll-smooth` removed. It applied CSS
+        // `scroll-behavior: smooth` to the container, which interpolates
+        // every programmatic scrollTop change over ~300ms. LegendList's
+        // own `scrollToEnd({ animated: true })` already steps scrollTop
+        // over many frames to draw the animation; stacking CSS smoothing
+        // on top of that compounded into a visible double-snap (the
+        // "scroll to bottom" pill landed at end, then `maintainVisible-
+        // ContentPosition.size` adjusted for measured heights, then CSS
+        // re-interpolated — read as "takes me away then back again"
+        // jank). The library's animation alone produces a clean ride.
+        className="h-full overflow-x-hidden overscroll-y-contain px-3 sm:px-5"
         ListHeaderComponent={<div className="h-3 sm:h-4" />}
         ListFooterComponent={
           <div>
