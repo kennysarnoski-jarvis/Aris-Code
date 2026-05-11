@@ -806,6 +806,16 @@ export const ARIS_WS_METHODS = {
    * approval RPC).
    */
   readArchive: "aris.archive.read",
+  /**
+   * Read the user-global facts store (`~/.aris/facts.jsonl`). Drives the
+   * right-sidebar Memory panel (mirrors Cowork's Memory section). User-
+   * global because facts apply across every project, not just the active
+   * thread's. No input needed — the file path is fixed per host user.
+   * Auto-refreshed on the client by re-calling this RPC whenever an
+   * `aris.tool.completed` for `upsert_memory_node` / `delete_memory_node`
+   * arrives, so the panel stays current without polling.
+   */
+  readFacts: "aris.facts.read",
 } as const;
 
 export const ArisSubscribeEventsInput = Schema.Struct({
@@ -887,4 +897,50 @@ export const WsArisArchiveReadRpc = Rpc.make(ARIS_WS_METHODS.readArchive, {
   payload: ArisArchiveReadInput,
   success: ArisArchiveReadOutput,
   error: ArisArchiveReadError,
+});
+
+// ── aris.facts.read — Memory panel snapshot ─────────────────────────
+
+/**
+ * One persisted fact returned by `aris.facts.read`. Mirrors the
+ * server-side `Fact` interface (FactsMemory.ts) one-to-one. The client
+ * groups by `factType` and renders `label` as the row title, with
+ * `description` + `content` revealed on click-to-expand.
+ */
+export const ArisFact = Schema.Struct({
+  factType: Schema.Literals(["user", "feedback"]),
+  label: Schema.String,
+  description: Schema.String,
+  content: Schema.String,
+});
+export type ArisFact = typeof ArisFact.Type;
+
+/**
+ * No input — facts are user-global (path is fixed at
+ * `~/.aris/facts.jsonl`). Empty struct kept for forward-compat in case
+ * we need per-host or per-account scoping later.
+ */
+export const ArisFactsReadInput = Schema.Struct({});
+export type ArisFactsReadInput = typeof ArisFactsReadInput.Type;
+
+export const ArisFactsReadOutput = Schema.Struct({
+  facts: Schema.Array(ArisFact),
+});
+export type ArisFactsReadOutput = typeof ArisFactsReadOutput.Type;
+
+export class ArisFactsReadError extends Schema.TaggedErrorClass<ArisFactsReadError>()(
+  "ArisFactsReadError",
+  {
+    detail: Schema.String,
+  },
+) {
+  override get message() {
+    return `Aris facts read failed: ${this.detail}`;
+  }
+}
+
+export const WsArisFactsReadRpc = Rpc.make(ARIS_WS_METHODS.readFacts, {
+  payload: ArisFactsReadInput,
+  success: ArisFactsReadOutput,
+  error: ArisFactsReadError,
 });

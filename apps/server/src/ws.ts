@@ -3,6 +3,7 @@ import {
   ARIS_WS_METHODS,
   ArisApprovalDecideError,
   ArisArchiveReadError,
+  ArisFactsReadError,
   type AuthAccessStreamEvent,
   AuthSessionId,
   CommandId,
@@ -52,6 +53,7 @@ import {
 } from "./observability/RpcInstrumentation";
 import { ProviderRegistry } from "./provider/Services/ProviderRegistry";
 import { readActiveWindow } from "./provider/Layers/RollingWindowMemory";
+import { readFacts } from "./provider/Layers/FactsMemory.ts";
 import { ServerLifecycleEvents } from "./serverLifecycleEvents";
 import { ServerRuntimeStartup } from "./serverRuntimeStartup";
 import { ServerSettingsService } from "./serverSettings";
@@ -1081,6 +1083,25 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
               },
               catch: (cause) =>
                 new ArisArchiveReadError({
+                  detail: cause instanceof Error ? cause.message : String(cause),
+                }),
+            }),
+            { "rpc.aggregate": "aris" },
+          ),
+        // Memory panel snapshot — reads user-global facts.jsonl. Empty
+        // input (facts aren't thread- or project-scoped). Returns an
+        // empty facts array when the file doesn't exist yet (fresh
+        // user, never saved a fact).
+        [ARIS_WS_METHODS.readFacts]: (_input) =>
+          observeRpcEffect(
+            ARIS_WS_METHODS.readFacts,
+            Effect.tryPromise({
+              try: async () => {
+                const facts = await readFacts();
+                return { facts };
+              },
+              catch: (cause) =>
+                new ArisFactsReadError({
                   detail: cause instanceof Error ? cause.message : String(cause),
                 }),
             }),

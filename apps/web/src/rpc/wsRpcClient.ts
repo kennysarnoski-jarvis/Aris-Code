@@ -130,6 +130,7 @@ export interface WsRpcClient {
     readonly subscribeEvents: RpcInputStreamMethod<typeof ARIS_WS_METHODS.subscribeArisEvents>;
     readonly decideApproval: RpcUnaryMethod<typeof ARIS_WS_METHODS.decideApproval>;
     readonly readArchive: RpcUnaryMethod<typeof ARIS_WS_METHODS.readArchive>;
+    readonly readFacts: RpcUnaryMethod<typeof ARIS_WS_METHODS.readFacts>;
   };
 }
 
@@ -283,6 +284,7 @@ export function createWsRpcClient(transport: WsTransport): WsRpcClient {
         transport.request((client) => client[ARIS_WS_METHODS.decideApproval](input)),
       readArchive: (input) =>
         transport.request((client) => client[ARIS_WS_METHODS.readArchive](input)),
+      readFacts: (input) => transport.request((client) => client[ARIS_WS_METHODS.readFacts](input)),
     },
   };
 }

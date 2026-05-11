@@ -6,6 +6,7 @@ import { OpenError, OpenInEditorInput } from "./editor";
 import {
   WsArisApprovalDecideRpc,
   WsArisArchiveReadRpc,
+  WsArisFactsReadRpc,
   WsSubscribeArisEventsRpc,
 } from "./arisEvent";
 import { AuthAccessStreamEvent } from "./auth";
@@ -399,4 +400,5 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeArisEventsRpc,
   WsArisApprovalDecideRpc,
   WsArisArchiveReadRpc,
+  WsArisFactsReadRpc,
 );

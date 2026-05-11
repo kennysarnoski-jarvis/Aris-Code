@@ -56,6 +56,8 @@ import type {
   ArisArchiveReadInput,
   ArisArchiveReadOutput,
   ArisEvent,
+  ArisFactsReadInput,
+  ArisFactsReadOutput,
 } from "./arisEvent";
 import type { EnvironmentId, ThreadId } from "./baseSchemas";
 import type { EphemeralReasoningStreamEvent } from "./ephemeral";
@@ -329,5 +331,13 @@ export interface EnvironmentApi {
      * have no on-disk archive (first turn never sent, fresh thread).
      */
     readArchive: (input: ArisArchiveReadInput) => Promise<ArisArchiveReadOutput>;
+    /**
+     * Read the user-global facts store (`~/.aris/facts.jsonl`). Drives
+     * the right-sidebar Memory panel. User-global: no thread/cwd
+     * scoping — the file path is fixed per host user. Refetched on the
+     * client whenever an `aris.tool.completed` for upsert/delete-memory
+     * arrives so the panel stays current without polling.
+     */
+    readFacts: (input: ArisFactsReadInput) => Promise<ArisFactsReadOutput>;
   };
 }

@@ -104,6 +104,7 @@ import PlanSidebar from "./PlanSidebar";
 import MemorySidebar from "./memory/MemorySidebar";
 import { CoordinatorActivityPanel } from "./CoordinatorActivityPanel";
 import { ProjectTodosPanel } from "./ProjectTodosPanel";
+import { MemoryPanel } from "./MemoryPanel";
 import { useArisProjectId } from "../useArisProjectId";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
 import { ChevronDownIcon } from "lucide-react";
@@ -3802,17 +3803,31 @@ export default function ChatView(props: ChatViewProps) {
             on top, project todos below. Both gated to provider ===
             "deepseek" — they have nothing to show for Aris/Codex/
             Claude threads. */}
-        {activeThread?.session?.provider === "deepseek" ? (
+        {/*
+         * Right sidebar. Renders whenever there's an active thread —
+         * MemoryPanel is user-global and applies to every provider, so
+         * the wrapper isn't gated on deepseek anymore. Coordinator +
+         * todos are still DS-specific and conditionally rendered inside.
+         */}
+        {activeThread ? (
           <div className="w-72 flex-shrink-0 border-l border-zinc-200 dark:border-zinc-800 overflow-y-auto flex flex-col gap-4 py-3">
-            <CoordinatorActivityPanel
+            {activeThread.session?.provider === "deepseek" && (
+              <>
+                <CoordinatorActivityPanel
+                  threadId={activeThreadId}
+                  environmentId={activeThread.environmentId ?? null}
+                  provider={activeThread.session?.provider ?? null}
+                />
+                <ProjectTodosPanel
+                  threadId={activeThreadId}
+                  environmentId={activeThread.environmentId ?? null}
+                  provider={activeThread.session?.provider ?? null}
+                />
+              </>
+            )}
+            <MemoryPanel
               threadId={activeThreadId}
-              environmentId={activeThread?.environmentId ?? null}
-              provider={activeThread?.session?.provider ?? null}
-            />
-            <ProjectTodosPanel
-              threadId={activeThreadId}
-              environmentId={activeThread?.environmentId ?? null}
-              provider={activeThread?.session?.provider ?? null}
+              environmentId={activeThread.environmentId ?? null}
             />
           </div>
         ) : null}

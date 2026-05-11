@@ -54,6 +54,7 @@ export function createEnvironmentApi(rpcClient: WsRpcClient): EnvironmentApi {
         rpcClient.aris.subscribeEvents(input, callback, options),
       decideApproval: (input) => rpcClient.aris.decideApproval(input),
       readArchive: (input) => rpcClient.aris.readArchive(input),
+      readFacts: (input) => rpcClient.aris.readFacts(input),
     },
   };
 }
