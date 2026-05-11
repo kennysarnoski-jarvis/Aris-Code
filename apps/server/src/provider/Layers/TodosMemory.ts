@@ -339,9 +339,10 @@ export function newTodosRecord(
  * — the model shouldn't waste context on done work, and the file still
  * has the audit trail for `clear --only-completed` housekeeping.
  *
- * Returns the empty string when there are no open todos, so the
- * adapter can decide to skip the `<todos>` block entirely (no point
- * in injecting an empty section).
+ * Returns the empty string when there are no open todos. The adapter
+ * still injects the `<todos>` block in that case — empty-state copy
+ * lives in the prompt template, not here — so DS always sees the
+ * affordance (matches the facts/scratchpad pattern; t3code 2026-05-11).
  */
 export function renderOpenTodos(todos: ReadonlyArray<Todo>): string {
   const open = todos.filter((t) => t.status !== "completed");

@@ -725,11 +725,19 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
       // shouldn't waste context on done work, and `clear --only-completed`
       // can sweep them via the manage_todos tool.
       //
-      // Failure mode: same as scratchpad — log + continue without
-      // injection. Empty open-list → no `<todos>` block at all.
-      let todosText: string | null = null;
+      // 2026-05-11 — `todosText` is now ALWAYS a string (empty when no
+      // open todos), matching the facts/scratchpad pattern. The injected
+      // block always renders so DS sees the `<todos>` affordance every
+      // turn — without it she'd only be reminded of the tool when she
+      // had already used it once, a chicken-and-egg trap that surfaced
+      // as inconsistent todo usage in live testing.
+      //
+      // Failure mode: same as scratchpad — log + continue. Read errors
+      // produce an empty string; the empty-state copy still nudges DS
+      // to use manage_todos.
+      let todosText = "";
       if (archiveCwd) {
-        const rendered = yield* Effect.tryPromise({
+        todosText = yield* Effect.tryPromise({
           try: async () => renderOpenTodos(await readTodos(archiveCwd)),
           catch: toTodosIOError("read"),
         }).pipe(
@@ -742,7 +750,6 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
             }),
           ),
         );
-        todosText = rendered.length > 0 ? rendered : null;
       }
 
       // RW-2 — Build the SDK input array. Prior turns become
@@ -982,27 +989,40 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
         // transition, `clear` (with `only_completed: true`) to sweep
         // finished. The block refreshes every turn from
         // `~/.aris/projects/<this-project>/todos.jsonl`.
-        ...(todosText
-          ? [
-              {
-                role: "system" as const,
-                content:
-                  "## Project todos (open only)\n\n" +
-                  "Open todos for this project — pending and in_progress. " +
-                  "Completed todos are hidden from this block but still " +
-                  "exist in the file (run `manage_todos` mode `list` to " +
-                  "see everything, or mode `clear` with `only_completed: " +
-                  "true` to sweep them).\n\n" +
-                  "When you start work on a todo, transition it to " +
-                  "`in_progress` via `manage_todos` mode `set_status`. " +
-                  "When done, transition to `completed`. The block below " +
-                  "refreshes every turn — you don't need to re-list.\n\n" +
-                  "<todos>\n" +
-                  todosText +
-                  "\n</todos>",
-              } as AgentInputItem,
-            ]
-          : []),
+        //
+        // 2026-05-11 — ALWAYS emitted (even when the open list is
+        // empty), mirroring the facts/scratchpad pattern. The empty-
+        // state copy nudges DS to USE the tool for multi-step work
+        // instead of grinding silently. Without this block, fresh-
+        // task turns had no `<todos>` reminder anywhere and DS would
+        // skip the tool more often than she should.
+        {
+          role: "system" as const,
+          content:
+            "## Project todos (open only)\n\n" +
+            "Open todos for this project — pending and in_progress. " +
+            "Completed todos are hidden from this block but still " +
+            "exist in the file (run `manage_todos` mode `list` to " +
+            "see everything, or mode `clear` with `only_completed: " +
+            "true` to sweep them).\n\n" +
+            "**Default to using todos for multi-step work.** Any time the " +
+            "user gives you a task with 3+ discrete steps — refactor, " +
+            "audit, implementation, anything you'd otherwise narrate as " +
+            "'first I'll X, then Y, then Z' — open `manage_todos` with " +
+            "mode `add` for each step BEFORE you start the first one. " +
+            "The user can see the panel update live and verify your plan. " +
+            "When you start a step, transition it to `in_progress` via " +
+            "mode `set_status`. When done, transition to `completed`. " +
+            "The block below refreshes every turn — you don't need to " +
+            "re-list between actions.\n\n" +
+            "<todos>\n" +
+            (todosText.length > 0
+              ? todosText
+              : "(no open todos — call manage_todos mode `add` to create " +
+                "them for any multi-step task the user just gave you, " +
+                "before you start the first step.)") +
+            "\n</todos>",
+        } as AgentInputItem,
         ...(rolledUpSummaryText
           ? [
               {
