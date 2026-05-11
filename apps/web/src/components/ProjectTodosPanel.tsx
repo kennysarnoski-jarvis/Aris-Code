@@ -28,11 +28,14 @@
  *       persist in the jsonl unless the user explicitly asks Aris to
  *       run `manage_todos({mode:"clear", only_completed:true})`).
  *
- *   Limitation: if the panel wasn't mounted when a todo flipped from
- *   open → completed, that transition isn't captured (we never saw the
- *   open state to track). In practice the panel is always mounted while
- *   the user is in a DS thread, so this only bites if the user switches
- *   threads and returns — same UX as Cowork's TodoList.
+ * 2026-05-11 follow-up — persist across app restart via localStorage:
+ *   The Map is serialized to localStorage on every state change, keyed
+ *   by threadId. On thread mount, the panel hydrates from localStorage
+ *   *before* subscribing to live events, so reopening the app drops
+ *   you back where you left off in each thread. Per-thread mental
+ *   model stays intact (every thread has its own localStorage key).
+ *   Storage is per-Electron-installation; uninstall + reinstall wipes
+ *   it, but the server-side jsonl on disk is untouched.
  *
  * @module ProjectTodosPanel
  */
@@ -50,6 +53,64 @@ interface TrackedTodo {
   readonly text: string;
 }
 
+const STORAGE_KEY_PREFIX = "arisTodos:";
+
+/**
+ * Serialize a tracked-todo Map for localStorage. Maps don't survive
+ * JSON.stringify natively — we convert to an entries array first.
+ */
+function serializeTrackedTodos(map: ReadonlyMap<string, TrackedTodo>): string {
+  return JSON.stringify(Array.from(map.entries()));
+}
+
+/**
+ * Hydrate from localStorage on thread mount. Tolerant to malformed or
+ * legacy data — any parse / shape error wipes the key and returns an
+ * empty map so the user never sees corrupted state. Returns an empty
+ * map when no key exists (fresh thread or first install).
+ */
+function loadTrackedTodos(threadId: string | null): ReadonlyMap<string, TrackedTodo> {
+  if (!threadId) return new Map();
+  if (typeof window === "undefined" || !window.localStorage) return new Map();
+  const raw = window.localStorage.getItem(STORAGE_KEY_PREFIX + threadId);
+  if (!raw) return new Map();
+  try {
+    const entries = JSON.parse(raw) as ReadonlyArray<[string, TrackedTodo]>;
+    if (!Array.isArray(entries)) throw new Error("Expected an array of entries.");
+    const out = new Map<string, TrackedTodo>();
+    for (const entry of entries) {
+      if (!Array.isArray(entry) || entry.length !== 2) continue;
+      const [id, todo] = entry;
+      if (typeof id !== "string" || typeof todo !== "object" || todo === null) continue;
+      const status = (todo as { status?: string }).status;
+      const text = (todo as { text?: string }).text;
+      if (status !== "pending" && status !== "in_progress" && status !== "completed") continue;
+      if (typeof text !== "string") continue;
+      out.set(id, { id, status, text });
+    }
+    return out;
+  } catch {
+    // Corrupted entry — drop it and return empty. Self-healing.
+    window.localStorage.removeItem(STORAGE_KEY_PREFIX + threadId);
+    return new Map();
+  }
+}
+
+function persistTrackedTodos(threadId: string | null, map: ReadonlyMap<string, TrackedTodo>): void {
+  if (!threadId) return;
+  if (typeof window === "undefined" || !window.localStorage) return;
+  if (map.size === 0) {
+    window.localStorage.removeItem(STORAGE_KEY_PREFIX + threadId);
+    return;
+  }
+  try {
+    window.localStorage.setItem(STORAGE_KEY_PREFIX + threadId, serializeTrackedTodos(map));
+  } catch {
+    // Storage quota hit / disabled — fail silently, in-memory state
+    // continues to work, just won't survive restart.
+  }
+}
+
 interface ParsedOpenTodo {
   readonly id: string;
   readonly status: Exclude<TrackedStatus, "completed">;
@@ -65,19 +126,29 @@ export interface ProjectTodosPanelProps {
 export function ProjectTodosPanel(props: ProjectTodosPanelProps) {
   const { threadId, environmentId, provider } = props;
   const enabled = provider === "deepseek" && !!threadId && !!environmentId;
-  const [trackedTodos, setTrackedTodos] = useState<ReadonlyMap<string, TrackedTodo>>(
-    () => new Map(),
+  const [trackedTodos, setTrackedTodos] = useState<ReadonlyMap<string, TrackedTodo>>(() =>
+    loadTrackedTodos(threadId),
   );
 
-  // Resets the tracked-todos map whenever the active thread changes
-  // (and on unmount). Each thread gets its own fresh slate.
+  // Persist every state change to localStorage (keyed by threadId) so
+  // the panel survives app restart. Effect runs on every mutation;
+  // serialize cost is trivial for any realistic todo count.
+  useEffect(() => {
+    persistTrackedTodos(threadId, trackedTodos);
+  }, [threadId, trackedTodos]);
+
+  // Hydrate from localStorage and subscribe to live events whenever the
+  // active thread changes. Each thread is independent — its history
+  // survives restart but doesn't leak into other threads.
   useEffect(() => {
     if (!enabled || !threadId || !environmentId) {
       setTrackedTodos(new Map());
       return;
     }
-    // Reset on (re)subscribe so switching threads always starts clean.
-    setTrackedTodos(new Map());
+    // Hydrate from localStorage first so the panel renders immediately
+    // with this thread's prior history; live events from this point
+    // forward layer on top.
+    setTrackedTodos(loadTrackedTodos(threadId));
 
     const api = readEnvironmentApi(environmentId);
     if (!api) return;
