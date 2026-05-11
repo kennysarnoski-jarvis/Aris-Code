@@ -116,6 +116,35 @@ export interface WorkerUsage {
 export const DEFAULT_WORKER_MAX_TURNS = 50;
 
 /**
+ * Tool names that are ALWAYS available to every spawned worker, even
+ * when the coordinator passes an explicit `tools: [...]` allowlist
+ * that omits them. These are the baseline file/shell operations that
+ * any practical worker task may legitimately need — without them you
+ * get the 2026-05-12 failure mode where Aris spawned a refactor worker
+ * with `tools: ["read_file", "edit_file", "grep"]` and the worker
+ * needed `bash` mid-task to size a file, hit "Tool bash not found in
+ * agent DeepSeek.Worker", and failed the whole worker.
+ *
+ * The coordinator's `tools` arg is now ADDITIVE over this baseline —
+ * it can add specialty tools (e.g. `search_knowledge`) but cannot
+ * narrow below the baseline.
+ *
+ * If you're tempted to add `scratchpad` / `todos` / `facts` /
+ * `search_*` to this set: DON'T. Those are specialty tools whose
+ * presence in a worker context depends on the task; the baseline is
+ * strictly the always-makes-sense surface.
+ */
+export const WORKER_BASELINE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "bash",
+  "read_file",
+  "write_file",
+  "edit_file",
+  "grep",
+  "glob",
+  "list_directory",
+]);
+
+/**
  * Tool names that are NEVER given to a spawned worker, regardless of
  * whether the model passed `tools: undefined` (default) or a
  * whitelist that includes them.

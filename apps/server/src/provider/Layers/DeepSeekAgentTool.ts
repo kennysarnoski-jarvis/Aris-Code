@@ -49,6 +49,7 @@ import { ArisToolCallId, type ArisEvent, type TurnId } from "@t3tools/contracts"
 import { createDeepSeekOpenAIClient } from "./DeepSeekOpenAIClient.ts";
 import {
   DEFAULT_WORKER_MAX_TURNS,
+  WORKER_BASELINE_TOOL_NAMES,
   WORKER_EXCLUDED_TOOL_NAMES,
   type WorkerUsage,
 } from "./CoordinatorTypes.ts";
@@ -172,9 +173,13 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
         .nullable()
         .optional()
         .describe(
-          "Optional name allowlist. When omitted/null, worker gets your " +
-            "full tool set minus spawn_worker and project/user state tools. " +
-            "Pass e.g. ['bash', 'read_file'] to restrict to a narrow set.",
+          "Optional allowlist of SPECIALTY tools for the worker, ADDITIVE " +
+            "over the always-on baseline. Every worker automatically gets " +
+            "bash, read_file, write_file, edit_file, grep, glob, " +
+            "list_directory — you don't need to (and shouldn't) list those. " +
+            "Pass e.g. ['search_knowledge', 'search_cve'] to ALSO give the " +
+            "worker the KG search tools. Omit/null gives the worker your " +
+            "full catalog minus spawn_worker. Cannot narrow below baseline.",
         ),
       system_prompt: z
         .string()
@@ -199,14 +204,23 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
         ),
     }),
     async execute({ description, prompt, tools, system_prompt, max_turns }) {
-      // Tool resolution: explicit whitelist OR exclusion-based default.
-      // Both paths exclude WORKER_EXCLUDED_TOOL_NAMES even if the
-      // model's whitelist tries to include something forbidden — the
-      // exclusion list is the security boundary, not a default.
+      // Tool resolution layers (2026-05-12, refined from earlier):
+      //   1. WORKER_EXCLUDED_TOOL_NAMES — security boundary, NEVER given to
+      //      workers regardless of what the coordinator asks for.
+      //   2. WORKER_BASELINE_TOOL_NAMES — file/shell baseline, ALWAYS given
+      //      to workers regardless of the coordinator's `tools` allowlist.
+      //      Prevents the "Tool bash not found in agent DeepSeek.Worker"
+      //      failure when the coordinator narrows too aggressively and the
+      //      worker legitimately needs a baseline tool mid-task.
+      //   3. requestedSet (coordinator's `tools` arg) — ADDITIVE over the
+      //      baseline. When present, specialty tools (search_*, scratchpad,
+      //      todos, facts, etc.) are only included if explicitly listed.
+      //      When absent, all non-excluded parent tools are included.
       const requestedSet = Array.isArray(tools) && tools.length > 0 ? new Set(tools) : null;
       const workerTools = deps.parentTools.filter((t) => {
         const name = t.name;
         if (WORKER_EXCLUDED_TOOL_NAMES.has(name)) return false;
+        if (WORKER_BASELINE_TOOL_NAMES.has(name)) return true;
         if (requestedSet !== null && !requestedSet.has(name)) return false;
         return true;
       });
@@ -318,19 +332,37 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
         (t) => !sessionScratchpadToolNames.has(t.name),
       );
 
+      // 2026-05-12 — Build the final tool set once so we can both pass
+      // it to the Agent AND list its names in the worker's instructions.
+      // Listing the tools in the system prompt is defense-in-depth
+      // against the "model hallucinates a tool name the agent doesn't
+      // have" failure mode — even with the always-on baseline, an
+      // explicit "these and only these" reminder keeps the worker
+      // honest about its surface.
+      const finalWorkerTools = [
+        ...workerToolsMinusSessionScratchpad,
+        ...workerSessionScratchpadTools,
+        escalateTool,
+      ];
+      const workerToolNamesList = finalWorkerTools.map((t) => t.name).join(", ");
+      const workerInstructionsWithToolList =
+        workerInstructions +
+        "\n\n## Your available tools\n\n" +
+        `You have exactly these tools and no others: ${workerToolNamesList}. ` +
+        "Do not attempt to call any tool not in this list — those calls " +
+        "fail with 'tool not found' and waste your turn budget. If the task " +
+        "seems to require a tool you don't have, call `escalate` with a " +
+        "description of what you'd need, and the coordinator will re-plan.";
+
       const workerAgent = new Agent({
         name: `DeepSeek.Worker.${description.replaceAll(/\s+/g, "_")}`,
-        instructions: workerInstructions,
+        instructions: workerInstructionsWithToolList,
         model: new OpenAIChatCompletionsModel(workerClient, deps.defaultModelName),
         // Workers get the parent's tool catalog (filtered, with the
         // parent-tagged session-scratchpad tools stripped), plus
         // worker-tagged session-scratchpad tools, plus the worker-only
         // escalate tool.
-        tools: [
-          ...workerToolsMinusSessionScratchpad,
-          ...workerSessionScratchpadTools,
-          escalateTool,
-        ],
+        tools: finalWorkerTools,
       });
 
       const turnCap =
