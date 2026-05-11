@@ -105,11 +105,57 @@ What Aris **can't** do yet:
 > [!NOTE]
 > **No prebuilt binaries yet.** Signed installers (Homebrew cask, winget, AUR, .dmg / .exe / AppImage) are planned but not yet shipped. For now, Aris Code runs from source — three commands on any platform. Watch [github.com/kennysarnoski-jarvis/Aris-Code/releases](https://github.com/kennysarnoski-jarvis/Aris-Code/releases) for the first packaged release.
 
-### Prerequisites (all platforms)
+> [!IMPORTANT]
+> **STOP — install these three things first or nothing will work.** Skip ahead and you'll hit `command not found: bun` or `Cannot find package`. Run all three steps below in order, then verify each one prints a version, *before* you `git clone`.
 
-- [Bun](https://bun.sh) ≥ 1.3 — `curl -fsSL https://bun.sh/install | bash`
-- Node.js 22+ — install via [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), or your distro's package manager
-- Git
+### Step 1 — Install Bun (≥ 1.3)
+
+```bash
+curl -fsSL https://bun.sh/install | bash
+```
+
+After install, **close and reopen your terminal** (or `source ~/.zshrc` on macOS / `source ~/.bashrc` on Linux) so `~/.bun/bin` lands on your `PATH`.
+
+Verify:
+
+```bash
+bun --version    # → 1.3.x or higher
+```
+
+If you still see `command not found: bun` after reopening the terminal, the installer printed a `PATH` line near the end of its output — copy that line into your shell rc file and reopen the terminal again.
+
+### Step 2 — Install Node.js (22 or newer)
+
+Pick one of these (any of them works):
+
+- **[nvm](https://github.com/nvm-sh/nvm)** — `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash`, reopen terminal, then `nvm install 22 && nvm use 22`
+- **[fnm](https://github.com/Schniz/fnm)** — `curl -fsSL https://fnm.vercel.app/install | bash`, reopen terminal, then `fnm install 22 && fnm use 22`
+- **Direct installer** — download the 22 LTS installer from [nodejs.org](https://nodejs.org/)
+- **Linux package manager** — `sudo apt install nodejs npm` (Debian/Ubuntu), `sudo dnf install nodejs` (Fedora), `sudo pacman -S nodejs npm` (Arch)
+
+Verify:
+
+```bash
+node --version   # → v22.x.x or higher
+```
+
+### Step 3 — Make sure Git is installed
+
+Most systems have it. Verify first:
+
+```bash
+git --version
+```
+
+If missing:
+
+- **macOS** — `xcode-select --install` (bundles git plus the C compiler you'll need later — see Platform notes below)
+- **Linux** — `sudo apt install git` (Debian/Ubuntu), `sudo dnf install git` (Fedora), `sudo pacman -S git` (Arch)
+- **Windows** — install [Git for Windows](https://git-scm.com/download/win), or use the git bundled with WSL2's Ubuntu
+
+---
+
+Got all three? `bun --version`, `node --version`, and `git --version` all print without error? Good — now you can clone the repo.
 
 ### Clone and run
 
