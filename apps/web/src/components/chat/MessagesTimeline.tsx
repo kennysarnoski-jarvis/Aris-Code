@@ -1,4 +1,10 @@
-import { type EnvironmentId, type MessageId, type ThreadId, type TurnId } from "@t3tools/contracts";
+import {
+  type EnvironmentId,
+  type MessageId,
+  type ServerProviderSkill,
+  type ThreadId,
+  type TurnId,
+} from "@t3tools/contracts";
 import {
   createContext,
   memo,
@@ -43,6 +49,7 @@ import { useArisCompactionStatus } from "../../useArisCompactionStatus";
 import { ChangedFilesTree } from "./ChangedFilesTree";
 import { DiffStatLabel, hasNonZeroStat } from "./DiffStatLabel";
 import { MessageCopyButton } from "./MessageCopyButton";
+import { SkillInlineText } from "./SkillInlineText";
 import {
   computeStableMessagesTimelineRows,
   MAX_VISIBLE_WORK_LOG_ENTRIES,
@@ -89,6 +96,11 @@ interface TimelineRowSharedState {
   markdownCwd: string | undefined;
   resolvedTheme: "light" | "dark";
   workspaceRoot: string | undefined;
+  /** Skills exposed by the active provider — passed down to ChatMarkdown
+   *  + UserMessageBody so `$skillname` tokens in assistant / user text
+   *  render as the same purple chip the composer shows. Ported from
+   *  t3code #2572 (2026-05-07). */
+  skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   activeThreadEnvironmentId: EnvironmentId;
   activeThreadProvider: string | null;
   /** Slice 31 — snapshotted Thinking toggle for the in-flight Aris turn.
@@ -147,8 +159,15 @@ interface MessagesTimelineProps {
   resolvedTheme: "light" | "dark";
   timestampFormat: TimestampFormat;
   workspaceRoot: string | undefined;
+  /** Skill catalog from the active provider — forwarded to ChatMarkdown
+   *  + UserMessageBody so `$skillname` tokens render as chips. Optional;
+   *  defaults to an empty array, in which case skill tokens render as
+   *  plain text. */
+  skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   onIsAtEndChange: (isAtEnd: boolean) => void;
 }
+
+const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
 
 // ---------------------------------------------------------------------------
 // MessagesTimeline — list owner
@@ -179,6 +198,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   resolvedTheme,
   timestampFormat,
   workspaceRoot,
+  skills = EMPTY_TIMELINE_SKILLS,
   onIsAtEndChange,
 }: MessagesTimelineProps) {
   // Subscribe to the live assistant content stream. The buffer drives a
@@ -360,6 +380,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       markdownCwd,
       resolvedTheme,
       workspaceRoot,
+      skills,
       activeThreadEnvironmentId,
       activeThreadProvider,
       activeTurnThinkingEnabled,
@@ -380,6 +401,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       markdownCwd,
       resolvedTheme,
       workspaceRoot,
+      skills,
       activeThreadEnvironmentId,
       activeThreadProvider,
       activeTurnThinkingEnabled,
@@ -551,6 +573,7 @@ function TimelineRowContent({ row }: { row: TimelineRow }) {
                 <CollapsibleUserMessageBody
                   text={displayedUserMessage.visibleText}
                   terminalContexts={terminalContexts}
+                  skills={ctx.skills}
                   footer={
                     <>
                       <div className="flex items-center gap-1.5 opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover:opacity-100">
@@ -618,6 +641,7 @@ function TimelineRowContent({ row }: { row: TimelineRow }) {
                   text={messageText}
                   cwd={ctx.markdownCwd}
                   isStreaming={Boolean(row.message.streaming)}
+                  skills={ctx.skills}
                 />
                 <AssistantChangedFilesSection
                   turnSummary={row.assistantTurnDiffSummary}
@@ -902,6 +926,7 @@ function shouldCollapseUserMessage(text: string): boolean {
 const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(props: {
   text: string;
   terminalContexts: ParsedTerminalContextEntry[];
+  skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   footer?: ReactNode;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -927,7 +952,11 @@ const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(prop
               : undefined
           }
         >
-          <UserMessageBody text={props.text} terminalContexts={props.terminalContexts} />
+          <UserMessageBody
+            text={props.text}
+            terminalContexts={props.terminalContexts}
+            skills={props.skills}
+          />
         </div>
       ) : null}
       {canCollapse || props.footer ? (
@@ -963,6 +992,7 @@ const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(prop
 const UserMessageBody = memo(function UserMessageBody(props: {
   text: string;
   terminalContexts: ParsedTerminalContextEntry[];
+  skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
 }) {
   if (props.terminalContexts.length > 0) {
     const hasEmbeddedInlineLabels = textContainsInlineTerminalContextLabels(
@@ -985,7 +1015,7 @@ const UserMessageBody = memo(function UserMessageBody(props: {
         if (matchIndex > cursor) {
           inlineNodes.push(
             <span key={`user-terminal-context-inline-before:${context.header}:${cursor}`}>
-              {props.text.slice(cursor, matchIndex)}
+              <SkillInlineText text={props.text.slice(cursor, matchIndex)} skills={props.skills} />
             </span>,
           );
         }
@@ -1002,7 +1032,7 @@ const UserMessageBody = memo(function UserMessageBody(props: {
         if (cursor < props.text.length) {
           inlineNodes.push(
             <span key={`user-message-terminal-context-inline-rest:${cursor}`}>
-              {props.text.slice(cursor)}
+              <SkillInlineText text={props.text.slice(cursor)} skills={props.skills} />
             </span>,
           );
         }
@@ -1030,7 +1060,11 @@ const UserMessageBody = memo(function UserMessageBody(props: {
     }
 
     if (props.text.length > 0) {
-      inlineNodes.push(<span key="user-message-terminal-context-inline-text">{props.text}</span>);
+      inlineNodes.push(
+        <span key="user-message-terminal-context-inline-text">
+          <SkillInlineText text={props.text} skills={props.skills} />
+        </span>,
+      );
     } else if (inlinePrefix.length === 0) {
       return null;
     }
@@ -1048,7 +1082,7 @@ const UserMessageBody = memo(function UserMessageBody(props: {
 
   return (
     <div className="whitespace-pre-wrap wrap-break-word text-sm leading-relaxed text-foreground">
-      {props.text}
+      <SkillInlineText text={props.text} skills={props.skills} />
     </div>
   );
 });
