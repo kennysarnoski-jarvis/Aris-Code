@@ -404,6 +404,12 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
             toolNames: workerTools.map((t) => t.name),
             turnCap,
             promptLength: prompt.length,
+            // 2026-05-12 — cwd surfacing for Cowork-style observability.
+            // Workers inherit the parent's cwd unconditionally; passing
+            // it through the event so the panel can render where the
+            // work is happening without the frontend having to plumb
+            // the project cwd separately.
+            cwd: deps.sessionScratchpadCtx.cwd,
           },
         } as ArisEvent);
       }
@@ -461,6 +467,28 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
                   `${tag} tool_call: name=${raw.name} callId=${raw.callId} ` +
                     `argsBytes=${argsRaw.length} args=${JSON.stringify(argsPreview)}`,
                 );
+                // 2026-05-12 — Emit aris.worker.context.changed so the
+                // CoordinatorActivityPanel can render a Cowork-style
+                // "currently doing X" line under each running worker.
+                // Label is derived from tool + args (see
+                // describeWorkerToolCall below); coalesced on the client
+                // (only the most recent label per worker matters).
+                if (deps.emitCoordinatorEvent && deps.sessionScratchpadCtx) {
+                  const contextLabel = describeWorkerToolCall(raw.name, argsRaw);
+                  if (contextLabel.length > 0) {
+                    deps.emitCoordinatorEvent({
+                      type: "aris.worker.context.changed",
+                      threadId: deps.sessionScratchpadCtx.threadId as never,
+                      turnId: deps.sessionScratchpadCtx.parentTurnId as TurnId,
+                      createdAt: new Date().toISOString() as never,
+                      payload: {
+                        workerCallId,
+                        parentTurnId: deps.sessionScratchpadCtx.parentTurnId as TurnId,
+                        contextLabel,
+                      },
+                    } as ArisEvent);
+                  }
+                }
               }
               continue;
             }
@@ -665,4 +693,75 @@ function formatUsage(u: WorkerUsage): string {
   if (u.outputTokens !== undefined) parts.push(`out=${u.outputTokens}`);
   if (u.totalTokens !== undefined) parts.push(`total=${u.totalTokens}`);
   return parts.join(", ");
+}
+
+/**
+ * Build a human-readable "what the worker is doing right now" label
+ * from a tool call. Used by the CoordinatorActivityPanel to render a
+ * Cowork-style currently-doing line under each running worker. Maps
+ * the common baseline tools to verb-led phrases; falls back to the
+ * tool name + a tiny args preview for anything we don't have a
+ * specific shape for (skills, KG search, archive tools, etc.).
+ *
+ * Args are JSON-parsed defensively — we never trust the model emitted
+ * valid JSON. Any parse failure falls through to the generic label.
+ *
+ * Kept in this file (not in CoordinatorTypes) because it's a worker-
+ * specific UX detail; CoordinatorTypes is for cross-cutting constants
+ * and types.
+ */
+function describeWorkerToolCall(toolName: string, argsRaw: string): string {
+  let args: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(argsRaw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      args = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // fall through with empty args
+  }
+  const pathArg = typeof args["path"] === "string" ? (args["path"] as string) : null;
+  const patternArg = typeof args["pattern"] === "string" ? (args["pattern"] as string) : null;
+  const commandArg = typeof args["command"] === "string" ? (args["command"] as string) : null;
+  const queryArg = typeof args["query"] === "string" ? (args["query"] as string) : null;
+  const labelArg = typeof args["label"] === "string" ? (args["label"] as string) : null;
+  const truncate = (s: string, max = 60): string => (s.length > max ? s.slice(0, max) + "…" : s);
+
+  switch (toolName) {
+    case "read_file":
+      return pathArg ? `Reading ${truncate(pathArg)}` : "Reading file";
+    case "write_file":
+      return pathArg ? `Writing ${truncate(pathArg)}` : "Writing file";
+    case "edit_file":
+      return pathArg ? `Editing ${truncate(pathArg)}` : "Editing file";
+    case "grep":
+      return patternArg
+        ? `Searching for ${truncate(patternArg, 40)}${pathArg ? ` in ${truncate(pathArg, 30)}` : ""}`
+        : "Running grep";
+    case "glob":
+      return patternArg ? `Globbing ${truncate(patternArg)}` : "Globbing";
+    case "list_directory":
+      return pathArg ? `Listing ${truncate(pathArg)}` : "Listing directory";
+    case "bash":
+      return commandArg ? `Running: ${truncate(commandArg, 80)}` : "Running shell command";
+    case "search_knowledge":
+    case "search_cve":
+    case "search_code":
+      return queryArg ? `${toolName}: ${truncate(queryArg, 60)}` : toolName;
+    case "manage_todos":
+    case "update_scratchpad":
+    case "read_scratchpad":
+      return toolName;
+    case "upsert_memory_node":
+    case "delete_memory_node":
+      return labelArg ? `${toolName}: ${truncate(labelArg, 40)}` : toolName;
+    case "escalate":
+      return "Escalating to coordinator";
+    case "read_session_scratchpad":
+      return "Reading shared scratchpad";
+    case "append_session_scratchpad":
+      return "Writing to shared scratchpad";
+    default:
+      return toolName;
+  }
 }

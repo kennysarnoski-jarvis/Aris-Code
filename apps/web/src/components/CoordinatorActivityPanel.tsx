@@ -85,6 +85,29 @@ export function CoordinatorActivityPanel(props: CoordinatorActivityPanelProps) {
                     {w.turnCap != null && <span>· cap {w.turnCap} turns</span>}
                     {w.outputBytes != null && <span>· {formatBytes(w.outputBytes)}</span>}
                   </div>
+                  {/* 2026-05-12 — Cowork-style observability. cwd is the
+                      working folder, currentContext is the latest tool
+                      call's "doing X" label (refreshed live from
+                      aris.worker.context.changed events). Only render
+                      currentContext while the worker is still running —
+                      once DONE / BUDGET / etc., the final outcome is what
+                      matters, not which tool fired last. */}
+                  {w.cwd && (
+                    <div
+                      className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-0.5 truncate"
+                      title={w.cwd}
+                    >
+                      📁 {shortenWorkerCwd(w.cwd)}
+                    </div>
+                  )}
+                  {w.status === "running" && w.currentContext && (
+                    <div
+                      className="text-[11px] text-zinc-600 dark:text-zinc-300 mt-0.5 italic truncate"
+                      title={w.currentContext}
+                    >
+                      ▸ {w.currentContext}
+                    </div>
+                  )}
                   {w.errorMessage && (
                     <div className="text-[11px] text-red-600 dark:text-red-400 mt-0.5 truncate">
                       {w.errorMessage}
@@ -195,4 +218,19 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/**
+ * Shrink an absolute cwd to its last 2 path segments so the panel row
+ * stays narrow. `/Users/kenny/Projects/Aris-Code/apps/web` → `apps/web`.
+ * The full path is still available in the row's `title` attribute for
+ * users who need to verify the exact location. Tilde-collapsed paths
+ * (`~/Projects/.../apps/web`) get the same last-2 treatment.
+ */
+function shortenWorkerCwd(cwd: string): string {
+  const trimmed = cwd.replace(/\/+$/, "");
+  if (trimmed.length === 0) return cwd;
+  const segments = trimmed.split("/").filter((s) => s.length > 0);
+  if (segments.length <= 2) return trimmed;
+  return segments.slice(-2).join("/");
 }

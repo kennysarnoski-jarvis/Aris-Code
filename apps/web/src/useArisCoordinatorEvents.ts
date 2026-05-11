@@ -45,6 +45,13 @@ export interface CoordinatorWorkerState {
   readonly toolNames: ReadonlyArray<string>;
   readonly turnCap: number | null;
   readonly errorMessage: string | null;
+  // 2026-05-12 — Cowork-style observability. `cwd` is the working
+  // folder inherited at spawn (static for the worker's lifetime).
+  // `currentContext` reflects the most recent tool call's human-
+  // readable label (e.g. "Reading apps/web/foo.tsx") and updates live
+  // as the worker runs.
+  readonly cwd: string | null;
+  readonly currentContext: string | null;
 }
 
 export interface SessionScratchpadEntryView {
@@ -129,10 +136,32 @@ export function useArisCoordinatorEvents(
           toolNames: event.payload.toolNames,
           turnCap: event.payload.turnCap,
           errorMessage: null,
+          cwd: event.payload.cwd ?? null,
+          currentContext: null,
         };
         setWorkersById((prev) => {
           const updated = new Map(prev);
           updated.set(event.payload.workerCallId, next);
+          return updated;
+        });
+        return;
+      }
+
+      // 2026-05-12 — Worker just kicked off a new tool call. Update
+      // its `currentContext` so the panel renders the latest "doing X"
+      // label. We coalesce on most-recent — no history kept, this is
+      // a "what's happening RIGHT NOW" affordance, not a transcript.
+      if (event.type === "aris.worker.context.changed") {
+        setWorkersById((prev) => {
+          const existing = prev.get(event.payload.workerCallId);
+          // No-op if we never saw the spawn — out-of-order delivery
+          // shouldn't create ghost worker rows.
+          if (!existing) return prev;
+          const updated = new Map(prev);
+          updated.set(event.payload.workerCallId, {
+            ...existing,
+            currentContext: event.payload.contextLabel,
+          });
           return updated;
         });
         return;
@@ -155,6 +184,8 @@ export function useArisCoordinatorEvents(
             toolNames: [],
             turnCap: null,
             errorMessage: null,
+            cwd: null,
+            currentContext: null,
           };
           const updated = new Map(prev);
           updated.set(event.payload.workerCallId, {

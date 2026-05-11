@@ -194,6 +194,7 @@ const ArisRateLimitType = Schema.Literal("aris.rate_limit");
 // entries scoped to the current parent turn.
 const ArisWorkerSpawnStartedType = Schema.Literal("aris.worker.spawn.started");
 const ArisWorkerSpawnCompletedType = Schema.Literal("aris.worker.spawn.completed");
+const ArisWorkerContextChangedType = Schema.Literal("aris.worker.context.changed");
 const ArisSessionScratchpadAppendedType = Schema.Literal("aris.session_scratchpad.appended");
 
 /**
@@ -378,8 +379,31 @@ const ArisWorkerSpawnStartedPayload = Schema.Struct({
   toolNames: Schema.Array(TrimmedNonEmptyStringSchema),
   turnCap: NonNegativeInt,
   promptLength: NonNegativeInt,
+  // 2026-05-12 — Working folder the worker operates in (inherited from
+  // the parent's cwd). Optional for legacy events that pre-date this
+  // field. Surfaced in the CoordinatorActivityPanel under the worker's
+  // title so the user can see where the work is happening, Cowork-style.
+  cwd: Schema.optional(Schema.String),
 });
 export type ArisWorkerSpawnStartedPayload = typeof ArisWorkerSpawnStartedPayload.Type;
+
+/**
+ * Emitted whenever a running worker's "what am I doing right now" label
+ * changes — i.e. it just kicked off a new tool call. The frontend uses
+ * this to render a one-line "currently doing X" under the worker title
+ * in the CoordinatorActivityPanel, matching Cowork's task panel UX. The
+ * label is derived from the tool call (tool name + args preview), e.g.
+ * `Reading apps/web/foo.tsx` or `Running: grep -r "errorMessage"`.
+ *
+ * Fires once per tool_call_item the worker emits. Coalescing on the
+ * client is fine — only the most recent label matters for rendering.
+ */
+const ArisWorkerContextChangedPayload = Schema.Struct({
+  workerCallId: ArisToolCallId,
+  parentTurnId: TurnId,
+  contextLabel: TrimmedNonEmptyStringSchema,
+});
+export type ArisWorkerContextChangedPayload = typeof ArisWorkerContextChangedPayload.Type;
 
 /**
  * Emitted when spawn_worker.execute completes, fails, escalates, or
@@ -631,6 +655,13 @@ const ArisWorkerSpawnCompletedEvent = Schema.Struct({
 });
 export type ArisWorkerSpawnCompletedEvent = typeof ArisWorkerSpawnCompletedEvent.Type;
 
+const ArisWorkerContextChangedEvent = Schema.Struct({
+  ...ArisEventBase.fields,
+  type: ArisWorkerContextChangedType,
+  payload: ArisWorkerContextChangedPayload,
+});
+export type ArisWorkerContextChangedEvent = typeof ArisWorkerContextChangedEvent.Type;
+
 const ArisSessionScratchpadAppendedEvent = Schema.Struct({
   ...ArisEventBase.fields,
   type: ArisSessionScratchpadAppendedType,
@@ -715,6 +746,7 @@ export const ArisEvent = Schema.Union([
   // COORD-6.1
   ArisWorkerSpawnStartedEvent,
   ArisWorkerSpawnCompletedEvent,
+  ArisWorkerContextChangedEvent,
   ArisSessionScratchpadAppendedEvent,
 ]);
 export type ArisEvent = typeof ArisEvent.Type;
