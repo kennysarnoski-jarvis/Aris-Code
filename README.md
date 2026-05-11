@@ -131,11 +131,77 @@ bun dev:desktop
 
 ### Platform notes
 
-- **macOS** — works out of the box. First launch may take ~30s while Vite warms up. Bun installs to `~/.bun/bin/bun`; make sure that's on your `PATH`.
-- **Linux** — works out of the box on most distros. If `bun dev:desktop` complains about missing libraries, install the Electron deps for your distro (e.g. on Debian/Ubuntu: `sudo apt install libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2`).
-- **Windows** — recommend running via [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) (Ubuntu inside Windows). Native Windows + PowerShell works but the Electron build chain can be flaky with paths containing spaces. Inside WSL2, follow the Linux instructions above.
+Aris Code pulls in two native modules during install: `electron` (downloads a ~120MB platform binary) and `node-pty` (compiles a small C++ binding for the terminal pane). Both are pre-trusted in `package.json`, so Bun runs their install scripts automatically — but you need the right OS-level toolchain on disk for the compile step to succeed.
 
-If `bun dev:desktop` errors on first run, the most common fix is `rm -rf node_modules && bun install` (deps got corrupted somewhere). If that doesn't fix it, open an issue with the full error output.
+#### macOS
+
+Install [Xcode Command Line Tools](https://developer.apple.com/xcode/) first — that provides `git` and the C/C++ compiler `node-pty` needs:
+
+```bash
+xcode-select --install
+```
+
+Then the standard flow works:
+
+```bash
+git clone https://github.com/kennysarnoski-jarvis/Aris-Code.git
+cd Aris-Code
+bun install     # downloads Electron, compiles node-pty
+bun dev:desktop
+```
+
+First launch takes ~30s while Vite warms up. Make sure `~/.bun/bin` is on your `PATH` (the Bun installer prints the exact line to add to your shell rc).
+
+#### Linux
+
+You need three things beyond Bun + Node:
+
+**1. Build toolchain** (for the `node-pty` native compile)
+
+| Distro | Command |
+|---|---|
+| Debian / Ubuntu | `sudo apt install build-essential python3` |
+| Fedora / RHEL | `sudo dnf groupinstall "Development Tools" && sudo dnf install python3` |
+| Arch | `sudo pacman -S base-devel python` |
+
+**2. Electron runtime libraries** (Electron loads these at launch)
+
+| Distro | Command |
+|---|---|
+| Debian / Ubuntu | `sudo apt install libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2` |
+| Fedora / RHEL | `sudo dnf install nss atk gtk3 mesa-libgbm alsa-lib` |
+| Arch | `sudo pacman -S nss atk gtk3 libgbm alsa-lib` |
+
+If Electron fails to launch with a `cannot open shared object file` error, the message names the exact `.so` it can't find — search your package manager for it.
+
+**3. A display server** — Wayland or X11. On a headless server `bun dev:desktop` has nothing to draw to and will fail. Run from a desktop session, or use X11 forwarding over SSH (`ssh -X`).
+
+Then:
+
+```bash
+git clone https://github.com/kennysarnoski-jarvis/Aris-Code.git
+cd Aris-Code
+bun install
+bun dev:desktop
+```
+
+#### Windows
+
+The painless path is **WSL2** with Ubuntu (Linux running inside Windows). Native Windows + PowerShell is technically possible but requires Visual Studio Build Tools for `node-pty` to compile and the Electron dev chain handles paths-with-spaces poorly — we don't recommend it.
+
+**One-time WSL2 setup:**
+
+1. Install WSL2 + Ubuntu — open PowerShell as admin, run `wsl --install` ([Microsoft's guide](https://learn.microsoft.com/en-us/windows/wsl/install)). Reboot when prompted.
+2. **Windows 11 users**: WSLg (the GUI bridge that lets Linux apps draw windows on Windows) ships by default — Electron just works inside WSL2. Skip to step 3.
+3. **Windows 10 users**: WSLg isn't installed by default. Follow [Microsoft's WSL2 GUI guide](https://learn.microsoft.com/en-us/windows/wsl/tutorials/gui-apps) to enable it. Without WSLg, the Electron window has nowhere to render.
+4. Open your WSL2 Ubuntu terminal and follow the **Linux** instructions above (install the build toolchain + Electron runtime libs, then `git clone` + `bun install` + `bun dev:desktop`).
+
+### Troubleshooting
+
+- **`bun install` fails on a native module** (`node-pty` or `electron`) — the build toolchain for your OS is the usual cause. Re-check the Platform notes for your OS.
+- **`bun dev:desktop` exits ~immediately on first run** — usually a stale partial install. Reset with `rm -rf node_modules apps/*/node_modules packages/*/node_modules && bun install`.
+- **`Electron failed to install correctly`** at launch — `electron` wasn't trusted by Bun at install time. Your `package.json` should list `electron` in `trustedDependencies`; if it doesn't, you're on an older clone — pull latest from `main` and re-run `bun install`.
+- **Still stuck** — open an [issue](https://github.com/kennysarnoski-jarvis/Aris-Code/issues) with your OS, Bun version (`bun --version`), Node version (`node --version`), and the full error output.
 
 ## Sign in
 
