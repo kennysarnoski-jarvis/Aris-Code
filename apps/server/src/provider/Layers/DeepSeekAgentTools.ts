@@ -29,6 +29,7 @@ import { createDeepSeekArchiveTools } from "./DeepSeekArchiveTools.ts";
 import { createDeepSeekFactsTools } from "./DeepSeekFactsTool.ts";
 import { createDeepSeekScratchpadTool } from "./DeepSeekScratchpadTool.ts";
 import { createDeepSeekSearchTools } from "./DeepSeekSearchTools.ts";
+import { createDeepSeekWebSearchTools } from "./DeepSeekWebSearchTools.ts";
 import { createDeepSeekSessionScratchpadTools } from "./DeepSeekSessionScratchpadTools.ts";
 import { createDeepSeekTodosTool } from "./DeepSeekTodosTool.ts";
 
@@ -113,6 +114,18 @@ export function createDeepSeekAgentTools(opts: DeepSeekAgentToolsOptions) {
           cloudToken: opts.cloudToken,
         })
       : [];
+  // 2026-05-12 — Web search tool. Hits the cloud's bearer-auth
+  // /api/local/web_search route (Anthropic Claude Haiku + the
+  // web_search_20250305 server tool). Same gating as KG search —
+  // skip when cloud creds aren't present so the spread below is
+  // unconditional.
+  const webSearchTools =
+    opts.cloudBaseUrl && opts.cloudToken
+      ? createDeepSeekWebSearchTools({
+          cloudBaseUrl: opts.cloudBaseUrl,
+          cloudToken: opts.cloudToken,
+        })
+      : [];
   // COORD-5 — Per-session shared scratchpad tools. Available to the
   // PARENT (writerLabel="parent") so the coordinator can publish a
   // master plan or read worker findings. Workers get their own copy
@@ -147,6 +160,7 @@ export function createDeepSeekAgentTools(opts: DeepSeekAgentToolsOptions) {
     ...todosTools,
     ...factsTools,
     ...searchTools,
+    ...webSearchTools,
     ...sessionScratchpadTools,
   ];
   const agentToolFamily =
