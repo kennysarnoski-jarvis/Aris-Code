@@ -120,10 +120,13 @@ Handles: apt deps (auto-detects t64 vs legacy library names for Ubuntu 24.04+), 
 **Windows (admin PowerShell):**
 
 ```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
 iex (irm https://raw.githubusercontent.com/kennysarnoski-jarvis/Aris-Code/main/scripts/install-windows.ps1)
 ```
 
 Handles: WSL2 install + Ubuntu distro install + (after a reboot) bootstraps the Linux script inside WSL2. Two manual touchpoints you'll be guided through: (1) reboot after WSL2 enables, (2) one-time Ubuntu username/password (Ubuntu's first launch is interactive). Total time ~30-45 min including the reboot.
+
+> **First time on Windows?** Read the [step-by-step Windows install walkthrough](./docs/INSTALL-WINDOWS.md) — covers every click from opening admin PowerShell to pasting your subscription key, including how to handle the reboot and one-time Ubuntu setup. ~30 min total, 5 min of active clicking.
 
 **macOS:**
 
@@ -243,20 +246,20 @@ You need three things beyond Bun + Node:
 
 **1. Build toolchain + unzip** (for the `node-pty` native compile and the Bun installer)
 
-| Distro          | Command                                                                        |
-| --------------- | ------------------------------------------------------------------------------ |
-| Debian / Ubuntu | `sudo apt install build-essential python3 unzip`                               |
-| Fedora / RHEL   | `sudo dnf groupinstall "Development Tools" && sudo dnf install python3 unzip`  |
-| Arch            | `sudo pacman -S base-devel python unzip`                                       |
+| Distro          | Command                                                                       |
+| --------------- | ----------------------------------------------------------------------------- |
+| Debian / Ubuntu | `sudo apt install build-essential python3 unzip`                              |
+| Fedora / RHEL   | `sudo dnf groupinstall "Development Tools" && sudo dnf install python3 unzip` |
+| Arch            | `sudo pacman -S base-devel python unzip`                                      |
 
 **2. Electron runtime libraries** (Electron loads these at launch)
 
-| Distro                 | Command                                                                                               |
-| ---------------------- | ----------------------------------------------------------------------------------------------------- |
-| Ubuntu **24.04+**      | `sudo apt install libnss3 libatk-bridge2.0-0t64 libgtk-3-0t64 libgbm1 libasound2t64`                  |
-| Ubuntu / Debian (older) | `sudo apt install libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2`                          |
-| Fedora / RHEL          | `sudo dnf install nss atk gtk3 mesa-libgbm alsa-lib`                                                  |
-| Arch                   | `sudo pacman -S nss atk gtk3 libgbm alsa-lib`                                                         |
+| Distro                  | Command                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------ |
+| Ubuntu **24.04+**       | `sudo apt install libnss3 libatk-bridge2.0-0t64 libgtk-3-0t64 libgbm1 libasound2t64` |
+| Ubuntu / Debian (older) | `sudo apt install libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2`          |
+| Fedora / RHEL           | `sudo dnf install nss atk gtk3 mesa-libgbm alsa-lib`                                 |
+| Arch                    | `sudo pacman -S nss atk gtk3 libgbm alsa-lib`                                        |
 
 > [!NOTE]
 > Ubuntu 24.04+ renamed several libraries with a `t64` suffix during the 64-bit time_t transition. Old names (`libatk-bridge2.0-0`, `libgtk-3-0`, `libasound2`) still appear as transition stubs but apt won't auto-install them — you'll see "no installation candidate." Use the t64 names instead.
