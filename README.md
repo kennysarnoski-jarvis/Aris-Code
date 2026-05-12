@@ -24,10 +24,10 @@ Aris is a coding agent first. Drop her into a codebase and she can:
 - **Write code that matches your conventions** — reads files before writing, matches existing patterns (indentation, naming, error handling, test style)
 - **Debug across a codebase** — uses `grep` / `glob` to chase a bug through call sites, runs `bash` to reproduce locally, surfaces the actual error before guessing
 - **Audit dependencies for security issues** — `"is my package.json vulnerable to anything?"` → she searches the knowledge graph for CVEs affecting your pinned versions, NOT what her training thinks the current state is
-- **Install today's deps, not yesterday's** — `"set up Next.js"` invokes `search_knowledge` with version-intent detection, returns the *current* major version + setup pattern from the framework_release graph entries
+- **Install today's deps, not yesterday's** — `"set up Next.js"` invokes `search_knowledge` with version-intent detection, returns the _current_ major version + setup pattern from the framework_release graph entries
 - **Plan + execute multi-step tasks** — tracks work in a per-project todo list (visible to you in the right sidebar), updates statuses as she completes steps, doesn't re-do completed work
 - **Fan out big jobs** — spawns sub-agents for parallel tasks (auditing 4 directories simultaneously, writing tests for multiple modules, etc.) with isolated context windows so the parent doesn't blow its budget
-- **Remember things about your project across sessions** — scratchpad for in-flight notes, todos for the task list, facts for things about *you* (your name, your conventions, your preferences) that persist across every project you open
+- **Remember things about your project across sessions** — scratchpad for in-flight notes, todos for the task list, facts for things about _you_ (your name, your conventions, your preferences) that persist across every project you open
 - **Hold conversations in million-token codebases** — auto-summarizes older parts of the conversation as you approach context limits, archives the full history, retrieves it on demand when relevant
 - **Look up specific CVEs and security patterns** — `"is CVE-2024-3094 in my supply chain?"` hits the graph with a direct label lookup, returns the canonical entry with CVSS / CWE / affected products / patch status
 - **Find reference implementations** — `"show me a Solidity reentrancy guard"` or `"how does Rust's Iterator trait actually look"` → searches the graph's code-bearing concepts and returns real implementations with context
@@ -41,12 +41,12 @@ What Aris **can't** do yet:
 
 ### Providers
 
-| Provider | Models | Notes |
-|---|---|---|
-| **Aris** (primary) | V4 Pro · V4 Flash | DeepSeek V4 wholesale, fronted by `youraris.com`, KG-enriched. Token-pay via your subscription. |
-| **Codex** | All Codex CLI models | Wraps `codex app-server` (JSON-RPC). Bring your own ChatGPT auth. |
-| **Claude** | All Anthropic models | Wraps the Claude Agent SDK. Bring your own Anthropic key. |
-| Cursor / OpenCode / Gemini | — | Coming soon |
+| Provider                   | Models               | Notes                                                                                           |
+| -------------------------- | -------------------- | ----------------------------------------------------------------------------------------------- |
+| **Aris** (primary)         | V4 Pro · V4 Flash    | DeepSeek V4 wholesale, fronted by `youraris.com`, KG-enriched. Token-pay via your subscription. |
+| **Codex**                  | All Codex CLI models | Wraps `codex app-server` (JSON-RPC). Bring your own ChatGPT auth.                               |
+| **Claude**                 | All Anthropic models | Wraps the Claude Agent SDK. Bring your own Anthropic key.                                       |
+| Cursor / OpenCode / Gemini | —                    | Coming soon                                                                                     |
 
 ### File and shell tools (all providers)
 
@@ -59,14 +59,14 @@ What Aris **can't** do yet:
 
 - **Scratchpad** — project-scoped freeform notes that persist across turns and threads
 - **Todos** — project task list with `pending` / `in_progress` / `completed` states, surfaced live in the right sidebar
-- **Facts** — user-global memory nodes (`{type, label, description, content}`) for things Aris should remember about *you* across every project (preferences, identity, working style)
+- **Facts** — user-global memory nodes (`{type, label, description, content}`) for things Aris should remember about _you_ across every project (preferences, identity, working style)
 
 ### Rolling-window memory (Aris)
 
 - Per-thread `.jsonl` archives in `~/.aris/projects/<key>/sessions/<thread>/`
 - Auto-rollover at 920K tokens; older windows summarized and stored
 - `list_archives` · `search_archives` · `read_archive_range` tools let Aris pull historical context on demand
-- Conversations don't get truncated — they get *summarized and retrievable*
+- Conversations don't get truncated — they get _summarized and retrievable_
 
 ### Multi-agent coordinator mode (Aris)
 
@@ -103,10 +103,49 @@ What Aris **can't** do yet:
 ## Get Aris Code
 
 > [!NOTE]
-> **No prebuilt binaries yet.** Signed installers (Homebrew cask, winget, AUR, .dmg / .exe / AppImage) are planned but not yet shipped. For now, Aris Code runs from source — three commands on any platform. Watch [github.com/kennysarnoski-jarvis/Aris-Code/releases](https://github.com/kennysarnoski-jarvis/Aris-Code/releases) for the first packaged release.
+> **No prebuilt binaries yet.** Signed installers (Homebrew cask, winget, AUR, .dmg / .exe / AppImage) are planned but not yet shipped. For now, Aris Code runs from source. Watch [github.com/kennysarnoski-jarvis/Aris-Code/releases](https://github.com/kennysarnoski-jarvis/Aris-Code/releases) for the first packaged release.
+
+### Quick install (recommended)
+
+One command per OS. The scripts are idempotent — safe to re-run if anything goes wrong.
+
+**Linux / Ubuntu / WSL2 (inside Ubuntu):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kennysarnoski-jarvis/Aris-Code/main/scripts/install-linux.sh | bash
+```
+
+Handles: apt deps (auto-detects t64 vs legacy library names for Ubuntu 24.04+), build toolchain, Node.js 22, Bun, node-gyp, repo clone into `~/Aris-Code`, and `bun install`. Takes ~5-10 minutes including the Electron binary download.
+
+**Windows (admin PowerShell):**
+
+```powershell
+iex (irm https://raw.githubusercontent.com/kennysarnoski-jarvis/Aris-Code/main/scripts/install-windows.ps1)
+```
+
+Handles: WSL2 install + Ubuntu distro install + (after a reboot) bootstraps the Linux script inside WSL2. Two manual touchpoints you'll be guided through: (1) reboot after WSL2 enables, (2) one-time Ubuntu username/password (Ubuntu's first launch is interactive). Total time ~30-45 min including the reboot.
+
+**macOS:**
+
+No script yet — Mac install is short enough that the [manual steps](#manual-install) below are quicker than scripting it. `xcode-select --install` then [clone + bun install](#manual-install).
+
+When the install finishes, launch with:
+
+```bash
+cd ~/Aris-Code
+bun dev:desktop
+```
+
+(On Windows, run that from inside Ubuntu — the window appears on your Windows desktop via WSLg.)
+
+---
+
+### Manual install
+
+If you'd rather drive each step yourself, or you're on a distro / OS the script doesn't cover:
 
 > [!IMPORTANT]
-> **STOP — install these three things first or nothing will work.** Skip ahead and you'll hit `command not found: bun` or `Cannot find package`. Run all three steps below in order, then verify each one prints a version, *before* you `git clone`.
+> **STOP — install these three things first or nothing will work.** Skip ahead and you'll hit `command not found: bun` or `Cannot find package`. Run all three steps below in order, then verify each one prints a version, _before_ you `git clone`.
 
 ### Step 1 — Install Bun (≥ 1.3)
 
@@ -202,25 +241,42 @@ First launch takes ~30s while Vite warms up. Make sure `~/.bun/bin` is on your `
 
 You need three things beyond Bun + Node:
 
-**1. Build toolchain** (for the `node-pty` native compile)
+**1. Build toolchain + unzip** (for the `node-pty` native compile and the Bun installer)
 
-| Distro | Command |
-|---|---|
-| Debian / Ubuntu | `sudo apt install build-essential python3` |
-| Fedora / RHEL | `sudo dnf groupinstall "Development Tools" && sudo dnf install python3` |
-| Arch | `sudo pacman -S base-devel python` |
+| Distro          | Command                                                                        |
+| --------------- | ------------------------------------------------------------------------------ |
+| Debian / Ubuntu | `sudo apt install build-essential python3 unzip`                               |
+| Fedora / RHEL   | `sudo dnf groupinstall "Development Tools" && sudo dnf install python3 unzip`  |
+| Arch            | `sudo pacman -S base-devel python unzip`                                       |
 
 **2. Electron runtime libraries** (Electron loads these at launch)
 
-| Distro | Command |
-|---|---|
-| Debian / Ubuntu | `sudo apt install libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2` |
-| Fedora / RHEL | `sudo dnf install nss atk gtk3 mesa-libgbm alsa-lib` |
-| Arch | `sudo pacman -S nss atk gtk3 libgbm alsa-lib` |
+| Distro                 | Command                                                                                               |
+| ---------------------- | ----------------------------------------------------------------------------------------------------- |
+| Ubuntu **24.04+**      | `sudo apt install libnss3 libatk-bridge2.0-0t64 libgtk-3-0t64 libgbm1 libasound2t64`                  |
+| Ubuntu / Debian (older) | `sudo apt install libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2`                          |
+| Fedora / RHEL          | `sudo dnf install nss atk gtk3 mesa-libgbm alsa-lib`                                                  |
+| Arch                   | `sudo pacman -S nss atk gtk3 libgbm alsa-lib`                                                         |
+
+> [!NOTE]
+> Ubuntu 24.04+ renamed several libraries with a `t64` suffix during the 64-bit time_t transition. Old names (`libatk-bridge2.0-0`, `libgtk-3-0`, `libasound2`) still appear as transition stubs but apt won't auto-install them — you'll see "no installation candidate." Use the t64 names instead.
+
+**3. Node.js 22** (the `node-gyp` step below needs `npm`, which comes with Node)
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
+```
+
+**4. node-gyp globally** (lets `node-pty` compile its native binding during `bun install`)
+
+```bash
+sudo npm install -g node-gyp
+```
 
 If Electron fails to launch with a `cannot open shared object file` error, the message names the exact `.so` it can't find — search your package manager for it.
 
-**3. A display server** — Wayland or X11. On a headless server `bun dev:desktop` has nothing to draw to and will fail. Run from a desktop session, or use X11 forwarding over SSH (`ssh -X`).
+**5. A display server** — Wayland or X11. On a headless server `bun dev:desktop` has nothing to draw to and will fail. Run from a desktop session, use X11 forwarding over SSH (`ssh -X`), or run inside WSL2 on Windows (WSLg handles it).
 
 Then:
 
