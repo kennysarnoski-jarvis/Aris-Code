@@ -88,9 +88,37 @@ export function toRollingWindowIOError(operation: "read" | "append" | "mkdir") {
 }
 
 /**
+ * Image-attachment metadata as persisted to active.jsonl alongside a
+ * user message. The actual file bytes live on disk in `attachmentsDir`
+ * (resolvable via `resolveAttachmentPath` / `resolveAttachmentPathById`),
+ * so the persisted record only needs the lookup key + display fields.
+ *
+ * Mirrors `ChatImageAttachment` from `@t3tools/contracts/orchestration`,
+ * deliberately duplicated here to avoid a runtime dependency from this
+ * pure-Node module on the Effect/Schema-backed contracts package — the
+ * shape is stable and any future drift gets caught by the zero-arg
+ * `attachmentRelativePath` call site in `resolveAttachmentPath` if a
+ * required field is dropped.
+ */
+export interface PersistedAttachment {
+  readonly type: "image";
+  readonly id: string;
+  readonly name: string;
+  readonly mimeType: string;
+  readonly sizeBytes: number;
+}
+
+/**
  * One turn-message component as persisted to active.jsonl. Mirrors the
  * shape OpenAI / DeepSeek expect on the wire (`role`, `content`) so
  * that future replay (RW-2) can round-trip without translation.
+ *
+ * `attachments` was added 2026-05-13 so user messages with image uploads
+ * survive thread reload — without it, the UI chip vanishes after the
+ * optimistic-message stage because the archive hydration (RW-2.5) re-
+ * derives `serverMessages` from this file. Optional (and absent on
+ * every record written before that date) — assistant messages and pre-
+ * vision user messages have no attachments to record.
  */
 export interface PersistedMessage {
   readonly role: "user" | "assistant";
@@ -98,6 +126,7 @@ export interface PersistedMessage {
   readonly timestamp: string;
   readonly messageId: string;
   readonly turnId: string;
+  readonly attachments?: ReadonlyArray<PersistedAttachment>;
 }
 
 /**
@@ -205,13 +234,82 @@ export async function readActiveWindow(
         typeof parsed.messageId === "string" &&
         typeof parsed.turnId === "string"
       ) {
-        out.push(parsed);
+        // Defensive shape check on attachments. Records written before
+        // 2026-05-13 won't have it; that's fine — omit the field.
+        // Records with malformed attachments get their attachments
+        // field stripped rather than the whole record dropped (the
+        // text content is still useful for conversation continuity).
+        const sanitizedAttachments = sanitizePersistedAttachments(parsed.attachments);
+        const base = {
+          role: parsed.role,
+          content: parsed.content,
+          timestamp: parsed.timestamp,
+          messageId: parsed.messageId,
+          turnId: parsed.turnId,
+        } satisfies Omit<PersistedMessage, "attachments">;
+        out.push(
+          sanitizedAttachments !== undefined
+            ? { ...base, attachments: sanitizedAttachments }
+            : base,
+        );
       }
     } catch {
       console.warn(`[RollingWindowMemory] dropped corrupt line in ${path}: ${line.slice(0, 80)}…`);
     }
   }
   return out;
+}
+
+/**
+ * Strict per-field shape check for one PersistedAttachment. Returns the
+ * sanitized record if every field is present and the right primitive
+ * type, otherwise `null` (which the caller filters out). Keeps the
+ * `readActiveWindow` permissive-but-typed contract — one bad attachment
+ * is dropped, the rest survive.
+ */
+function sanitizePersistedAttachment(candidate: unknown): PersistedAttachment | null {
+  if (!candidate || typeof candidate !== "object") return null;
+  const obj = candidate as Record<string, unknown>;
+  if (
+    obj.type === "image" &&
+    typeof obj.id === "string" &&
+    obj.id.length > 0 &&
+    typeof obj.name === "string" &&
+    typeof obj.mimeType === "string" &&
+    typeof obj.sizeBytes === "number" &&
+    Number.isFinite(obj.sizeBytes) &&
+    obj.sizeBytes >= 0
+  ) {
+    return {
+      type: "image",
+      id: obj.id,
+      name: obj.name,
+      mimeType: obj.mimeType,
+      sizeBytes: obj.sizeBytes,
+    };
+  }
+  return null;
+}
+
+/**
+ * Returns `undefined` when the input is absent or yields zero valid
+ * attachments after sanitization, otherwise the cleaned readonly array.
+ * Distinguishing "absent" from "present-but-empty" matters here because
+ * old records have no field at all and we don't want to falsely emit
+ * an empty array (the absence is the signal the record predates
+ * vision).
+ */
+function sanitizePersistedAttachments(
+  attachments: unknown,
+): ReadonlyArray<PersistedAttachment> | undefined {
+  if (attachments === undefined || attachments === null) return undefined;
+  if (!Array.isArray(attachments)) return undefined;
+  const clean: PersistedAttachment[] = [];
+  for (const candidate of attachments) {
+    const sanitized = sanitizePersistedAttachment(candidate);
+    if (sanitized) clean.push(sanitized);
+  }
+  return clean.length > 0 ? clean : undefined;
 }
 
 /**

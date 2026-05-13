@@ -24,6 +24,7 @@ import type { EnvironmentId, ThreadId, TurnId } from "@t3tools/contracts";
 
 import { fetchArisThreadHistory } from "./arisHistoryFetch";
 import { readEnvironmentApi } from "./environmentApi";
+import { resolveEnvironmentHttpUrl } from "./environments/runtime";
 import type { ChatMessage } from "./types";
 
 export interface UseArisThreadHistoryOptions {
@@ -124,6 +125,26 @@ export function useArisThreadHistory(
             };
             if (m.turnId !== null && m.turnId !== undefined) {
               base.turnId = m.turnId as TurnId;
+            }
+            // 2026-05-13 — Vision: forward image-attachment metadata so
+            // the chat-bubble chip survives thread reload. `previewUrl`
+            // resolves to the server's `/attachments/<id>` route via
+            // the environment's HTTP base — same plumbing
+            // `mapMessage` in store.ts uses for Codex/Claude. Built
+            // here (not in store.ts) because Aris-channel messages
+            // bypass the orchestration projection entirely.
+            if (m.attachments && m.attachments.length > 0 && environmentId) {
+              base.attachments = m.attachments.map((attachment) => ({
+                type: "image" as const,
+                id: attachment.id,
+                name: attachment.name,
+                mimeType: attachment.mimeType,
+                sizeBytes: attachment.sizeBytes,
+                previewUrl: resolveEnvironmentHttpUrl({
+                  environmentId,
+                  pathname: `/attachments/${encodeURIComponent(attachment.id)}`,
+                }),
+              }));
             }
             return base;
           });

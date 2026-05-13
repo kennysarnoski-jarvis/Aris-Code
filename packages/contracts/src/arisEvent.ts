@@ -36,7 +36,7 @@ import {
   TrimmedNonEmptyString,
   TurnId,
 } from "./baseSchemas";
-import { ProviderApprovalDecision, RuntimeMode } from "./orchestration";
+import { ChatAttachment, ProviderApprovalDecision, RuntimeMode } from "./orchestration";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const UnknownRecordSchema = Schema.Record(Schema.String, Schema.Unknown);
@@ -862,6 +862,12 @@ export const ArisArchiveMessage = Schema.Struct({
   content: Schema.String,
   turnId: Schema.NullOr(Schema.String),
   createdAt: Schema.String,
+  // Image attachments persisted alongside this user message (added
+  // 2026-05-13). Optional — old records and assistant messages don't
+  // carry one. Reuses the same `ChatAttachment` shape Codex/Claude
+  // use so the client store's mapMessage path handles all three
+  // providers uniformly.
+  attachments: Schema.optional(Schema.Array(ChatAttachment)),
 });
 export type ArisArchiveMessage = typeof ArisArchiveMessage.Type;
 

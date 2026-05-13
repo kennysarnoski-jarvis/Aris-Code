@@ -1066,19 +1066,42 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
               try: async () => {
                 const persisted = await readActiveWindow(input.cwd, input.threadId);
                 return {
-                  messages: persisted.map((m) => ({
+                  messages: persisted.map((m) => {
                     // Persisted messageId is already in the
                     // canonical "user:turnId" / "assistant:turnId-..."
                     // form (see DeepSeekAdapter RW-1 writes), so we
                     // pass it through directly. The brand cast is
                     // safe because the runtime shape is identical to
                     // MessageId.
-                    id: m.messageId as never,
-                    role: m.role,
-                    content: m.content,
-                    turnId: m.turnId ?? null,
-                    createdAt: m.timestamp,
-                  })),
+                    //
+                    // Forward image-attachment metadata when present
+                    // (added 2026-05-13). The persisted shape mirrors
+                    // ChatImageAttachment so we just hand the array
+                    // straight through — Schema.optional means the
+                    // field stays absent on the wire when there are
+                    // no attachments, preserving prefix-cache for
+                    // assistant-message rows. Built as a single
+                    // mutable object (rather than spread-from-base) to
+                    // satisfy oxlint's `no-map-spread` rule.
+                    const out: {
+                      id: never;
+                      role: typeof m.role;
+                      content: string;
+                      turnId: string | null;
+                      createdAt: string;
+                      attachments?: NonNullable<typeof m.attachments>;
+                    } = {
+                      id: m.messageId as never,
+                      role: m.role,
+                      content: m.content,
+                      turnId: m.turnId ?? null,
+                      createdAt: m.timestamp,
+                    };
+                    if (m.attachments && m.attachments.length > 0) {
+                      out.attachments = m.attachments;
+                    }
+                    return out;
+                  }),
                 };
               },
               catch: (cause) =>

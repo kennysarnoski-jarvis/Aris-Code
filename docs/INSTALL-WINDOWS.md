@@ -404,6 +404,7 @@ the install succeeded. Run `bun dev:desktop` from there.
 
 [Open an issue on GitHub](https://github.com/kennysarnoski-jarvis/Aris-Code/issues)
 with:
+
 - Your Windows version (run `winver`)
 - The full error message you saw
 - Which step you were on

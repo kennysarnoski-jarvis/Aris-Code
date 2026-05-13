@@ -20,9 +20,15 @@
  *     `DeepSeekAgentRunner`).
  *
  * What's intentionally NOT here vs ArisAdapter (deferred to follow-ups):
- *   - **Vision support**: DeepSeek V4-Pro is text-only per the recon
- *     memory (no image input). If V4-Pro adds vision later, port the
- *     `materializeUserContent` block from `ArisAdapter`.
+ *   - **Vision support** (2026-05-13): DeepSeek V4 itself is text-only,
+ *     but image attachments are now forwarded as OpenAI multimodal
+ *     content. The cloud's `/api/local/deepseek/v1/chat/completions`
+ *     route detects `image_url` content blocks and rewrites them via
+ *     Claude Haiku (OCR + visual description) before forwarding to
+ *     DeepSeek, so DS receives a text-only request with the image's
+ *     content embedded. Single-turn vision only — descriptions aren't
+ *     persisted to `active.jsonl`, so multi-turn references to a prior
+ *     image require re-attaching it.
  *   - **Project/conversation IDs**: DeepSeek is stateless from the
  *     cloud's perspective; multi-turn state lives in the message array
  *     Aris Code sends.
@@ -71,14 +77,18 @@ import {
   type DeepSeekReasoningEffort,
   MessageId,
   type ProviderApprovalDecision,
+  type ProviderSendTurnInput,
   type ProviderSession,
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { DateTime, Deferred, Effect, Fiber, Layer, Random, Stream } from "effect";
 
 import { ArisEventBus } from "../../aris/Services/ArisEventBus.ts";
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
   ProviderAdapterRequestError,
@@ -216,6 +226,9 @@ interface DeepSeekSessionContext {
 const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
   const serverSettings = yield* ServerSettingsService;
   const arisEventBus = yield* ArisEventBus;
+  // Needed by materializeUserContent below to resolve attachment ids
+  // back to filesystem paths (mirrors CodexAdapter line 1349 pattern).
+  const serverConfig = yield* Effect.service(ServerConfig);
 
   const sessions = new Map<ThreadId, DeepSeekSessionContext>();
 
@@ -314,6 +327,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
     userText: string,
     modelOverride: string | undefined,
     reasoningEffort: DeepSeekReasoningEffort | undefined,
+    attachments: ProviderSendTurnInput["attachments"],
   ) => {
     let assistantMessageCount = 0;
 
@@ -612,13 +626,35 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
       // block the turn this way. The .catch on the bare promise
       // swallows any failure so an unhandled rejection can't crash
       // the process.
+      //
+      // 2026-05-13 — Image-attachment metadata (id/type/name/mimeType/
+      // sizeBytes) is now persisted alongside the user message so the
+      // UI chip survives thread reload. The actual file bytes live in
+      // `attachmentsDir`; only the lookup metadata needs to round-trip
+      // through the archive. Attachments are filtered to image-typed
+      // entries (the only `ChatAttachment` variant today) and shape-
+      // copied — we don't serialize anything the persisted-attachment
+      // shape doesn't declare.
       if (archiveCwd) {
+        const persistedAttachments = (attachments ?? [])
+          .filter(
+            (a): a is NonNullable<ProviderSendTurnInput["attachments"]>[number] =>
+              a.type === "image",
+          )
+          .map((a) => ({
+            type: "image" as const,
+            id: a.id,
+            name: a.name,
+            mimeType: a.mimeType,
+            sizeBytes: a.sizeBytes,
+          }));
         void appendToActiveWindow(archiveCwd, sessionThreadId, {
           role: "user",
           content: effectiveUserText,
           timestamp: startedAt,
           messageId: userMessageId,
           turnId,
+          ...(persistedAttachments.length > 0 ? { attachments: persistedAttachments } : {}),
         }).catch((err) => {
           console.warn(
             `[DeepSeekAdapter] RW-1 user-message persist failed (continuing): ${String(err)}`,
@@ -910,6 +946,69 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
           "Use the tool. Don't narrate that you'd use the tool.",
       } as AgentInputItem;
 
+      // 2026-05-13 — Vision shim. DeepSeek V4 itself is text-only, but
+      // the cloud's /api/local/deepseek/v1/chat/completions route now
+      // strips image_url blocks → Claude Haiku → text before forwarding
+      // to DeepSeek. We forward attachments as standard OpenAI
+      // multimodal content; the cloud transparently converts them.
+      // Absent attachments → fall through to text-only (preserves
+      // prefix-cache hit rate vs always-multimodal).
+      // Uses `Effect.promise` (no error channel) — the inner async
+      // handles per-attachment errors itself (log + skip), so one
+      // unreadable file can't fail the whole turn. Reads the threaded
+      // `attachments` parameter rather than `input.attachments` because
+      // we're inside `runTurnStreaming` not `sendTurn`.
+      const userMessageItem: AgentInputItem = yield* Effect.promise(
+        async (): Promise<AgentInputItem> => {
+          const imageAttachments = (attachments ?? []).filter(
+            (a): a is NonNullable<ProviderSendTurnInput["attachments"]>[number] =>
+              a.type === "image",
+          );
+          if (imageAttachments.length === 0) {
+            return { role: "user", content: effectiveUserText } as AgentInputItem;
+          }
+          // OpenAI Agents SDK's InputImage schema uses `image: string`
+          // (data URL or remote URL) as the field name. The chat-completions
+          // converter at `@openai/agents-openai` then rewrites it to the
+          // chat API's `{ type: "image_url", image_url: { url } }` shape
+          // before sending. Using `image_url` here directly trips the
+          // converter's "Only image URLs are supported for input_image"
+          // error because the field it reads is `c.image`, not
+          // `c.image_url`.
+          const contentParts: Array<
+            { type: "input_text"; text: string } | { type: "input_image"; image: string }
+          > = [];
+          if (effectiveUserText.length > 0) {
+            contentParts.push({ type: "input_text", text: effectiveUserText });
+          }
+          for (const attachment of imageAttachments) {
+            const path = resolveAttachmentPath({
+              attachmentsDir: serverConfig.attachmentsDir,
+              attachment,
+            });
+            if (!path) continue;
+            try {
+              const bytes = await readFile(path);
+              const base64 = Buffer.from(bytes).toString("base64");
+              contentParts.push({
+                type: "input_image",
+                image: `data:${attachment.mimeType};base64,${base64}`,
+              });
+            } catch (err) {
+              console.warn(
+                `[DeepSeekAdapter] Failed to read attachment ${attachment.id} (${path}): ${
+                  err instanceof Error ? err.message : String(err)
+                } — skipping.`,
+              );
+            }
+          }
+          if (contentParts.length === 0) {
+            return { role: "user", content: effectiveUserText } as AgentInputItem;
+          }
+          return { role: "user", content: contentParts } as AgentInputItem;
+        },
+      );
+
       const sdkInputItems: AgentInputItem[] = [
         ...(cwdSystemMessage ? [cwdSystemMessage] : []),
         coordinatorSystemMessage,
@@ -1063,7 +1162,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
                 content: [{ type: "output_text", text: m.content }],
               } as AgentInputItem),
         ),
-        { role: "user", content: effectiveUserText } as AgentInputItem,
+        userMessageItem,
       ];
       console.error(
         `[DeepSeekAdapter] RW-2/5/MEM-1/MEM-2/MEM-2.5/MEM-3/COORD-2 sending ${sdkInputItems.length} message(s) to runner ` +
@@ -1326,22 +1425,26 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
     const ctx = yield* requireSession(input.threadId);
 
     const trimmedInput = input.input?.trim() ?? "";
-    if (trimmedInput.length === 0) {
+    const hasAttachments = (input.attachments?.length ?? 0) > 0;
+    // 2026-05-13 — Allow image-only sends (empty text + at least one
+    // attachment). The cloud's Haiku shim converts images to text
+    // descriptions before forwarding to DeepSeek, so the upstream
+    // request always has non-empty content even when the user typed
+    // no text. Reject only when BOTH are empty.
+    if (trimmedInput.length === 0 && !hasAttachments) {
       return yield* new ProviderAdapterValidationError({
         provider: PROVIDER,
         operation: "sendTurn",
-        issue: "DeepSeek requires non-empty text input.",
+        issue: "DeepSeek requires text input or at least one attachment.",
       });
     }
 
-    // DeepSeek V4-Pro is text-only per recon — silently ignore
-    // attachments rather than failing the whole turn. Vision support
-    // can be added when/if DeepSeek ships a multimodal model.
-    if (input.attachments && input.attachments.length > 0) {
-      console.warn(
-        `[DeepSeekAdapter] sendTurn: ignoring ${input.attachments.length} attachment(s) — DeepSeek V4-Pro is text-only.`,
-      );
-    }
+    // 2026-05-13 — Vision is now wired via the cloud-side Haiku shim
+    // (see materializeUserContent below at the sdkInputItems construction
+    // site). The old silent-drop is removed: attachments flow through as
+    // OpenAI multimodal `input_image` blocks, the cloud's DS chat route
+    // strips them to text via Claude Haiku, and DeepSeek receives a
+    // text-only request enriched with the image's content.
 
     const modelSelection =
       input.modelSelection?.provider === "deepseek" ? input.modelSelection : undefined;
@@ -1365,6 +1468,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
       trimmedInput,
       modelSelection?.model,
       reasoningEffort,
+      input.attachments,
     ).pipe(Effect.forkChild);
     ctx.activeFiber = fiber;
 
