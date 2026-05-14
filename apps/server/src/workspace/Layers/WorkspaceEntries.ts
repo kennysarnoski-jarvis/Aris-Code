@@ -497,10 +497,26 @@ export const makeWorkspaceEntries = Effect.gen(function* () {
     },
   );
 
+  const listTree: WorkspaceEntriesShape["listTree"] = Effect.fn("WorkspaceEntries.listTree")(
+    function* (input) {
+      const normalizedCwd = yield* normalizeWorkspaceRoot(input.cwd);
+      const index = yield* Cache.get(workspaceIndexCache, normalizedCwd);
+      // The cached index already drops ignored dirs (node_modules, .git,
+      // dist, ...) and gitignored paths when the project is a git repo.
+      // Hand back the full entry list — directories AND files — for the
+      // client to assemble into a tree. SearchableWorkspaceEntry extends
+      // ProjectEntry, so the internal normalized* fields ride along
+      // structurally; the RPC's success schema strips them on encode,
+      // exactly as it does for `search`.
+      return { entries: index.entries, truncated: index.truncated };
+    },
+  );
+
   return {
     browse,
     invalidate,
     search,
+    listTree,
   } satisfies WorkspaceEntriesShape;
 });
 

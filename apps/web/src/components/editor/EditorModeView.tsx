@@ -85,7 +85,15 @@ type ReadState =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "ready"; contents: string; relativePath: string; truncated: boolean };
+  | {
+      status: "ready";
+      contents: string;
+      relativePath: string;
+      truncated: boolean;
+      /** Total file count in the project index — Slice 3b-i's visible
+       *  proof that `listTree` returned the full, uncapped index. */
+      fileCount: number;
+    };
 
 export default function EditorModeView(props: { onExitToChat: () => void }) {
   const routeThreadRef = useParams({
@@ -123,41 +131,37 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     // user switched threads/projects or left editor mode.
     let cancelled = false;
     setState({ status: "loading" });
-    // Slice 3a auto-picks the first file in the project index to prove
-    // the readFile pipe across any project type. `searchEntries` with
-    // query "." returns the whole index — the server's
-    // `normalizeSearchQuery` strips the leading "." to an empty query,
-    // which the search service treats as match-all (its pre-typing
-    // "show everything" path). Slice 3b replaces this auto-pick with the
-    // file tree's click selection.
-    api.projects
-      .searchEntries({ cwd: activeCwd, query: ".", limit: 50 })
-      .then((searchResult) => {
+
+    // Slice 3b-i pulls the project's full file index via `listTree`
+    // (uncapped, unlike `searchEntries`'s 200-result limit) and
+    // auto-picks the first non-dotfile to keep proving the readFile
+    // pipe. Slice 3b-ii renders this same index as the clickable file
+    // tree; the auto-pick becomes the tree's initial selection.
+    void (async () => {
+      try {
+        const tree = await api.projects.listTree({ cwd: activeCwd });
         if (cancelled) {
-          return null;
+          return;
         }
+        const files = tree.entries.filter((entry) => entry.kind === "file");
         // Skip dotfiles in the auto-pick — `.DS_Store`, `.gitignore`,
-        // etc. are rarely what you want to see first, and `.DS_Store`
-        // in particular is binary. The server's binary guard is the
-        // real backstop (Slice 3b lets the user click any file,
-        // including dotfiles, and the guard handles them), but for the
-        // auto-pick a sensible default beats a junk default.
-        const firstFile = searchResult.entries.find((entry) => {
-          if (entry.kind !== "file") {
-            return false;
-          }
+        // etc. are rarely what you want to see first (and `.DS_Store`
+        // is binary). The server's binary guard is the real backstop;
+        // for the auto-pick, a sensible default beats a junk default.
+        const firstFile = files.find((entry) => {
           const slashIndex = entry.path.lastIndexOf("/");
           const basename = slashIndex >= 0 ? entry.path.slice(slashIndex + 1) : entry.path;
           return !basename.startsWith(".");
         });
         if (!firstFile) {
           setState({ status: "error", message: "No files found in this project." });
-          return null;
+          return;
         }
-        return api.projects.readFile({ cwd: activeCwd, relativePath: firstFile.path });
-      })
-      .then((readResult) => {
-        if (cancelled || !readResult) {
+        const readResult = await api.projects.readFile({
+          cwd: activeCwd,
+          relativePath: firstFile.path,
+        });
+        if (cancelled) {
           return;
         }
         setState({
@@ -165,15 +169,17 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
           contents: readResult.contents,
           relativePath: readResult.relativePath,
           truncated: readResult.truncated,
+          fileCount: files.length,
         });
-      })
-      .catch((err: unknown) => {
+      } catch (err) {
         if (cancelled) {
           return;
         }
         const message = err instanceof Error ? err.message : "Failed to open file.";
         setState({ status: "error", message });
-      });
+      }
+    })();
+
     return () => {
       cancelled = true;
     };
@@ -189,6 +195,11 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
             <span className="min-w-0 truncate text-sm text-muted-foreground">
               {state.relativePath}
               {state.truncated ? " (truncated)" : ""}
+            </span>
+          ) : null}
+          {state.status === "ready" ? (
+            <span className="shrink-0 text-xs text-muted-foreground/60">
+              {state.fileCount} {state.fileCount === 1 ? "file" : "files"}
             </span>
           ) : null}
         </div>

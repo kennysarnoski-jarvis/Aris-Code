@@ -52,6 +52,9 @@ import {
   OrchestrationRpcSchemas,
 } from "./orchestration";
 import {
+  ProjectListTreeError,
+  ProjectListTreeInput,
+  ProjectListTreeResult,
   ProjectReadFileError,
   ProjectReadFileInput,
   ProjectReadFileResult,
@@ -91,6 +94,7 @@ export const WS_METHODS = {
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
   projectsReadFile: "projects.readFile",
+  projectsListTree: "projects.listTree",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -179,6 +183,12 @@ export const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
   payload: ProjectReadFileInput,
   success: ProjectReadFileResult,
   error: ProjectReadFileError,
+});
+
+export const WsProjectsListTreeRpc = Rpc.make(WS_METHODS.projectsListTree, {
+  payload: ProjectListTreeInput,
+  success: ProjectListTreeResult,
+  error: ProjectListTreeError,
 });
 
 export const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
@@ -377,6 +387,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
   WsProjectsReadFileRpc,
+  WsProjectsListTreeRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsSubscribeGitStatusRpc,

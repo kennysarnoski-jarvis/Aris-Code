@@ -93,3 +93,32 @@ export class ProjectReadFileError extends Schema.TaggedErrorClass<ProjectReadFil
     cause: Schema.optional(Schema.Defect),
   },
 ) {}
+
+export const ProjectListTreeInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+});
+export type ProjectListTreeInput = typeof ProjectListTreeInput.Type;
+
+export const ProjectListTreeResult = Schema.Struct({
+  /**
+   * Full project file index — every file and directory entry, already
+   * stripped of ignored dirs (node_modules, .git, dist, ...) and
+   * gitignored paths when the project is a git repo. The client
+   * assembles these flat entries into a tree.
+   */
+  entries: Schema.Array(ProjectEntry),
+  /**
+   * True when the underlying workspace index hit its entry cap — the
+   * tree is a partial view of a very large project.
+   */
+  truncated: Schema.Boolean,
+});
+export type ProjectListTreeResult = typeof ProjectListTreeResult.Type;
+
+export class ProjectListTreeError extends Schema.TaggedErrorClass<ProjectListTreeError>()(
+  "ProjectListTreeError",
+  {
+    message: TrimmedNonEmptyString,
+    cause: Schema.optional(Schema.Defect),
+  },
+) {}

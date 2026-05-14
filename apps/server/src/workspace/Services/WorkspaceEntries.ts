@@ -12,6 +12,8 @@ import type { Effect } from "effect";
 import type {
   FilesystemBrowseInput,
   FilesystemBrowseResult,
+  ProjectListTreeInput,
+  ProjectListTreeResult,
   ProjectSearchEntriesInput,
   ProjectSearchEntriesResult,
 } from "@t3tools/contracts";
@@ -56,6 +58,16 @@ export interface WorkspaceEntriesShape {
   readonly search: (
     input: ProjectSearchEntriesInput,
   ) => Effect.Effect<ProjectSearchEntriesResult, WorkspaceEntriesError>;
+
+  /**
+   * Return the full cached workspace index — every file and directory entry,
+   * unranked and uncapped (beyond the index's own entry ceiling). Backs the
+   * V2 editor file tree, which needs the whole project structure rather than
+   * a query-ranked, limited slice.
+   */
+  readonly listTree: (
+    input: ProjectListTreeInput,
+  ) => Effect.Effect<ProjectListTreeResult, WorkspaceEntriesError>;
 
   /**
    * Drop any cached workspace entries for the given workspace root.
