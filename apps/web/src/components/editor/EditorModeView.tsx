@@ -1,62 +1,196 @@
+import { useEffect, useMemo, useState } from "react";
+import { useParams } from "@tanstack/react-router";
 import { ArrowLeftIcon, FileCode2Icon } from "lucide-react";
 
 import { Button } from "../ui/button";
 import { MonacoEditor } from "./MonacoEditor";
+import { readEnvironmentApi } from "../../environmentApi";
+import { selectProjectByRef, useStore } from "../../store";
+import { createThreadSelectorByRef } from "../../storeSelectors";
+import { resolveThreadRouteRef } from "../../threadRoutes";
 
 /**
  * EditorModeView — the V2 editor mode shell.
  *
- * Slice 2: Monaco now renders inside the shell, read-only, with syntax
- * highlighting, fed hardcoded content. This proves the worker wiring +
- * mount lifecycle work inside Electron's BrowserWindow. Real file
- * opening (file tree + `projects.readFile` RPC) lands in Slice 3; tabs,
- * theming, and agent-edit reflection follow in 4–6.
+ * Slice 3a: Monaco shows a *real* file from the open project, fetched
+ * through the new `projects.readFile` RPC. The file is auto-picked (the
+ * first file in the project index) rather than hardcoded — hardcoding a
+ * path like `package.json` can't work across project types (Node,
+ * Python, Pine Script...). This slice exists to prove the RPC pipe
+ * end-to-end (contract → server → web client → Monaco). Slice 3b adds
+ * the file tree so the open file becomes the user's click selection;
+ * 4–6 layer tabs, theming, and agent-edit reflection on top.
  *
- * Renders in place of `<ChatView>` inside the thread route's
- * `<SidebarInset>` when `?view=editor` is set. `onExitToChat` clears that
- * param (the route owns navigation, so the callback comes down as a prop
- * rather than this component reaching for the router itself).
+ * cwd + environmentId are derived from the route here (mirroring
+ * `DiffPanel`) rather than threaded as props — keeps the route's editor
+ * branch a plain `<EditorModeView onExitToChat=... />`.
  *
- * Default export so the thread route can `React.lazy` it — that keeps
- * Monaco (~5MB) out of the cold-start bundle, only loaded when the user
- * actually switches into editor mode.
+ * Default export so the thread route can `React.lazy` it, keeping
+ * Monaco (~5MB) out of the cold-start bundle.
  */
 
-// Slice 2 placeholder content — replaced by real file contents in Slice 3.
-const PLACEHOLDER_CONTENT = `// Aris Code — V2 editor (Slice 2)
-//
-// This is hardcoded placeholder content. It exists to prove Monaco
-// mounts, the web-worker wiring resolves inside Electron, and syntax
-// highlighting works. Slice 3 wires the file tree + projects.readFile
-// RPC so this becomes the actual file you clicked.
-
-interface EditorSlicePlan {
-  slice: number;
-  title: string;
-  done: boolean;
+/**
+ * Minimal extension → Monaco language id map. Slice 3a opens whatever
+ * file the index hands back, so the editor needs at least coarse
+ * highlighting per file type. Unknown extensions fall back to
+ * `plaintext` (e.g. `.pine` — Monaco has no Pine Script grammar). Slice
+ * 3b can promote this to a shared helper if the file tree needs it
+ * elsewhere.
+ */
+function languageFromPath(filePath: string): string {
+  const lastDot = filePath.lastIndexOf(".");
+  const ext = lastDot >= 0 ? filePath.slice(lastDot + 1).toLowerCase() : "";
+  switch (ext) {
+    case "ts":
+    case "tsx":
+    case "mts":
+    case "cts":
+      return "typescript";
+    case "js":
+    case "jsx":
+    case "mjs":
+    case "cjs":
+      return "javascript";
+    case "json":
+      return "json";
+    case "py":
+      return "python";
+    case "md":
+    case "mdx":
+      return "markdown";
+    case "css":
+      return "css";
+    case "html":
+      return "html";
+    case "rs":
+      return "rust";
+    case "go":
+      return "go";
+    case "sh":
+    case "bash":
+      return "shell";
+    case "yml":
+    case "yaml":
+      return "yaml";
+    case "toml":
+      return "toml";
+    case "sql":
+      return "sql";
+    default:
+      return "plaintext";
+  }
 }
 
-const plan: EditorSlicePlan[] = [
-  { slice: 1, title: "Chat/Editor mode toggle", done: true },
-  { slice: 2, title: "Monaco renders in Editor mode", done: true },
-  { slice: 3, title: "File tree + projects.readFile RPC", done: false },
-  { slice: 4, title: "Multi-tab editor", done: false },
-  { slice: 5, title: "Monaco theming bridge", done: false },
-  { slice: 6, title: "Agent-edit reflection", done: false },
-];
-
-export function nextSlice(): EditorSlicePlan | undefined {
-  return plan.find((entry) => !entry.done);
-}
-`;
+type ReadState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; contents: string; relativePath: string; truncated: boolean };
 
 export default function EditorModeView(props: { onExitToChat: () => void }) {
+  const routeThreadRef = useParams({
+    strict: false,
+    select: (params) => resolveThreadRouteRef(params),
+  });
+  const activeThread = useStore(
+    useMemo(() => createThreadSelectorByRef(routeThreadRef), [routeThreadRef]),
+  );
+  const activeProjectId = activeThread?.projectId ?? null;
+  const activeProject = useStore((store) =>
+    activeThread && activeProjectId
+      ? selectProjectByRef(store, {
+          environmentId: activeThread.environmentId,
+          projectId: activeProjectId,
+        })
+      : undefined,
+  );
+  const environmentId = activeThread?.environmentId ?? null;
+  const activeCwd = activeThread?.worktreePath ?? activeProject?.cwd ?? null;
+
+  const [state, setState] = useState<ReadState>({ status: "idle" });
+
+  useEffect(() => {
+    if (!environmentId || !activeCwd) {
+      setState({ status: "idle" });
+      return;
+    }
+    const api = readEnvironmentApi(environmentId);
+    if (!api) {
+      setState({ status: "error", message: "Environment connection unavailable." });
+      return;
+    }
+    // `cancelled` guards against a resolved fetch landing after the
+    // user switched threads/projects or left editor mode.
+    let cancelled = false;
+    setState({ status: "loading" });
+    // Slice 3a auto-picks the first file in the project index to prove
+    // the readFile pipe across any project type. `searchEntries` with
+    // query "." returns the whole index — the server's
+    // `normalizeSearchQuery` strips the leading "." to an empty query,
+    // which the search service treats as match-all (its pre-typing
+    // "show everything" path). Slice 3b replaces this auto-pick with the
+    // file tree's click selection.
+    api.projects
+      .searchEntries({ cwd: activeCwd, query: ".", limit: 50 })
+      .then((searchResult) => {
+        if (cancelled) {
+          return null;
+        }
+        // Skip dotfiles in the auto-pick — `.DS_Store`, `.gitignore`,
+        // etc. are rarely what you want to see first, and `.DS_Store`
+        // in particular is binary. The server's binary guard is the
+        // real backstop (Slice 3b lets the user click any file,
+        // including dotfiles, and the guard handles them), but for the
+        // auto-pick a sensible default beats a junk default.
+        const firstFile = searchResult.entries.find((entry) => {
+          if (entry.kind !== "file") {
+            return false;
+          }
+          const slashIndex = entry.path.lastIndexOf("/");
+          const basename = slashIndex >= 0 ? entry.path.slice(slashIndex + 1) : entry.path;
+          return !basename.startsWith(".");
+        });
+        if (!firstFile) {
+          setState({ status: "error", message: "No files found in this project." });
+          return null;
+        }
+        return api.projects.readFile({ cwd: activeCwd, relativePath: firstFile.path });
+      })
+      .then((readResult) => {
+        if (cancelled || !readResult) {
+          return;
+        }
+        setState({
+          status: "ready",
+          contents: readResult.contents,
+          relativePath: readResult.relativePath,
+          truncated: readResult.truncated,
+        });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) {
+          return;
+        }
+        const message = err instanceof Error ? err.message : "Failed to open file.";
+        setState({ status: "error", message });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [environmentId, activeCwd]);
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
       <header className="flex h-[52px] shrink-0 items-center gap-3 border-b border-border px-4">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <FileCode2Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-          <span className="text-base font-medium">Editor</span>
+          <span className="shrink-0 text-base font-medium">Editor</span>
+          {state.status === "ready" ? (
+            <span className="min-w-0 truncate text-sm text-muted-foreground">
+              {state.relativePath}
+              {state.truncated ? " (truncated)" : ""}
+            </span>
+          ) : null}
         </div>
         <Button variant="outline" size="sm" onClick={props.onExitToChat} className="shrink-0">
           <ArrowLeftIcon className="size-3.5" aria-hidden />
@@ -64,7 +198,21 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
         </Button>
       </header>
       <div className="min-h-0 flex-1">
-        <MonacoEditor value={PLACEHOLDER_CONTENT} language="typescript" readOnly />
+        {state.status === "ready" ? (
+          <MonacoEditor
+            value={state.contents}
+            language={languageFromPath(state.relativePath)}
+            readOnly
+          />
+        ) : (
+          <div className="flex h-full items-center justify-center p-8 text-center text-sm text-muted-foreground">
+            {state.status === "loading"
+              ? "Loading file..."
+              : state.status === "error"
+                ? state.message
+                : "No project workspace available for this thread."}
+          </div>
+        )}
       </div>
     </div>
   );
