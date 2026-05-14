@@ -1,6 +1,6 @@
 /**
- * useArisThreadHistory — React hook that fetches chat history for the
- * Aris-channel providers (Aris and DeepSeek). Each provider has a
+ * useArisThreadHistory — React hook that owns the chat-history state for
+ * the Aris-channel providers (Aris and DeepSeek). Each provider has a
  * different persistence store but the hook hides that from callers:
  *
  *   - **Aris** → ArisLLM HTTP API → `aris_memory.db` (graph store)
@@ -11,12 +11,43 @@
  * state.sqlite is NOT used for either provider — Aris-channel threads
  * have authoritative history elsewhere.
  *
- * Refetches whenever:
- *   - threadId changes (thread switch)
- *   - provider flips between Aris-channel providers
- *   - baseUrl / apiKey change (Aris sign-in / sign-out — irrelevant for DS)
- *   - environmentId / cwd change (DS — needed to locate the archive file)
- *   - `refetch()` is called (caller-driven, e.g. on turn completion)
+ * ## Push-driven model (2026-05-13)
+ *
+ * The hook now mirrors how Codex/Claude render messages — incremental
+ * push, not periodic refetch. Lifecycle:
+ *
+ *   1. **Cold mount** of a thread → one-shot archive fetch returns the
+ *      prior conversation. Same as before. Sets `messages` from null →
+ *      array.
+ *   2. **Live updates** during a session → subscribe to
+ *      `aris.assistant.message.completed` on the aris-channel WS.
+ *      When the event fires, append the assistant message to the local
+ *      `messages` array. The UI re-renders incrementally — no full-list
+ *      replacement, no flicker.
+ *   3. **User messages** are NOT pushed — the optimistic message in
+ *      `ChatView.tsx` is the source of truth for the user bubble until
+ *      the next cold mount (page refresh / thread switch / app restart),
+ *      at which point the archive read returns the persisted user msg
+ *      with its server-assigned id. Within a session, the optimistic
+ *      stays visible because nothing in `messages` matches its
+ *      client-generated id (Codex/Claude settle via id-match because
+ *      they share id space with the projection; DS doesn't, so the
+ *      optimistic just keeps standing).
+ *
+ * Why push instead of refetch: the previous model called `refetch()`
+ * on turn-start AND turn-end, which raced against `DeepSeekAdapter`'s
+ * fire-and-forget active.jsonl write (`void appendToActiveWindow(...)`).
+ * If a refetch landed before the disk write, the new user message
+ * vanished for one frame — the "weird text flash" symptom.
+ *
+ * `refetch()` is still exposed on the result for cold-reload paths
+ * (e.g. an out-of-band sidebar action that knows the archive changed
+ * underneath us) but ChatView no longer calls it during normal turn
+ * flow.
+ *
+ * Initial fetch fires on dep change (threadId, provider, etc.); the
+ * live subscription opens after the fetch resolves and stays up until
+ * threadId changes or the hook unmounts.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -168,6 +199,52 @@ export function useArisThreadHistory(
       controller.abort();
     };
   }, [enabled, arisEnabled, threadId, baseUrl, apiKey, cwd, environmentId, refetchTick]);
+
+  // Push-driven incremental updates. Subscribes to the aris-channel WS
+  // so `aris.assistant.message.completed` lands as an append on the
+  // local `messages` array — no full-archive refetch, no flicker.
+  // Lifecycle:
+  //   - Open subscription when the hook is enabled and we have an
+  //     environmentId (the WS client is environment-scoped). For the
+  //     aris-cloud provider environmentId is also available because
+  //     ChatView passes it from the active environment.
+  //   - Close on threadId / environmentId change or hook unmount.
+  //   - Skip events when `messages` is still null (initial fetch in
+  //     flight) — appending to null would create a single-message
+  //     array missing all prior history. The fetch result will include
+  //     the message anyway since the assistant write hits active.jsonl
+  //     before the event fires server-side.
+  //   - Dedupe by messageId — if the subscription somehow re-emits the
+  //     same event (rapid re-subscribe race) we don't want a duplicate
+  //     row in the timeline.
+  //
+  // User-message events intentionally NOT consumed here — see the
+  // module docstring for why the optimistic message owns that path.
+  useEffect(() => {
+    if (!enabled || !threadId || !environmentId) return;
+    const api = readEnvironmentApi(environmentId);
+    if (!api) return;
+    const unsubscribe = api.aris.subscribeEvents({ threadId: threadId as ThreadId }, (event) => {
+      if (activeThreadIdRef.current !== threadId) return;
+      if (event.type !== "aris.assistant.message.completed") return;
+      setMessages((existing) => {
+        if (existing === null) return existing;
+        if (existing.some((m) => m.id === event.payload.messageId)) return existing;
+        const next: ChatMessage = {
+          id: event.payload.messageId,
+          role: "assistant",
+          text: event.payload.finalText,
+          createdAt: event.createdAt,
+          streaming: false,
+        };
+        if (event.turnId) next.turnId = event.turnId;
+        return [...existing, next];
+      });
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, [enabled, threadId, environmentId]);
 
   const refetch = useCallback(() => {
     setRefetchTick((n) => n + 1);

@@ -250,20 +250,40 @@ export function deriveMessagesTimelineRows(input: {
   // synthetic, the height delta is essentially zero.
   const liveBufferText = input.liveAssistantBufferText ?? "";
   const liveBufferTurnId = input.liveAssistantBufferTurnId ?? null;
-  // Buffer-vs-active-turn matching:
-  //   - When a turn is actively in progress, the buffer's turnId must match
-  //     the active turn id. This rejects stale buffer content from a
-  //     previous turn that hasn't been cleared yet (e.g. after the user
-  //     sends a fresh message but before the next stream's first delta
-  //     arrives — the previous turn's text still sits in the buffer).
-  //   - When `activeTurnId` is null (the most recent turn just ended),
-  //     allow the buffer to keep rendering as long as the structural
-  //     check below confirms no settled assistant has landed yet. This
-  //     closes the half-second visual gap between stream-end (active
-  //     turn cleared) and `arisRefetch` (settled row arrives).
-  const bufferIsForActiveTurn =
+  // The synthetic in-flight assistant row should render iff the buffer
+  // is holding text for a turn whose settled assistant message hasn't
+  // landed in the timeline yet. If a settled message with the same
+  // turnId already exists in `timelineEntries`, the buffer is stale —
+  // the real version is already on screen, rendering the synthetic
+  // would either duplicate it or (worse) ghost the previous turn's
+  // text under a freshly-sent user bubble whose own assistant hasn't
+  // started streaming.
+  //
+  // 2026-05-13 — Replaces the prior `activeTurnId` matching scheme
+  // which had two failure modes for the Aris/DS flow:
+  //   1. The escape hatch `activeTurnId === null → allow render`
+  //      flashed the previous turn's buffer between sends.
+  //   2. Strict equality `activeTurnId === buffer.turnId` still
+  //      failed because activeTurnId doesn't flip to null between
+  //      turns — it holds the previous turn id until the server
+  //      publishes the next `aris.turn.started`. During that window
+  //      (after the user clicks send, before the new turn id arrives)
+  //      the buffer's turn STILL matches activeTurnId, so the gate
+  //      would re-render it.
+  // Asking "does the buffer's turn already have a settled message"
+  // sidesteps both. After the assistant completes for turn N, the
+  // settled assistant lands in messages with turnId N — buffer for
+  // turn N immediately fails this check forever, regardless of
+  // whether activeTurnId has rolled forward yet.
+  const bufferAlreadySettled =
     liveBufferTurnId !== null &&
-    (input.activeTurnId === null || liveBufferTurnId === input.activeTurnId);
+    input.timelineEntries.some(
+      (entry) =>
+        entry.kind === "message" &&
+        entry.message.role === "assistant" &&
+        entry.message.turnId === liveBufferTurnId,
+    );
+  const bufferIsForActiveTurn = liveBufferTurnId !== null && !bufferAlreadySettled;
   const hasLiveBuffer = liveBufferText.length > 0 && bufferIsForActiveTurn;
   const hasSettledAssistantAfterLatestUser = settledAssistantExistsAfterLatestUser(
     input.timelineEntries,

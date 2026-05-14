@@ -1351,7 +1351,6 @@ export default function ChatView(props: ChatViewProps) {
     threadId: activeThread?.id ?? null,
     provider: activeThread?.session?.provider ?? null,
   });
-  const arisRefetch = arisHistory.refetch;
   // Both Aris and DeepSeek emit tool events through ArisEventBus and
   // we already wired `useArisToolEvents` to subscribe for both. Without
   // including DeepSeek here, the synthesized work-log entries get
@@ -1383,45 +1382,22 @@ export default function ChatView(props: ChatViewProps) {
       })
       .map(arisToolStateToWorkLogEntry);
   }, [isArisThread, workLogEntries, arisToolEvents.toolCalls, activeLatestTurn?.turnId]);
-  // Stabilize arisRefetch in a ref. TanStack Query's `refetch` callback
-  // is a new function reference on most renders, which would otherwise
-  // re-run the effects below on every render and cause an infinite
-  // update loop (when the second useEffect lacks a per-render guard).
-  // The ref pattern keeps the latest callback accessible without putting
-  // the unstable reference into the dep array.
-  const arisRefetchRef = useRef(arisRefetch);
-  useEffect(() => {
-    arisRefetchRef.current = arisRefetch;
-  });
+  // Sidebar refresh on turn-settle. The arisHistory hook owns its own
+  // live updates now (subscribes to aris.assistant.message.completed
+  // and appends incrementally), so the previous turn-start /
+  // turn-settle full-archive refetches are gone — they raced against
+  // the active.jsonl write and caused a "previous chat" flash on send.
+  // What stays here is the sidebar poke: when a turn ends we still
+  // want the thread-list to pick up any lastActiveAt / auto-title
+  // updates that landed during the turn. Cheap (one /v1/threads fetch)
+  // and fires exactly once per settle.
   const wasLatestTurnSettledRef = useRef(latestTurnSettled);
   useEffect(() => {
-    if (latestTurnSettled && !wasLatestTurnSettledRef.current) {
-      console.log("[aris-refetch] turn-settled fired, refetching", {
-        threadId: activeThread?.id,
-        turnId: activeLatestTurn?.turnId,
-      });
-      arisRefetchRef.current();
-      // Cut C punch list (Phase 3b) — also poke the sidebar so it picks
-      // up `lastActiveAt` updates and any auto-generated title that
-      // landed during this turn. Cheap (one /v1/threads fetch) and only
-      // fires once per settle.
-      if (isArisThread) {
-        triggerArisSidebarRefresh();
-      }
+    if (latestTurnSettled && !wasLatestTurnSettledRef.current && isArisThread) {
+      triggerArisSidebarRefresh();
     }
     wasLatestTurnSettledRef.current = latestTurnSettled;
   }, [latestTurnSettled, isArisThread]);
-  // Refetch on turn START too. aris_server persists the user message to
-  // aris_memory.db BEFORE the agentic loop runs, but the hook above only
-  // refetches on turn END. Without this, during an active turn the fetched
-  // history is stale (missing the just-sent user bubble), which makes the
-  // working/reasoning row appear to float far above the last assistant reply.
-  const activeLatestTurnId = activeLatestTurn?.turnId ?? null;
-  useEffect(() => {
-    if (isArisThread && activeLatestTurnId) {
-      arisRefetchRef.current();
-    }
-  }, [isArisThread, activeLatestTurnId]);
 
   // Sidebar thread-list refresh on `aris.thread.persisted`. ArisAdapter
   // publishes that event the moment it receives the first SSE envelope
@@ -1590,7 +1566,22 @@ export default function ChatView(props: ChatViewProps) {
     if (pendingMessages.length === 0) {
       return serverMessagesWithPreviewHandoff;
     }
-    return [...serverMessagesWithPreviewHandoff, ...pendingMessages];
+    // Sort by createdAt rather than appending pendingMessages at the
+    // end. Codex/Claude don't need this — their projection emits the
+    // server-side user message with the same id as the optimistic, so
+    // pendingMessages is empty by the time the assistant arrives. DS
+    // never emits a user-message push (the optimistic owns that slot
+    // until next cold mount), so when the assistant lands via
+    // `aris.assistant.message.completed` it'd otherwise render BEFORE
+    // the user bubble in the timeline. Sorting handles all three
+    // providers uniformly. monotonicCreatedAtAfter at send-time
+    // guarantees the optimistic timestamp is strictly greater than
+    // every prior message, so this only re-orders the optimistic
+    // relative to messages that arrive AFTER it (the new assistant
+    // reply) — which is exactly the case we want to fix.
+    return [...serverMessagesWithPreviewHandoff, ...pendingMessages].toSorted((a, b) =>
+      a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0,
+    );
   }, [serverMessages, attachmentPreviewHandoffByMessageId, optimisticUserMessages]);
   const timelineEntries = useMemo(
     () =>
