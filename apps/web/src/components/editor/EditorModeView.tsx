@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "@tanstack/react-router";
 import { ArrowLeftIcon, FileCode2Icon } from "lucide-react";
 
 import { Button } from "../ui/button";
 import { MonacoEditor } from "./MonacoEditor";
 import { FileTree } from "./FileTree";
+import { EditorTabStrip } from "./EditorTabStrip";
 import { buildFileTree, type FileTreeNode } from "./fileTreeModel";
 import { useResizablePaneWidth } from "./useResizablePaneWidth";
 import { readEnvironmentApi } from "../../environmentApi";
@@ -15,19 +16,21 @@ import { resolveThreadRouteRef } from "../../threadRoutes";
 /**
  * EditorModeView — the V2 editor mode shell.
  *
- * Slice 3b-ii: the left pane is now the real recursive file tree, built
- * from `projects.listTree`. Clicking a file reads it through
- * `projects.readFile` and shows it in Monaco (read-only, highlighted).
- * The first non-dotfile is auto-selected on open so there's immediate
- * content. Slices 4–6 layer tabs, theming, and agent-edit reflection on
- * top — this slice doesn't change the readFile/listTree pipes, only how
- * the user drives them.
+ * Slice 4: the editor is now multi-tab. Clicking a file in the tree
+ * opens it as a tab (or re-activates an already-open one); tabs
+ * accumulate across the strip above Monaco. Each tab's fetched contents
+ * are kept in a per-path cache (`tabStates`) so switching back to an
+ * already-loaded tab is instant — only the first open of a file hits
+ * the `readFile` RPC. Closing a tab falls back to a neighbour.
+ *
+ * Slices 5–6 layer theming and agent-edit reflection on top — this
+ * slice doesn't change the readFile/listTree pipes, only how many
+ * files can be open at once.
  *
  * Two independent async state machines: `treeState` (the listTree fetch
- * + built tree) and `fileState` (the readFile fetch for whatever
- * `openFilePath` currently points at). They're separate because the
- * tree loads once per project while the file reloads on every
- * selection.
+ * + built tree) and the per-tab `tabStates` cache (a `readFile` fetch
+ * per distinct file the user has opened). They're separate because the
+ * tree loads once per project while files load lazily on first open.
  *
  * cwd + environmentId are derived from the route here (mirroring
  * `DiffPanel`). Default export so the thread route can `React.lazy` it,
@@ -95,11 +98,14 @@ type TreeState =
   | { status: "error"; message: string }
   | { status: "ready"; nodes: FileTreeNode[]; fileCount: number };
 
-type FileState =
-  | { status: "idle" }
-  | { status: "loading"; path: string }
-  | { status: "error"; path: string; message: string }
-  | { status: "ready"; path: string; contents: string; truncated: boolean };
+/**
+ * Per-tab file state. The `ready` variant doubles as the content cache:
+ * once a tab is `ready`, switching away and back never refetches.
+ */
+type TabFileState =
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; relativePath: string; contents: string; truncated: boolean };
 
 export default function EditorModeView(props: { onExitToChat: () => void }) {
   const routeThreadRef = useParams({
@@ -122,15 +128,27 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   const activeCwd = activeThread?.worktreePath ?? activeProject?.cwd ?? null;
 
   const [treeState, setTreeState] = useState<TreeState>({ status: "idle" });
-  const [openFilePath, setOpenFilePath] = useState<string | null>(null);
-  const [fileState, setFileState] = useState<FileState>({ status: "idle" });
+  // Multi-tab state. `openTabs` is the ordered strip; `activeTabPath`
+  // points at the focused tab; `tabStates` caches each tab's fetched
+  // contents keyed by path. Refs mirror the latter two so the close
+  // handler and Effect 2 can read the freshest values synchronously
+  // without re-binding on every keystroke-equivalent change.
+  const [openTabs, setOpenTabs] = useState<string[]>([]);
+  const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
+  const [tabStates, setTabStates] = useState<Map<string, TabFileState>>(new Map());
+  const openTabsRef = useRef(openTabs);
+  openTabsRef.current = openTabs;
+  const tabStatesRef = useRef(tabStates);
+  tabStatesRef.current = tabStates;
 
   // Effect 1 — load the project tree. Runs once per project. Resets the
-  // open-file selection up front so a stale path from the previous
-  // project can't briefly drive Effect 2 against the new cwd; the
-  // auto-pick below re-seeds it once the fresh index lands.
+  // whole tab strip up front so stale tabs from the previous project
+  // can't briefly drive Effect 2 against the new cwd; the auto-pick
+  // below re-seeds a single tab once the fresh index lands.
   useEffect(() => {
-    setOpenFilePath(null);
+    setOpenTabs([]);
+    setActiveTabPath(null);
+    setTabStates(new Map());
     if (!environmentId || !activeCwd) {
       setTreeState({ status: "idle" });
       return;
@@ -159,7 +177,8 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
         // the real backstop when the user clicks one in the tree.
         const firstFile = files.find((entry) => !basenameOf(entry.path).startsWith("."));
         if (firstFile) {
-          setOpenFilePath(firstFile.path);
+          setOpenTabs([firstFile.path]);
+          setActiveTabPath(firstFile.path);
         }
       } catch (err) {
         if (cancelled) {
@@ -174,52 +193,113 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     };
   }, [environmentId, activeCwd]);
 
-  // Effect 2 — read whatever file `openFilePath` points at. Re-runs on
-  // every selection change.
+  // Effect 2 — read whatever file `activeTabPath` points at, unless it's
+  // already cached. Re-runs on every tab switch, but a cache hit
+  // (`ready` or `error`) returns immediately so only the first open of
+  // a given file hits the RPC.
   useEffect(() => {
-    if (!environmentId || !activeCwd || !openFilePath) {
-      setFileState({ status: "idle" });
+    if (!environmentId || !activeCwd || !activeTabPath) {
+      return;
+    }
+    const cached = tabStatesRef.current.get(activeTabPath);
+    if (cached && cached.status !== "loading") {
       return;
     }
     const api = readEnvironmentApi(environmentId);
     if (!api) {
-      setFileState({
-        status: "error",
-        path: openFilePath,
-        message: "Environment connection unavailable.",
-      });
+      setTabStates((prev) =>
+        new Map(prev).set(activeTabPath, {
+          status: "error",
+          message: "Environment connection unavailable.",
+        }),
+      );
       return;
     }
     let cancelled = false;
-    const path = openFilePath;
-    setFileState({ status: "loading", path });
+    const path = activeTabPath;
+    setTabStates((prev) => new Map(prev).set(path, { status: "loading" }));
     void (async () => {
       try {
         const result = await api.projects.readFile({ cwd: activeCwd, relativePath: path });
         if (cancelled) {
           return;
         }
-        setFileState({
-          status: "ready",
-          path: result.relativePath,
-          contents: result.contents,
-          truncated: result.truncated,
-        });
+        setTabStates((prev) =>
+          new Map(prev).set(path, {
+            status: "ready",
+            relativePath: result.relativePath,
+            contents: result.contents,
+            truncated: result.truncated,
+          }),
+        );
       } catch (err) {
         if (cancelled) {
           return;
         }
         const message = err instanceof Error ? err.message : "Failed to open file.";
-        setFileState({ status: "error", path, message });
+        setTabStates((prev) => new Map(prev).set(path, { status: "error", message }));
       }
     })();
     return () => {
       cancelled = true;
+      // Drop a still-pending `loading` entry so re-activating this tab
+      // refetches instead of being stuck on a cache hit that never
+      // resolved. A `ready`/`error` entry that landed before cleanup is
+      // left intact — that's the cache doing its job.
+      setTabStates((prev) => {
+        const entry = prev.get(path);
+        if (!entry || entry.status !== "loading") {
+          return prev;
+        }
+        const next = new Map(prev);
+        next.delete(path);
+        return next;
+      });
     };
-  }, [environmentId, activeCwd, openFilePath]);
+  }, [environmentId, activeCwd, activeTabPath]);
 
+  // Tree click — open the file as a tab (or re-activate it if already
+  // open) and focus it. New tabs append to the end of the strip.
   const onSelectFile = useCallback((path: string) => {
-    setOpenFilePath(path);
+    setOpenTabs((prev) => (prev.includes(path) ? prev : [...prev, path]));
+    setActiveTabPath(path);
+  }, []);
+
+  const onSelectTab = useCallback((path: string) => {
+    setActiveTabPath(path);
+  }, []);
+
+  // Close a tab. Reads `openTabsRef` so the neighbour computation sees
+  // the live strip even if multiple closes land in one tick. When the
+  // active tab closes, focus falls to the tab that took its index slot
+  // (i.e. the former right neighbour), or the new last tab if it was at
+  // the end. The cached content is dropped — reopening refetches.
+  const onCloseTab = useCallback((path: string) => {
+    const current = openTabsRef.current;
+    const closingIndex = current.indexOf(path);
+    if (closingIndex === -1) {
+      return;
+    }
+    const nextTabs = current.filter((tab) => tab !== path);
+    setOpenTabs(nextTabs);
+    setTabStates((prev) => {
+      if (!prev.has(path)) {
+        return prev;
+      }
+      const next = new Map(prev);
+      next.delete(path);
+      return next;
+    });
+    setActiveTabPath((prevActive) => {
+      if (prevActive !== path) {
+        return prevActive;
+      }
+      if (nextTabs.length === 0) {
+        return null;
+      }
+      const fallbackIndex = Math.min(closingIndex, nextTabs.length - 1);
+      return nextTabs[fallbackIndex] ?? null;
+    });
   }, []);
 
   // Resizable tree pane — long file paths get clipped at a fixed width,
@@ -232,12 +312,12 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     maxWidth: 600,
   });
 
+  const activeTabState = activeTabPath ? (tabStates.get(activeTabPath) ?? null) : null;
+
   const headerPath =
-    fileState.status === "ready"
-      ? `${fileState.path}${fileState.truncated ? " (truncated)" : ""}`
-      : fileState.status === "loading"
-        ? fileState.path
-        : null;
+    activeTabState?.status === "ready"
+      ? `${activeTabState.relativePath}${activeTabState.truncated ? " (truncated)" : ""}`
+      : activeTabPath;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
@@ -264,7 +344,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
           {treeState.status === "ready" ? (
             <FileTree
               nodes={treeState.nodes}
-              activePath={openFilePath}
+              activePath={activeTabPath}
               onSelectFile={onSelectFile}
             />
           ) : (
@@ -287,22 +367,30 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
           aria-orientation="vertical"
           aria-label="Resize file tree"
         />
-        <div className="min-h-0 min-w-0 flex-1">
-          {fileState.status === "ready" ? (
-            <MonacoEditor
-              value={fileState.contents}
-              language={languageFromPath(fileState.path)}
-              readOnly
-            />
-          ) : (
-            <div className="flex h-full items-center justify-center p-8 text-center text-sm text-muted-foreground">
-              {fileState.status === "loading"
-                ? "Loading file..."
-                : fileState.status === "error"
-                  ? fileState.message
-                  : "Select a file from the tree to view it."}
-            </div>
-          )}
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <EditorTabStrip
+            tabs={openTabs}
+            activeTabPath={activeTabPath}
+            onSelectTab={onSelectTab}
+            onCloseTab={onCloseTab}
+          />
+          <div className="min-h-0 min-w-0 flex-1">
+            {activeTabState?.status === "ready" ? (
+              <MonacoEditor
+                value={activeTabState.contents}
+                language={languageFromPath(activeTabState.relativePath)}
+                readOnly
+              />
+            ) : (
+              <div className="flex h-full items-center justify-center p-8 text-center text-sm text-muted-foreground">
+                {activeTabState?.status === "loading"
+                  ? "Loading file..."
+                  : activeTabState?.status === "error"
+                    ? activeTabState.message
+                    : "Select a file from the tree to view it."}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
