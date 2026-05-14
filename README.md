@@ -117,6 +117,8 @@ curl -fsSL https://raw.githubusercontent.com/kennysarnoski-jarvis/Aris-Code/main
 
 Handles: apt deps (auto-detects t64 vs legacy library names for Ubuntu 24.04+), build toolchain, Node.js 22, Bun, node-gyp, repo clone into `~/Aris-Code`, and `bun install`. Takes ~5-10 minutes including the Electron binary download.
 
+> **First time on Linux, or wondering why it's not in your Apps menu?** Read the [Linux install & usage guide](./docs/INSTALL-LINUX.md) — covers daily-use workflow, an optional `.desktop` launcher so Aris Code shows up in your launcher like a regular app, updating between releases, and distro-specific troubleshooting.
+
 **Windows (admin PowerShell):**
 
 ```powershell
