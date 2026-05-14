@@ -3,7 +3,6 @@ import { Suspense, lazy, type ReactNode, useCallback, useEffect, useMemo, useSta
 
 import ChatView from "../components/ChatView";
 import { threadHasStarted } from "../components/ChatView.logic";
-import { EditorModeView } from "../components/editor/EditorModeView";
 import { DiffWorkerPoolProvider } from "../components/DiffWorkerPoolProvider";
 import {
   DiffPanelHeaderSkeleton,
@@ -25,6 +24,9 @@ import { Sheet, SheetPopup } from "../components/ui/sheet";
 import { Sidebar, SidebarInset, SidebarProvider, SidebarRail } from "~/components/ui/sidebar";
 
 const DiffPanel = lazy(() => import("../components/DiffPanel"));
+// V2 editor mode — React.lazy so Monaco (~5MB) stays out of the
+// cold-start bundle and only loads when the user enters editor mode.
+const EditorModeView = lazy(() => import("../components/editor/EditorModeView"));
 const DIFF_INLINE_LAYOUT_MEDIA_QUERY = "(max-width: 1180px)";
 const DIFF_INLINE_SIDEBAR_WIDTH_STORAGE_KEY = "chat_diff_sidebar_width";
 const DIFF_INLINE_DEFAULT_WIDTH = "clamp(28rem,48vw,44rem)";
@@ -276,11 +278,20 @@ function ChatThreadRouteView() {
 
   // V2 editor mode is its own early-return branch — it occupies the same
   // SidebarInset slot ChatView would, but deliberately doesn't entangle
-  // with the diff sheet/sidebar logic below. (Slice 1: empty shell.)
+  // with the diff sheet/sidebar logic below. Suspense covers the
+  // React.lazy boundary while Monaco's chunk loads on first entry.
   if (editorMode) {
     return (
       <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
-        <EditorModeView onExitToChat={exitToChat} />
+        <Suspense
+          fallback={
+            <div className="flex h-full items-center justify-center bg-background text-sm text-muted-foreground">
+              Loading editor...
+            </div>
+          }
+        >
+          <EditorModeView onExitToChat={exitToChat} />
+        </Suspense>
       </SidebarInset>
     );
   }

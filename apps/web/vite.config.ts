@@ -56,7 +56,15 @@ export default defineConfig({
     tailwindcss(),
   ],
   optimizeDeps: {
-    include: ["@pierre/diffs", "@pierre/diffs/react", "@pierre/diffs/worker/worker.js"],
+    include: [
+      "@pierre/diffs",
+      "@pierre/diffs/react",
+      "@pierre/diffs/worker/worker.js",
+      // V2 editor — pre-bundle monaco so dev-server cold starts stay
+      // sane. The editor itself is React.lazy'd in the thread route, so
+      // this only affects dev-server warmup, not the cold-start bundle.
+      "monaco-editor",
+    ],
   },
   define: {
     "import.meta.env.VITE_HTTP_URL": JSON.stringify(configuredHttpUrl ?? ""),
