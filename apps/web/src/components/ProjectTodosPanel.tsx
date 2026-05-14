@@ -219,7 +219,7 @@ export function ProjectTodosPanel(props: ProjectTodosPanelProps) {
         )}
       </div>
       {orderedTodos.length === 0 ? (
-        <div className="text-xs text-zinc-500 dark:text-zinc-400 italic px-3 py-2">
+        <div className="text-sm text-zinc-500 dark:text-zinc-400 italic px-3 py-2">
           No todos written this session.
         </div>
       ) : (
@@ -231,7 +231,7 @@ export function ProjectTodosPanel(props: ProjectTodosPanelProps) {
             >
               <TodoStatusPill status={t.status} />
               <span
-                className={`text-xs flex-1 break-words ${
+                className={`text-sm flex-1 break-words ${
                   t.status === "completed"
                     ? "text-zinc-400 dark:text-zinc-500 line-through"
                     : "text-zinc-800 dark:text-zinc-200"

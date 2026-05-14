@@ -87,7 +87,7 @@ export const DeepSeekBalancePill = memo(function DeepSeekBalancePill() {
           <Badge
             variant="outline"
             className={cn(
-              "shrink-0 cursor-default gap-1 px-2 py-0.5 text-[11px] font-medium tabular-nums",
+              "shrink-0 cursor-default gap-1 px-2 py-0.5 text-xs font-medium tabular-nums",
               tierClass,
             )}
             onClick={() => {
@@ -101,7 +101,7 @@ export const DeepSeekBalancePill = memo(function DeepSeekBalancePill() {
         }
       />
       <TooltipPopup side="bottom" className="max-w-xs">
-        <div className="space-y-1 text-xs">
+        <div className="space-y-1 text-sm">
           <div className="font-medium">Aris balance</div>
           <div className="text-muted-foreground">
             {state.balanceCents !== null ? `${displayBalance} remaining` : "Fetching balance…"}

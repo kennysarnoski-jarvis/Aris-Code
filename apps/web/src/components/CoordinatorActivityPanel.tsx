@@ -43,7 +43,7 @@ export function CoordinatorActivityPanel(props: CoordinatorActivityPanelProps) {
 
   if (!hasContent) {
     return (
-      <div className="text-xs text-zinc-500 dark:text-zinc-400 italic px-3 py-2">
+      <div className="text-sm text-zinc-500 dark:text-zinc-400 italic px-3 py-2">
         No coordinator activity this turn.
       </div>
     );
@@ -197,7 +197,7 @@ function ScratchpadEntryRow({
         className="w-full text-left flex flex-col gap-0.5"
       >
         <span className="text-[11px] text-zinc-500 dark:text-zinc-400">{entry.writer}</span>
-        <span className="text-xs text-zinc-800 dark:text-zinc-200 whitespace-pre-wrap">
+        <span className="text-sm text-zinc-800 dark:text-zinc-200 whitespace-pre-wrap">
           {expanded ? entry.content : preview}
         </span>
       </button>

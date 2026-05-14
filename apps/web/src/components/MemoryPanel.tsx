@@ -90,7 +90,7 @@ export function MemoryPanel(props: MemoryPanelProps) {
         </div>
       )}
       {totalCount === 0 && !isLoading && !errorMessage && (
-        <div className="text-xs text-zinc-500 dark:text-zinc-400 italic px-3 py-2">
+        <div className="text-sm text-zinc-500 dark:text-zinc-400 italic px-3 py-2">
           No memories saved yet. Aris will save things you tell her here automatically.
         </div>
       )}
@@ -123,7 +123,7 @@ function MemoryRow(props: { fact: ArisFact }) {
         disabled={!hasMore}
         aria-expanded={hasMore ? expanded : undefined}
       >
-        <span className="text-xs text-zinc-800 dark:text-zinc-200 break-words">{fact.label}</span>
+        <span className="text-sm text-zinc-800 dark:text-zinc-200 break-words">{fact.label}</span>
         {expanded && (
           <div className="mt-1 flex flex-col gap-1 text-[11px] text-zinc-600 dark:text-zinc-300 break-words whitespace-pre-wrap">
             {fact.description.length > 0 && (
