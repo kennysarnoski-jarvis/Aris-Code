@@ -6,6 +6,14 @@
 
 @theme inline {
   --animate-skeleton: skeleton 2s -1s infinite linear;
+  /* Send-time entrance animation for user message bubbles. Slide up 8px
+     from below + fade in over 280ms with a decelerating cubic-bezier
+     (Material's "decelerate" curve, gives the soft "settling" feel).
+     Applied via the `animate-message-enter` Tailwind utility on the
+     user bubble div in MessagesTimeline.tsx, gated by a per-mount
+     watermark so virtualized re-mounts and cold-load history don't
+     re-fire it. Tuned to feel similar to Cowork's send-bubble flow. */
+  --animate-message-enter: message-enter 280ms cubic-bezier(0.2, 0, 0, 1);
   --color-warning-foreground: var(--warning-foreground);
   --color-warning: var(--warning);
   --color-success-foreground: var(--success-foreground);
@@ -41,6 +49,16 @@
   @keyframes skeleton {
     to {
       background-position: -200% 0;
+    }
+  }
+  @keyframes message-enter {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
     }
   }
 }

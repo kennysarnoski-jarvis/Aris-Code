@@ -116,6 +116,14 @@ interface TimelineRowSharedState {
   onRevertUserMessage: (messageId: MessageId) => void;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
+  /** Per-mount millisecond watermark used by the user-bubble entrance
+   *  animation gate. Messages with `createdAt > sendAnimationWatermark`
+   *  are treated as "freshly sent during this view's lifetime" and get
+   *  the slide-up + fade-in entrance. Captured once on mount in the
+   *  parent component and propagated through context so the row
+   *  renderer (TimelineRowContent, defined outside the parent's scope)
+   *  can read it. */
+  sendAnimationWatermark: number;
 }
 
 const TimelineRowCtx = createContext<TimelineRowSharedState>(null!);
@@ -201,6 +209,17 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   skills = EMPTY_TIMELINE_SKILLS,
   onIsAtEndChange,
 }: MessagesTimelineProps) {
+  // Send-time entrance animation gate. Captured ONCE on first render of
+  // this MessagesTimeline instance — any user message whose createdAt is
+  // strictly greater than this watermark is treated as "freshly sent
+  // during this view's lifetime" and gets the slide-up + fade-in
+  // entrance. Pre-existing messages (cold-mount thread history,
+  // virtualized re-mounts during scroll) all have older createdAts and
+  // skip the animation. This is the cheapest, most reliable gate that
+  // doesn't require threading per-message "have I been seen" state
+  // through the LegendList renderer.
+  const sendAnimationWatermarkRef = useRef<number>(Date.now());
+
   // Subscribe to the live assistant content stream. The buffer drives a
   // synthetic in-flight assistant row inside the timeline data array (see
   // `deriveMessagesTimelineRows`), so the streaming → settled handoff is
@@ -388,6 +407,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onRevertUserMessage,
       onImageExpand,
       onOpenTurnDiff,
+      sendAnimationWatermark: sendAnimationWatermarkRef.current,
     }),
     [
       activeTurnInProgress,
@@ -542,9 +562,21 @@ function TimelineRowContent({ row }: { row: TimelineRow }) {
           const displayedUserMessage = deriveDisplayedUserMessageState(row.message.text);
           const terminalContexts = displayedUserMessage.contexts;
           const canRevertAgentWork = typeof row.revertTurnCount === "number";
+          // Send-time entrance animation. Only fires for messages whose
+          // createdAt is strictly later than the timeline-mount watermark
+          // — i.e. messages added during this view's lifetime, not
+          // cold-load history or virtualized re-mounts of older bubbles.
+          // The watermark itself is set once on parent mount and rides
+          // in via TimelineRowCtx (see `sendAnimationWatermark` field).
+          const isFreshlySent =
+            new Date(row.message.createdAt).getTime() > ctx.sendAnimationWatermark;
           return (
             <div className="flex justify-end">
-              <div className="group relative max-w-[80%] rounded-2xl rounded-br-sm border border-border bg-secondary px-4 py-3">
+              <div
+                className={`group relative max-w-[80%] rounded-2xl rounded-br-sm border border-border bg-secondary px-4 py-3${
+                  isFreshlySent ? " animate-message-enter" : ""
+                }`}
+              >
                 {userImages.length > 0 && (
                   <div className="mb-2 grid max-w-[420px] grid-cols-2 gap-2">
                     {userImages.map(
