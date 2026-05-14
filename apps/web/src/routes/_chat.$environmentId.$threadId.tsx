@@ -3,6 +3,7 @@ import { Suspense, lazy, type ReactNode, useCallback, useEffect, useMemo, useSta
 
 import ChatView from "../components/ChatView";
 import { threadHasStarted } from "../components/ChatView.logic";
+import { EditorModeView } from "../components/editor/EditorModeView";
 import { DiffWorkerPoolProvider } from "../components/DiffWorkerPoolProvider";
 import {
   DiffPanelHeaderSkeleton,
@@ -237,6 +238,20 @@ function ChatThreadRouteView() {
       },
     });
   }, [markDiffOpened, navigate, threadRef]);
+  // V2 editor mode — `?view=editor` swaps the main window to EditorModeView.
+  // `exitToChat` clears the param; the route owns navigation so EditorModeView
+  // gets this as a callback rather than reaching for the router itself.
+  const editorMode = search.view === "editor";
+  const exitToChat = useCallback(() => {
+    if (!threadRef) {
+      return;
+    }
+    void navigate({
+      to: "/$environmentId/$threadId",
+      params: buildThreadRouteParams(threadRef),
+      search: (previous) => ({ ...previous, view: undefined }),
+    });
+  }, [navigate, threadRef]);
 
   useEffect(() => {
     if (!threadRef || !bootstrapComplete) {
@@ -257,6 +272,17 @@ function ChatThreadRouteView() {
 
   if (!threadRef || !bootstrapComplete || !routeThreadExists) {
     return null;
+  }
+
+  // V2 editor mode is its own early-return branch — it occupies the same
+  // SidebarInset slot ChatView would, but deliberately doesn't entangle
+  // with the diff sheet/sidebar logic below. (Slice 1: empty shell.)
+  if (editorMode) {
+    return (
+      <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
+        <EditorModeView onExitToChat={exitToChat} />
+      </SidebarInset>
+    );
   }
 
   const shouldRenderDiffContent = diffOpen || hasOpenedDiff;
@@ -303,7 +329,7 @@ function ChatThreadRouteView() {
 export const Route = createFileRoute("/_chat/$environmentId/$threadId")({
   validateSearch: (search) => parseDiffRouteSearch(search),
   search: {
-    middlewares: [retainSearchParams<DiffRouteSearch>(["diff"])],
+    middlewares: [retainSearchParams<DiffRouteSearch>(["diff", "view"])],
   },
   component: ChatThreadRouteView,
 });

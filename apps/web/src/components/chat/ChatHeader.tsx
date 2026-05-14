@@ -9,7 +9,7 @@ import { scopeThreadRef } from "@t3tools/client-runtime";
 import { memo } from "react";
 import GitActionsControl from "../GitActionsControl";
 import { type DraftId } from "~/composerDraftStore";
-import { DiffIcon, TerminalSquareIcon } from "lucide-react";
+import { DiffIcon, FileCode2Icon, TerminalSquareIcon } from "lucide-react";
 import { Badge } from "../ui/badge";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import ProjectScriptsControl, { type NewProjectScriptInput } from "../ProjectScriptsControl";
@@ -42,6 +42,8 @@ interface ChatHeaderProps {
   onDeleteProjectScript: (scriptId: string) => Promise<void>;
   onToggleTerminal: () => void;
   onToggleDiff: () => void;
+  /** V2 editor mode — navigates the main window to the Monaco editor view. */
+  onEnterEditor: () => void;
 }
 
 export const ChatHeader = memo(function ChatHeader({
@@ -68,6 +70,7 @@ export const ChatHeader = memo(function ChatHeader({
   onDeleteProjectScript,
   onToggleTerminal,
   onToggleDiff,
+  onEnterEditor,
 }: ChatHeaderProps) {
   return (
     <div className="@container/header-actions flex min-w-0 flex-1 items-center gap-2">
@@ -168,6 +171,28 @@ export const ChatHeader = memo(function ChatHeader({
                 ? `Toggle diff panel (${diffToggleShortcutLabel})`
                 : "Toggle diff panel"}
           </TooltipPopup>
+        </Tooltip>
+        {/* V2 editor mode entry point. One-way: clicking navigates the main
+            window to the editor view, where ChatHeader is no longer
+            rendered — so this stays a plain (never-pressed) Toggle for
+            visual consistency with the terminal/diff cluster rather than a
+            true two-state toggle. */}
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Toggle
+                className="shrink-0"
+                pressed={false}
+                onPressedChange={() => onEnterEditor()}
+                aria-label="Open editor"
+                variant="outline"
+                size="xs"
+              >
+                <FileCode2Icon className="size-3" />
+              </Toggle>
+            }
+          />
+          <TooltipPopup side="bottom">Open editor</TooltipPopup>
         </Tooltip>
       </div>
     </div>

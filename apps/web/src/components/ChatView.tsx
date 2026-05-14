@@ -1748,6 +1748,22 @@ export default function ChatView(props: ChatViewProps) {
     });
   }, [diffOpen, environmentId, isServerThread, navigate, onDiffPanelOpen, threadId]);
 
+  // V2 editor mode — navigates the main window to EditorModeView via the
+  // route's `view` search param. Not a `replace` navigation (unlike the
+  // diff toggle): a history entry means browser-back naturally exits the
+  // editor. The route owns the inverse (`exitToChat`); the empty-shell
+  // EditorModeView has its own "Back to Chat" control too.
+  const onEnterEditor = useCallback(() => {
+    void navigate({
+      to: "/$environmentId/$threadId",
+      params: {
+        environmentId,
+        threadId,
+      },
+      search: (previous) => ({ ...previous, view: "editor" }),
+    });
+  }, [environmentId, navigate, threadId]);
+
   const envLocked = Boolean(
     activeThread &&
     (activeThread.messages.length > 0 ||
@@ -3570,6 +3586,7 @@ export default function ChatView(props: ChatViewProps) {
           onDeleteProjectScript={deleteProjectScript}
           onToggleTerminal={toggleTerminalVisibility}
           onToggleDiff={onToggleDiff}
+          onEnterEditor={onEnterEditor}
         />
       </header>
 
