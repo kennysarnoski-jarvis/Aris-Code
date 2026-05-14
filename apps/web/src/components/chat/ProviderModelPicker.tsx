@@ -68,11 +68,29 @@ const COMING_SOON_PROVIDER_OPTIONS = [
   { id: "gemini", label: "Gemini", icon: Gemini },
 ] as const;
 
-function providerIconClassName(
-  provider: ProviderKind | ProviderPickerKind,
-  fallbackClassName: string,
-): string {
-  return provider === "claudeAgent" ? "text-[#d97757]" : fallbackClassName;
+// Brand color per provider mark — keeps each icon in its recognizable
+// identity color instead of flat muted gray.
+//   - claudeAgent → Anthropic terracotta
+//   - deepseek    → DeepSeek blue (#5786FE, matches the simple-icons mark)
+//   - codex/cursor → OpenAI + Cursor marks are monochrome by brand, so
+//     full-contrast `text-foreground` (black on light / white on dark)
+//     reads cleanest and stays theme-correct
+//   - aris/opencode → no single brand hex (aris is the hidden legacy
+//     provider; opencode is intentionally mono) → fall through to the
+//     caller's fallback class
+//   - gemini → omitted on purpose: its mark carries a baked-in gradient
+//     fill, so a text-color class would be a no-op anyway
+// Keyed by plain string so it also covers the "coming soon" option ids
+// (`opencode`, `gemini`) that aren't part of ProviderPickerKind.
+const PROVIDER_ICON_COLOR_CLASS: Record<string, string> = {
+  claudeAgent: "text-[#d97757]",
+  deepseek: "text-[#5786FE]",
+  codex: "text-foreground",
+  cursor: "text-foreground",
+};
+
+function providerIconClassName(provider: string, fallbackClassName: string): string {
+  return PROVIDER_ICON_COLOR_CLASS[provider] ?? fallbackClassName;
 }
 
 export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
@@ -264,7 +282,10 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
                 <MenuItem key={option.value} disabled>
                   <OptionIcon
                     aria-hidden="true"
-                    className="size-4 shrink-0 text-muted-foreground/85 opacity-80"
+                    className={cn(
+                      "size-4 shrink-0 opacity-80",
+                      providerIconClassName(option.value, "text-muted-foreground/85"),
+                    )}
                   />
                   <span>{option.label}</span>
                   <span className="ms-auto text-[11px] text-muted-foreground/80 uppercase tracking-[0.08em]">
@@ -278,7 +299,13 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
               const OptionIcon = option.icon;
               return (
                 <MenuItem key={option.id} disabled>
-                  <OptionIcon aria-hidden="true" className="size-4 shrink-0 opacity-80" />
+                  <OptionIcon
+                    aria-hidden="true"
+                    className={cn(
+                      "size-4 shrink-0 opacity-80",
+                      providerIconClassName(option.id, "text-muted-foreground/85"),
+                    )}
+                  />
                   <span>{option.label}</span>
                   <span className="ms-auto text-[11px] text-muted-foreground/80 uppercase tracking-[0.08em]">
                     Coming soon
