@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "@tanstack/react-router";
 import { ArrowLeftIcon, FileCode2Icon } from "lucide-react";
+import * as monaco from "monaco-editor";
 
 import { Button } from "../ui/button";
 import { MonacoEditor } from "./MonacoEditor";
@@ -16,16 +17,18 @@ import { resolveThreadRouteRef } from "../../threadRoutes";
 /**
  * EditorModeView — the V2 editor mode shell.
  *
- * Slice 4: the editor is now multi-tab. Clicking a file in the tree
- * opens it as a tab (or re-activates an already-open one); tabs
- * accumulate across the strip above Monaco. Each tab's fetched contents
- * are kept in a per-path cache (`tabStates`) so switching back to an
- * already-loaded tab is instant — only the first open of a file hits
- * the `readFile` RPC. Closing a tab falls back to a neighbour.
+ * Multi-tab (Slice 4): clicking a file in the tree opens it as a tab
+ * (or re-activates an already-open one); tabs accumulate across the
+ * strip above Monaco. Closing a tab falls back to a neighbour.
  *
- * Slices 5–6 layer theming and agent-edit reflection on top — this
- * slice doesn't change the readFile/listTree pipes, only how many
- * files can be open at once.
+ * Model-per-tab (Slice 6a-i): each open file is backed by its own
+ * Monaco `ITextModel`, held in the `tabStates` cache. The model *is*
+ * the buffer — switching tabs swaps `editor.setModel()` rather than
+ * re-`setValue`-ing a shared model, so each tab keeps its own undo
+ * history, cursor, and scroll. The editor is writable; Cmd-S save +
+ * dirty tracking land in 6a-ii. This view owns the full model
+ * lifecycle: created when a `readFile` resolves, disposed when the tab
+ * closes, the project switches, or editor mode unmounts.
  *
  * Two independent async state machines: `treeState` (the listTree fetch
  * + built tree) and the per-tab `tabStates` cache (a `readFile` fetch
@@ -100,12 +103,19 @@ type TreeState =
 
 /**
  * Per-tab file state. The `ready` variant doubles as the content cache:
- * once a tab is `ready`, switching away and back never refetches.
+ * once a tab is `ready`, switching away and back never refetches. Its
+ * `model` is the live Monaco buffer for that file — owned here, and
+ * disposed when the tab/project/view goes away.
  */
 type TabFileState =
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "ready"; relativePath: string; contents: string; truncated: boolean };
+  | {
+      status: "ready";
+      relativePath: string;
+      model: monaco.editor.ITextModel;
+      truncated: boolean;
+    };
 
 export default function EditorModeView(props: { onExitToChat: () => void }) {
   const routeThreadRef = useParams({
@@ -144,8 +154,15 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   // Effect 1 — load the project tree. Runs once per project. Resets the
   // whole tab strip up front so stale tabs from the previous project
   // can't briefly drive Effect 2 against the new cwd; the auto-pick
-  // below re-seeds a single tab once the fresh index lands.
+  // below re-seeds a single tab once the fresh index lands. The
+  // previous project's models are disposed before the reset — they
+  // belong to a cwd we're leaving.
   useEffect(() => {
+    for (const state of tabStatesRef.current.values()) {
+      if (state.status === "ready") {
+        state.model.dispose();
+      }
+    }
     setOpenTabs([]);
     setActiveTabPath(null);
     setTabStates(new Map());
@@ -224,11 +241,18 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
         if (cancelled) {
           return;
         }
+        // The model is the editable buffer for this tab. Created here on
+        // first open and cached in `tabStates`; disposed by the tab
+        // close / project switch / unmount paths.
+        const model = monaco.editor.createModel(
+          result.contents,
+          languageFromPath(result.relativePath),
+        );
         setTabStates((prev) =>
           new Map(prev).set(path, {
             status: "ready",
             relativePath: result.relativePath,
-            contents: result.contents,
+            model,
             truncated: result.truncated,
           }),
         );
@@ -273,12 +297,19 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   // the live strip even if multiple closes land in one tick. When the
   // active tab closes, focus falls to the tab that took its index slot
   // (i.e. the former right neighbour), or the new last tab if it was at
-  // the end. The cached content is dropped — reopening refetches.
+  // the end. The cached state — including the Monaco model — is dropped;
+  // reopening the file refetches and rebuilds a fresh model.
   const onCloseTab = useCallback((path: string) => {
     const current = openTabsRef.current;
     const closingIndex = current.indexOf(path);
     if (closingIndex === -1) {
       return;
+    }
+    // Dispose the model before dropping the tab — read off the ref so
+    // disposal stays outside the (otherwise pure) state updater.
+    const closingState = tabStatesRef.current.get(path);
+    if (closingState?.status === "ready") {
+      closingState.model.dispose();
     }
     const nextTabs = current.filter((tab) => tab !== path);
     setOpenTabs(nextTabs);
@@ -302,6 +333,20 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     });
   }, []);
 
+  // Dispose every open model when editor mode unmounts (e.g. "Back to
+  // Chat"). The tab-close and project-switch paths handle the
+  // incremental cases; this catches the wholesale teardown so models
+  // don't leak past the view that owns them.
+  useEffect(() => {
+    return () => {
+      for (const state of tabStatesRef.current.values()) {
+        if (state.status === "ready") {
+          state.model.dispose();
+        }
+      }
+    };
+  }, []);
+
   // Resizable tree pane — long file paths get clipped at a fixed width,
   // so the user drags the divider to size it. Width persists across
   // reloads.
@@ -313,6 +358,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   });
 
   const activeTabState = activeTabPath ? (tabStates.get(activeTabPath) ?? null) : null;
+  const activeModel = activeTabState?.status === "ready" ? activeTabState.model : null;
 
   const headerPath =
     activeTabState?.status === "ready"
@@ -374,22 +420,22 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
             onSelectTab={onSelectTab}
             onCloseTab={onCloseTab}
           />
-          <div className="min-h-0 min-w-0 flex-1">
-            {activeTabState?.status === "ready" ? (
-              <MonacoEditor
-                value={activeTabState.contents}
-                language={languageFromPath(activeTabState.relativePath)}
-                readOnly
-              />
-            ) : (
-              <div className="flex h-full items-center justify-center p-8 text-center text-sm text-muted-foreground">
+          {/* The editor instance is mounted for the lifetime of editor
+              mode — models swap in/out as tabs change. The loading /
+              error / empty states render as an opaque overlay rather
+              than unmounting Monaco, so the widget (and its view state)
+              survives a tab that's mid-fetch. */}
+          <div className="relative min-h-0 min-w-0 flex-1">
+            <MonacoEditor model={activeModel} />
+            {activeTabState?.status !== "ready" ? (
+              <div className="absolute inset-0 flex items-center justify-center bg-background p-8 text-center text-sm text-muted-foreground">
                 {activeTabState?.status === "loading"
                   ? "Loading file..."
                   : activeTabState?.status === "error"
                     ? activeTabState.message
                     : "Select a file from the tree to view it."}
               </div>
-            )}
+            ) : null}
           </div>
         </div>
       </div>
