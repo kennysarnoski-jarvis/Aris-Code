@@ -39,10 +39,15 @@ export function MonacoEditor(props: {
   model: monaco.editor.ITextModel | null;
   readOnly?: boolean;
   wordWrap?: boolean;
+  onCursorChange?: (position: { line: number; column: number }) => void;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const { resolvedTheme } = useTheme();
+  // Latest `onCursorChange` in a ref — the cursor listener is bound
+  // once on mount, so it can't close over a stale handler.
+  const onCursorChangeRef = useRef(props.onCursorChange);
+  onCursorChangeRef.current = props.onCursorChange;
 
   // Theme effect — declared *before* the mount effect so the global
   // Monaco theme is defined + active before `monaco.editor.create()`
@@ -197,6 +202,16 @@ export function MonacoEditor(props: {
       })();
     };
     container.addEventListener("contextmenu", onContainerContextMenu);
+    // Cursor position feed for the status bar. Goes through the ref so
+    // the listener stays stable; setModel below also re-emits so the
+    // bar refreshes on tab switch even when Monaco doesn't fire its
+    // own cursor event.
+    const cursorListener = editor.onDidChangeCursorPosition((event) => {
+      onCursorChangeRef.current?.({
+        line: event.position.lineNumber,
+        column: event.position.column,
+      });
+    });
     // Cmd-S is bound at the window level in `EditorModeView` (capture
     // phase) so it works regardless of focus — we don't add it here so
     // we don't risk double-firing the save callback.
@@ -209,6 +224,7 @@ export function MonacoEditor(props: {
     return () => {
       container.removeEventListener("mousedown", onContainerMouseDown, { capture: true });
       container.removeEventListener("contextmenu", onContainerContextMenu);
+      cursorListener.dispose();
       editor.dispose();
       editorRef.current = null;
     };
@@ -220,10 +236,22 @@ export function MonacoEditor(props: {
   // model's own undo stack / cursor / scroll, which is the whole reason
   // editor mode uses a model per open file. The identity guard avoids a
   // redundant re-set on mount (the editor was already created with it).
+  // Re-emits the cursor position after the swap so the status bar
+  // reflects the new model's caret immediately, even if Monaco doesn't
+  // fire its own cursor event for the model change.
   useEffect(() => {
     const editor = editorRef.current;
-    if (editor && editor.getModel() !== props.model) {
+    if (!editor) {
+      return;
+    }
+    if (editor.getModel() !== props.model) {
       editor.setModel(props.model);
+    }
+    if (props.model) {
+      const pos = editor.getPosition();
+      if (pos) {
+        onCursorChangeRef.current?.({ line: pos.lineNumber, column: pos.column });
+      }
     }
   }, [props.model]);
 
