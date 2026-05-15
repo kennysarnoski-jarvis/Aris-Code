@@ -20,6 +20,9 @@ import type { FileTreeNode } from "./fileTreeModel";
  * icon can't load (e.g. offline). Folders use the closed-folder icon
  * regardless of expansion; the rotating chevron carries open/closed.
  *
+ * Directory rows accept a right-click via `onFolderContextMenu`, which
+ * `EditorModeView` turns into a "New File" menu scoped to that folder.
+ *
  * Expansion state is local component state per row — deliberately not
  * lifted. React keys are stable paths, so collapse state survives
  * re-renders within a project; switching projects produces a fresh
@@ -29,6 +32,7 @@ export const FileTree = memo(function FileTree(props: {
   nodes: readonly FileTreeNode[];
   activePath: string | null;
   onSelectFile: (path: string) => void;
+  onFolderContextMenu?: (folderPath: string, position: { x: number; y: number }) => void;
 }) {
   const { resolvedTheme } = useTheme();
   return (
@@ -41,6 +45,7 @@ export const FileTree = memo(function FileTree(props: {
           theme={resolvedTheme}
           activePath={props.activePath}
           onSelectFile={props.onSelectFile}
+          onFolderContextMenu={props.onFolderContextMenu}
         />
       ))}
     </ul>
@@ -56,8 +61,11 @@ function FileTreeRow(props: {
   theme: "light" | "dark";
   activePath: string | null;
   onSelectFile: (path: string) => void;
+  // Always threaded through the recursion (may be `undefined`) — not
+  // optional, so it satisfies `exactOptionalPropertyTypes`.
+  onFolderContextMenu: ((folderPath: string, position: { x: number; y: number }) => void) | undefined;
 }) {
-  const { node, depth, theme, activePath, onSelectFile } = props;
+  const { node, depth, theme, activePath, onSelectFile, onFolderContextMenu } = props;
   const [expanded, setExpanded] = useState(depth === 0);
 
   if (node.kind === "directory") {
@@ -66,6 +74,14 @@ function FileTreeRow(props: {
         <button
           type="button"
           onClick={() => setExpanded((value) => !value)}
+          onContextMenu={
+            onFolderContextMenu
+              ? (event) => {
+                  event.preventDefault();
+                  onFolderContextMenu(node.path, { x: event.clientX, y: event.clientY });
+                }
+              : undefined
+          }
           className="flex w-full items-center gap-1.5 py-0.5 pr-2 text-left text-muted-foreground hover:bg-accent hover:text-foreground"
           style={{ paddingLeft: `${depth * INDENT_PER_DEPTH_PX + ROW_BASE_PADDING_PX}px` }}
           aria-expanded={expanded}
@@ -92,6 +108,7 @@ function FileTreeRow(props: {
                 theme={theme}
                 activePath={activePath}
                 onSelectFile={onSelectFile}
+                onFolderContextMenu={onFolderContextMenu}
               />
             ))}
           </ul>

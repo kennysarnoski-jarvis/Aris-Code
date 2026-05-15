@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "@tanstack/react-router";
-import { ArrowLeftIcon, FileCode2Icon } from "lucide-react";
+import { ArrowLeftIcon, FileCode2Icon, FilePlusIcon, WrapTextIcon } from "lucide-react";
 import * as monaco from "monaco-editor";
 
 import { Button } from "../ui/button";
 import { MonacoEditor } from "./MonacoEditor";
 import { FileTree } from "./FileTree";
 import { EditorTabStrip } from "./EditorTabStrip";
+import { EditorQuickOpen } from "./EditorQuickOpen";
 import { buildFileTree, type FileTreeNode } from "./fileTreeModel";
 import { useResizablePaneWidth } from "./useResizablePaneWidth";
 import { readEnvironmentApi } from "../../environmentApi";
+import { readLocalApi } from "../../localApi";
 import { selectProjectByRef, useStore } from "../../store";
 import { createThreadSelectorByRef } from "../../storeSelectors";
 import { resolveThreadRouteRef } from "../../threadRoutes";
@@ -25,10 +27,39 @@ import { resolveThreadRouteRef } from "../../threadRoutes";
  * Monaco `ITextModel`, held in the `tabStates` cache. The model *is*
  * the buffer — switching tabs swaps `editor.setModel()` rather than
  * re-`setValue`-ing a shared model, so each tab keeps its own undo
- * history, cursor, and scroll. The editor is writable; Cmd-S save +
- * dirty tracking land in 6a-ii. This view owns the full model
+ * history, cursor, and scroll. This view owns the full model
  * lifecycle: created when a `readFile` resolves, disposed when the tab
  * closes, the project switches, or editor mode unmounts.
+ *
+ * Save + dirty tracking (Slice 6a-ii): a tab is dirty when its model's
+ * `getAlternativeVersionId()` differs from the version id last written
+ * to disk — so undoing back to the saved state clears the dirty mark,
+ * the way VS Code behaves. Cmd-S writes the active model through
+ * `projects.writeFile`. Truncated files (the readFile size cap was
+ * hit) open read-only — writing a truncated buffer back would chop the
+ * real file.
+ *
+ * Unsaved-edit guards (Slice 6c): closing a dirty tab, or leaving
+ * editor mode entirely (which unmounts this view and disposes every
+ * model), prompts a confirm first — a stray click shouldn't silently
+ * drop unsaved work.
+ *
+ * Quick-open (Slice 7b): Cmd-P opens `EditorQuickOpen`, a fuzzy file
+ * palette over `projects.searchEntries`. The keybinding is a
+ * window-level listener owned here so it works regardless of focus;
+ * the palette component is only mounted while open.
+ *
+ * Quality-of-life (Slice 7c): Cmd-W closes the active tab (sharing the
+ * window-level keydown listener with Cmd-P), and a header toggle drives
+ * Monaco word wrap — persisted to localStorage so it survives reloads.
+ *
+ * New File (Slices 8a/8b): the file-tree header + reveals an inline
+ * input that writes an empty file via `projects.writeFile` (which
+ * creates parent dirs), reloads the tree, and opens it as a tab.
+ * Right-clicking a folder offers "New File" and scopes that same input
+ * to the clicked folder — the input shows the folder as a fixed prefix
+ * so the destination is always answered. An inline input rather than
+ * `window.prompt` — reliable in the Electron renderer, and nicer.
  *
  * Two independent async state machines: `treeState` (the listTree fetch
  * + built tree) and the per-tab `tabStates` cache (a `readFile` fetch
@@ -99,13 +130,21 @@ type TreeState =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "ready"; nodes: FileTreeNode[]; fileCount: number };
+  | {
+      status: "ready";
+      nodes: FileTreeNode[];
+      fileCount: number;
+      // Flat set of every file path in the project — backs the New File
+      // duplicate check without re-walking the nested tree.
+      filePaths: ReadonlySet<string>;
+    };
 
 /**
  * Per-tab file state. The `ready` variant doubles as the content cache:
  * once a tab is `ready`, switching away and back never refetches. Its
  * `model` is the live Monaco buffer for that file — owned here, and
- * disposed when the tab/project/view goes away.
+ * disposed (with its `contentListener`) when the tab/project/view goes
+ * away.
  */
 type TabFileState =
   | { status: "loading" }
@@ -114,8 +153,16 @@ type TabFileState =
       status: "ready";
       relativePath: string;
       model: monaco.editor.ITextModel;
+      // The model's alternative-version-id at the last successful write
+      // (or initial load). The tab is dirty once the model moves off it.
+      savedVersionId: number;
+      // `onDidChangeContent` subscription that recomputes `dirtyPaths`;
+      // disposed alongside the model.
+      contentListener: monaco.IDisposable;
       truncated: boolean;
     };
+
+const WORD_WRAP_STORAGE_KEY = "aris-editor-word-wrap";
 
 export default function EditorModeView(props: { onExitToChat: () => void }) {
   const routeThreadRef = useParams({
@@ -146,10 +193,36 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   const [openTabs, setOpenTabs] = useState<string[]>([]);
   const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
   const [tabStates, setTabStates] = useState<Map<string, TabFileState>>(new Map());
+  // Paths with unsaved edits — drives the dirty dot in the tab strip.
+  // Kept as its own state (not derived) because dirtiness flips on every
+  // keystroke via each model's `onDidChangeContent` listener.
+  const [dirtyPaths, setDirtyPaths] = useState<ReadonlySet<string>>(new Set());
+  // Last save failure, surfaced in the header until the next successful
+  // save, a switch to a different tab's error, or a project switch.
+  const [saveError, setSaveError] = useState<{ path: string; message: string } | null>(null);
+  // Cmd-P fuzzy file palette open/closed.
+  const [quickOpenActive, setQuickOpenActive] = useState(false);
+  // Editor word wrap — header toggle, persisted across reloads.
+  const [wordWrap, setWordWrap] = useState<boolean>(
+    () =>
+      typeof window !== "undefined" &&
+      window.localStorage.getItem(WORD_WRAP_STORAGE_KEY) === "on",
+  );
+  // New File inline input — `null` means not creating. When active,
+  // `folderPath` is the destination folder ("" = project root) and
+  // `draft` is the in-progress name the user is typing. `newFileError`
+  // surfaces a duplicate/write failure beneath the input without a
+  // dialog.
+  const [newFile, setNewFile] = useState<{ folderPath: string; draft: string } | null>(null);
+  const [newFileError, setNewFileError] = useState<string | null>(null);
   const openTabsRef = useRef(openTabs);
   openTabsRef.current = openTabs;
+  const activeTabPathRef = useRef(activeTabPath);
+  activeTabPathRef.current = activeTabPath;
   const tabStatesRef = useRef(tabStates);
   tabStatesRef.current = tabStates;
+  const dirtyPathsRef = useRef(dirtyPaths);
+  dirtyPathsRef.current = dirtyPaths;
 
   // Effect 1 — load the project tree. Runs once per project. Resets the
   // whole tab strip up front so stale tabs from the previous project
@@ -160,12 +233,15 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   useEffect(() => {
     for (const state of tabStatesRef.current.values()) {
       if (state.status === "ready") {
+        state.contentListener.dispose();
         state.model.dispose();
       }
     }
     setOpenTabs([]);
     setActiveTabPath(null);
     setTabStates(new Map());
+    setDirtyPaths(new Set());
+    setSaveError(null);
     if (!environmentId || !activeCwd) {
       setTreeState({ status: "idle" });
       return;
@@ -187,7 +263,12 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
         }
         const nodes = buildFileTree(tree.entries);
         const files = tree.entries.filter((entry) => entry.kind === "file");
-        setTreeState({ status: "ready", nodes, fileCount: files.length });
+        setTreeState({
+          status: "ready",
+          nodes,
+          fileCount: files.length,
+          filePaths: new Set(files.map((entry) => entry.path)),
+        });
         // Auto-pick the first non-dotfile for immediate content. Dotfiles
         // (`.DS_Store`, `.gitignore`, ...) are rarely what you want first
         // and `.DS_Store` is binary; the server's binary guard is still
@@ -248,11 +329,36 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
           result.contents,
           languageFromPath(result.relativePath),
         );
+        const savedVersionId = model.getAlternativeVersionId();
+        // Recompute this tab's dirty mark on every edit. Reads the
+        // *current* `savedVersionId` off the ref so a save (which
+        // advances it) is reflected without re-binding the listener.
+        const contentListener = model.onDidChangeContent(() => {
+          const current = tabStatesRef.current.get(path);
+          if (current?.status !== "ready") {
+            return;
+          }
+          const isDirty = model.getAlternativeVersionId() !== current.savedVersionId;
+          setDirtyPaths((prev) => {
+            if (prev.has(path) === isDirty) {
+              return prev;
+            }
+            const next = new Set(prev);
+            if (isDirty) {
+              next.add(path);
+            } else {
+              next.delete(path);
+            }
+            return next;
+          });
+        });
         setTabStates((prev) =>
           new Map(prev).set(path, {
             status: "ready",
             relativePath: result.relativePath,
             model,
+            savedVersionId,
+            contentListener,
             truncated: result.truncated,
           }),
         );
@@ -305,10 +411,20 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     if (closingIndex === -1) {
       return;
     }
-    // Dispose the model before dropping the tab — read off the ref so
-    // disposal stays outside the (otherwise pure) state updater.
+    // Closing a dirty tab drops its buffer — confirm first so an
+    // unsaved file isn't lost to a stray click on the ×.
+    if (
+      dirtyPathsRef.current.has(path) &&
+      !window.confirm(`${basenameOf(path)} has unsaved changes. Close anyway?`)
+    ) {
+      return;
+    }
+    // Dispose the model + its dirty listener before dropping the tab —
+    // read off the ref so disposal stays outside the (otherwise pure)
+    // state updaters.
     const closingState = tabStatesRef.current.get(path);
     if (closingState?.status === "ready") {
+      closingState.contentListener.dispose();
       closingState.model.dispose();
     }
     const nextTabs = current.filter((tab) => tab !== path);
@@ -321,6 +437,15 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
       next.delete(path);
       return next;
     });
+    setDirtyPaths((prev) => {
+      if (!prev.has(path)) {
+        return prev;
+      }
+      const next = new Set(prev);
+      next.delete(path);
+      return next;
+    });
+    setSaveError((prev) => (prev?.path === path ? null : prev));
     setActiveTabPath((prevActive) => {
       if (prevActive !== path) {
         return prevActive;
@@ -333,19 +458,215 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     });
   }, []);
 
-  // Dispose every open model when editor mode unmounts (e.g. "Back to
-  // Chat"). The tab-close and project-switch paths handle the
-  // incremental cases; this catches the wholesale teardown so models
-  // don't leak past the view that owns them.
+  // Dispose every open model + listener when editor mode unmounts (e.g.
+  // "Back to Chat"). The tab-close and project-switch paths handle the
+  // incremental cases; this catches the wholesale teardown so nothing
+  // leaks past the view that owns it.
   useEffect(() => {
     return () => {
       for (const state of tabStatesRef.current.values()) {
         if (state.status === "ready") {
+          state.contentListener.dispose();
           state.model.dispose();
         }
       }
     };
   }, []);
+
+  // Window-level keyboard shortcuts for editor mode (capture phase so
+  // they fire regardless of focus and win over OS defaults). Bound for
+  // the lifetime of editor mode — this view only exists in editor mode.
+  //   Cmd/Ctrl-P — open the fuzzy file palette (beats the print shortcut)
+  //   Cmd/Ctrl-W — close the active tab (beats closing the window);
+  //                with no tab open it falls through to the default.
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) {
+        return;
+      }
+      if (event.code === "KeyP") {
+        event.preventDefault();
+        setQuickOpenActive(true);
+        return;
+      }
+      if (event.code === "KeyW") {
+        const path = activeTabPathRef.current;
+        if (path) {
+          event.preventDefault();
+          onCloseTab(path);
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, { capture: true });
+    };
+  }, [onCloseTab]);
+
+  // Persist the word-wrap choice so it survives reloads.
+  useEffect(() => {
+    window.localStorage.setItem(WORD_WRAP_STORAGE_KEY, wordWrap ? "on" : "off");
+  }, [wordWrap]);
+
+  // Save the active tab's buffer to disk — invoked by Cmd-S through
+  // `MonacoEditor`. No-ops unless the active tab is `ready` and
+  // non-truncated: a truncated buffer is only a prefix of the file, so
+  // writing it back would chop the rest (the editor also opens
+  // truncated files read-only as the first line of defence).
+  // `versionId` is captured *before* the await — edits made while the
+  // write is in flight keep the tab dirty rather than being silently
+  // folded into the saved state.
+  const onSave = useCallback(() => {
+    const path = activeTabPathRef.current;
+    if (!path || !environmentId || !activeCwd) {
+      return;
+    }
+    const state = tabStatesRef.current.get(path);
+    if (state?.status !== "ready" || state.truncated) {
+      return;
+    }
+    const api = readEnvironmentApi(environmentId);
+    if (!api) {
+      setSaveError({ path, message: "Environment connection unavailable." });
+      return;
+    }
+    const { model } = state;
+    const contents = model.getValue();
+    const versionId = model.getAlternativeVersionId();
+    void (async () => {
+      try {
+        await api.projects.writeFile({ cwd: activeCwd, relativePath: path, contents });
+        // The tab may have closed (and its model disposed) mid-write.
+        const latest = tabStatesRef.current.get(path);
+        if (latest?.status !== "ready") {
+          return;
+        }
+        setTabStates((prev) => {
+          const entry = prev.get(path);
+          if (entry?.status !== "ready") {
+            return prev;
+          }
+          return new Map(prev).set(path, { ...entry, savedVersionId: versionId });
+        });
+        // Edits that landed during the write leave the tab dirty
+        // against the version we just persisted.
+        const stillDirty = latest.model.getAlternativeVersionId() !== versionId;
+        setDirtyPaths((prev) => {
+          if (prev.has(path) === stillDirty) {
+            return prev;
+          }
+          const next = new Set(prev);
+          if (stillDirty) {
+            next.add(path);
+          } else {
+            next.delete(path);
+          }
+          return next;
+        });
+        setSaveError((prev) => (prev?.path === path ? null : prev));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to save file.";
+        setSaveError({ path, message });
+      }
+    })();
+  }, [environmentId, activeCwd]);
+
+  // "Back to Chat" fully unmounts editor mode, disposing every model —
+  // so any unsaved edits would vanish without a trace. Confirm first
+  // when any tab is dirty. Editor mode is a whole-window mode, so this
+  // and the per-tab × are the only ways out.
+  const onExitToChat = props.onExitToChat;
+  const handleExitToChat = useCallback(() => {
+    const dirtyCount = dirtyPathsRef.current.size;
+    if (dirtyCount > 0) {
+      const subject = dirtyCount === 1 ? "file has" : "files have";
+      if (
+        !window.confirm(
+          `${dirtyCount} ${subject} unsaved changes. Leave the editor anyway?`,
+        )
+      ) {
+        return;
+      }
+    }
+    onExitToChat();
+  }, [onExitToChat]);
+
+  // Commit the New File inline input: write an empty file, reload the
+  // tree so it appears, and open it as a tab. `writeFile` creates any
+  // missing parent directories, so a `path/to/new.ts` draft just works.
+  // Failures (duplicate path, write error) keep the input open with the
+  // reason shown beneath it.
+  const commitNewFile = useCallback(() => {
+    if (!environmentId || !activeCwd || newFile === null) {
+      return;
+    }
+    const base = newFile.draft.trim();
+    if (base.length === 0) {
+      setNewFile(null);
+      setNewFileError(null);
+      return;
+    }
+    // The destination folder is fixed by where New File was triggered
+    // ("" = project root); the user only types the name (or a sub-path).
+    const relativePath = newFile.folderPath ? `${newFile.folderPath}/${base}` : base;
+    if (treeState.status === "ready" && treeState.filePaths.has(relativePath)) {
+      setNewFileError(`"${relativePath}" already exists`);
+      return;
+    }
+    const api = readEnvironmentApi(environmentId);
+    if (!api) {
+      setNewFileError("Environment connection unavailable.");
+      return;
+    }
+    void (async () => {
+      try {
+        const result = await api.projects.writeFile({
+          cwd: activeCwd,
+          relativePath,
+          contents: "",
+        });
+        // Reload the tree off the (now cache-invalidated) index so the
+        // new file shows up. This only touches `treeState` — open tabs
+        // and the active selection are left alone.
+        const tree = await api.projects.listTree({ cwd: activeCwd });
+        const nodes = buildFileTree(tree.entries);
+        const files = tree.entries.filter((entry) => entry.kind === "file");
+        setTreeState({
+          status: "ready",
+          nodes,
+          fileCount: files.length,
+          filePaths: new Set(files.map((entry) => entry.path)),
+        });
+        setNewFile(null);
+        setNewFileError(null);
+        onSelectFile(result.relativePath);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to create file.";
+        setNewFileError(message);
+      }
+    })();
+  }, [environmentId, activeCwd, newFile, treeState, onSelectFile]);
+
+  // Right-click on a folder row → a "New File" menu scoped to that
+  // folder. Picking it opens the inline input with the folder as a
+  // fixed prefix, so the user only types the filename.
+  const handleFolderContextMenu = useCallback(
+    async (folderPath: string, position: { x: number; y: number }) => {
+      const api = readLocalApi();
+      if (!api) {
+        return;
+      }
+      const clicked = await api.contextMenu.show(
+        [{ id: "new-file", label: "New File" }],
+        position,
+      );
+      if (clicked === "new-file") {
+        setNewFileError(null);
+        setNewFile({ folderPath, draft: "" });
+      }
+    },
+    [],
+  );
 
   // Resizable tree pane — long file paths get clipped at a fixed width,
   // so the user drags the divider to size it. Width persists across
@@ -359,6 +680,9 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
 
   const activeTabState = activeTabPath ? (tabStates.get(activeTabPath) ?? null) : null;
   const activeModel = activeTabState?.status === "ready" ? activeTabState.model : null;
+  // Truncated files open read-only — writing back a partial buffer
+  // would chop the file. See `onSave`.
+  const activeIsTruncated = activeTabState?.status === "ready" && activeTabState.truncated;
 
   const headerPath =
     activeTabState?.status === "ready"
@@ -379,29 +703,120 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
               {treeState.fileCount} {treeState.fileCount === 1 ? "file" : "files"}
             </span>
           ) : null}
+          {saveError ? (
+            <span className="min-w-0 shrink truncate text-xs text-destructive">
+              Save failed: {saveError.message}
+            </span>
+          ) : null}
         </div>
-        <Button variant="outline" size="sm" onClick={props.onExitToChat} className="shrink-0">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setWordWrap((value) => !value)}
+          className={`shrink-0 ${wordWrap ? "bg-accent text-foreground" : ""}`}
+          aria-pressed={wordWrap}
+          title={wordWrap ? "Word wrap: on" : "Word wrap: off"}
+        >
+          <WrapTextIcon className="size-3.5" aria-hidden />
+        </Button>
+        <Button variant="outline" size="sm" onClick={handleExitToChat} className="shrink-0">
           <ArrowLeftIcon className="size-3.5" aria-hidden />
           Back to Chat
         </Button>
       </header>
       <div className="flex min-h-0 flex-1">
-        <aside className="shrink-0 overflow-auto" style={{ width: `${treePaneWidth}px` }}>
-          {treeState.status === "ready" ? (
-            <FileTree
-              nodes={treeState.nodes}
-              activePath={activeTabPath}
-              onSelectFile={onSelectFile}
-            />
-          ) : (
-            <div className="p-4 text-sm text-muted-foreground">
-              {treeState.status === "loading"
-                ? "Loading files..."
-                : treeState.status === "error"
-                  ? treeState.message
-                  : "No project workspace available for this thread."}
+        <aside
+          className="flex shrink-0 flex-col overflow-hidden"
+          style={{ width: `${treePaneWidth}px` }}
+        >
+          {/* File-tree header — the New File affordance. The + reveals
+              an inline path input; committing it routes through
+              `commitNewFile`. */}
+          <div className="flex h-8 shrink-0 items-center gap-1 border-b border-border pr-1 pl-3">
+            {newFile === null ? (
+              <>
+                <span className="flex-1 text-xs font-medium text-muted-foreground">Files</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNewFileError(null);
+                    setNewFile({ folderPath: "", draft: "" });
+                  }}
+                  disabled={!environmentId || !activeCwd}
+                  title="New file"
+                  aria-label="New file"
+                  className="flex size-6 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+                >
+                  <FilePlusIcon className="size-3.5" aria-hidden />
+                </button>
+              </>
+            ) : (
+              <div className="flex min-w-0 flex-1 items-center">
+                {newFile.folderPath ? (
+                  <span
+                    className="shrink-0 truncate text-xs text-muted-foreground/60"
+                    title={newFile.folderPath}
+                  >
+                    {newFile.folderPath}/
+                  </span>
+                ) : null}
+                <input
+                  autoFocus
+                  type="text"
+                  value={newFile.draft}
+                  placeholder={newFile.folderPath ? "new-file.ts" : "path/to/new-file.ts"}
+                  onChange={(event) => {
+                    setNewFile({ folderPath: newFile.folderPath, draft: event.target.value });
+                    setNewFileError(null);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      commitNewFile();
+                    } else if (event.key === "Escape") {
+                      event.preventDefault();
+                      setNewFile(null);
+                      setNewFileError(null);
+                    }
+                  }}
+                  onBlur={() => {
+                    setNewFile(null);
+                    setNewFileError(null);
+                  }}
+                  className="h-6 min-w-0 flex-1 rounded-sm bg-transparent px-1 text-xs text-foreground outline-none placeholder:text-muted-foreground/60"
+                />
+              </div>
+            )}
+          </div>
+          {newFileError ? (
+            <div className="shrink-0 border-b border-border px-3 py-1 text-xs text-destructive">
+              {newFileError}
             </div>
-          )}
+          ) : null}
+          <div className="min-h-0 flex-1 overflow-auto">
+            {treeState.status === "ready" ? (
+              treeState.fileCount === 0 ? (
+                <div className="p-4 text-sm text-muted-foreground">
+                  No files yet — use + above to create one.
+                </div>
+              ) : (
+                <FileTree
+                  nodes={treeState.nodes}
+                  activePath={activeTabPath}
+                  onSelectFile={onSelectFile}
+                  onFolderContextMenu={handleFolderContextMenu}
+                />
+              )
+            ) : (
+              <div className="p-4 text-sm text-muted-foreground">
+                {treeState.status === "loading"
+                  ? "Loading files..."
+                  : treeState.status === "error"
+                    ? treeState.message
+                    : "No project workspace available for this thread."}
+              </div>
+            )}
+          </div>
         </aside>
         {/* Drag handle — doubles as the visual divider between the tree
             pane and the editor. Wider than a 1px border so it's an
@@ -417,6 +832,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
           <EditorTabStrip
             tabs={openTabs}
             activeTabPath={activeTabPath}
+            dirtyPaths={dirtyPaths}
             onSelectTab={onSelectTab}
             onCloseTab={onCloseTab}
           />
@@ -426,7 +842,12 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
               than unmounting Monaco, so the widget (and its view state)
               survives a tab that's mid-fetch. */}
           <div className="relative min-h-0 min-w-0 flex-1">
-            <MonacoEditor model={activeModel} />
+            <MonacoEditor
+              model={activeModel}
+              readOnly={activeIsTruncated}
+              wordWrap={wordWrap}
+              onSave={onSave}
+            />
             {activeTabState?.status !== "ready" ? (
               <div className="absolute inset-0 flex items-center justify-center bg-background p-8 text-center text-sm text-muted-foreground">
                 {activeTabState?.status === "loading"
@@ -439,6 +860,14 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
           </div>
         </div>
       </div>
+      {quickOpenActive && environmentId && activeCwd ? (
+        <EditorQuickOpen
+          cwd={activeCwd}
+          environmentId={environmentId}
+          onClose={() => setQuickOpenActive(false)}
+          onPickFile={onSelectFile}
+        />
+      ) : null}
     </div>
   );
 }
