@@ -1,7 +1,9 @@
 import { memo, useState } from "react";
-import { ChevronRightIcon, FileIcon, FolderIcon, FolderOpenIcon } from "lucide-react";
+import { ChevronRightIcon } from "lucide-react";
 
 import { cn } from "~/lib/utils";
+import { useTheme } from "../../hooks/useTheme";
+import { VscodeEntryIcon } from "../chat/VscodeEntryIcon";
 import type { FileTreeNode } from "./fileTreeModel";
 
 /**
@@ -13,6 +15,11 @@ import type { FileTreeNode } from "./fileTreeModel";
  * expanded so the project's top-level structure is visible on open;
  * deeper directories start collapsed.
  *
+ * Row icons come from the shared vscode-icons set (`VscodeEntryIcon`) —
+ * type-specific and theme-aware, with a lucide fallback when the CDN
+ * icon can't load (e.g. offline). Folders use the closed-folder icon
+ * regardless of expansion; the rotating chevron carries open/closed.
+ *
  * Expansion state is local component state per row — deliberately not
  * lifted. React keys are stable paths, so collapse state survives
  * re-renders within a project; switching projects produces a fresh
@@ -23,6 +30,7 @@ export const FileTree = memo(function FileTree(props: {
   activePath: string | null;
   onSelectFile: (path: string) => void;
 }) {
+  const { resolvedTheme } = useTheme();
   return (
     <ul className="py-1 text-sm">
       {props.nodes.map((node) => (
@@ -30,6 +38,7 @@ export const FileTree = memo(function FileTree(props: {
           key={node.path}
           node={node}
           depth={0}
+          theme={resolvedTheme}
           activePath={props.activePath}
           onSelectFile={props.onSelectFile}
         />
@@ -44,10 +53,11 @@ const ROW_BASE_PADDING_PX = 8;
 function FileTreeRow(props: {
   node: FileTreeNode;
   depth: number;
+  theme: "light" | "dark";
   activePath: string | null;
   onSelectFile: (path: string) => void;
 }) {
-  const { node, depth, activePath, onSelectFile } = props;
+  const { node, depth, theme, activePath, onSelectFile } = props;
   const [expanded, setExpanded] = useState(depth === 0);
 
   if (node.kind === "directory") {
@@ -64,11 +74,12 @@ function FileTreeRow(props: {
             className={cn("size-3 shrink-0 transition-transform", expanded && "rotate-90")}
             aria-hidden
           />
-          {expanded ? (
-            <FolderOpenIcon className="size-3.5 shrink-0" aria-hidden />
-          ) : (
-            <FolderIcon className="size-3.5 shrink-0" aria-hidden />
-          )}
+          <VscodeEntryIcon
+            pathValue={node.path}
+            kind="directory"
+            theme={theme}
+            className="size-3.5"
+          />
           <span className="min-w-0 truncate">{node.name}</span>
         </button>
         {expanded && node.children.length > 0 ? (
@@ -78,6 +89,7 @@ function FileTreeRow(props: {
                 key={child.path}
                 node={child}
                 depth={depth + 1}
+                theme={theme}
                 activePath={activePath}
                 onSelectFile={onSelectFile}
               />
@@ -107,7 +119,7 @@ function FileTreeRow(props: {
         }}
         aria-current={isActive ? "true" : undefined}
       >
-        <FileIcon className="size-3.5 shrink-0" aria-hidden />
+        <VscodeEntryIcon pathValue={node.path} kind="file" theme={theme} className="size-3.5" />
         <span className="min-w-0 truncate">{node.name}</span>
       </button>
     </li>
