@@ -121,9 +121,36 @@ function syncDesktopTheme(theme: Theme) {
   });
 }
 
-// Apply immediately on module load to prevent flash
+// Apply the stored theme immediately on module load (prevents a flash),
+// and wire the app-global theme listeners *once* — independent of
+// component lifecycle.
+//
+// These listeners used to live inside `subscribe`, which meant OS
+// dark/light changes (and cross-window theme changes) only propagated
+// while some component happened to be calling `useTheme()`. Following
+// the OS `prefers-color-scheme` is an application-global concern, not a
+// per-component one — so it belongs here, set up once for the lifetime
+// of the renderer. `subscribe` is now purely the React re-render hookup.
 if (typeof document !== "undefined" && hasThemeStorage()) {
   applyTheme(getStored());
+
+  window.matchMedia(MEDIA_QUERY).addEventListener("change", () => {
+    // Only "system" follows the OS; an explicit light/dark pick is fixed.
+    if (getStored() === "system") {
+      applyTheme("system", true);
+    }
+    // Re-render any mounted `useTheme()` consumers (e.g. so Monaco
+    // re-skins). A no-op when none are mounted — `applyTheme` above has
+    // already toggled the `.dark` class, which re-skins the CSS layer.
+    emitChange();
+  });
+
+  window.addEventListener("storage", (event) => {
+    if (event.key === STORAGE_KEY) {
+      applyTheme(getStored(), true);
+      emitChange();
+    }
+  });
 }
 
 function getSnapshot(): ThemeSnapshot {
@@ -145,29 +172,12 @@ function getServerSnapshot() {
 
 function subscribe(listener: () => void): () => void {
   if (typeof window === "undefined") return () => {};
+  // Just the React re-render hookup. The OS-preference and cross-window
+  // listeners are wired once at module load (above), so theme-following
+  // works regardless of which components are currently mounted.
   listeners.push(listener);
-
-  // Listen for system preference changes
-  const mq = window.matchMedia(MEDIA_QUERY);
-  const handleChange = () => {
-    if (getStored() === "system") applyTheme("system", true);
-    emitChange();
-  };
-  mq.addEventListener("change", handleChange);
-
-  // Listen for storage changes from other tabs
-  const handleStorage = (e: StorageEvent) => {
-    if (e.key === STORAGE_KEY) {
-      applyTheme(getStored(), true);
-      emitChange();
-    }
-  };
-  window.addEventListener("storage", handleStorage);
-
   return () => {
     listeners = listeners.filter((l) => l !== listener);
-    mq.removeEventListener("change", handleChange);
-    window.removeEventListener("storage", handleStorage);
   };
 }
 
