@@ -38,7 +38,7 @@ import { randomUUID } from "node:crypto";
 
 import { Data } from "effect";
 
-import { getThreadArchiveDir } from "./RollingWindowMemory.ts";
+import { getThreadArchiveDir, type RollingWindowConfig } from "./RollingWindowMemory.ts";
 
 const SESSION_SCRATCHPAD_FILE_PREFIX = "coordinator-";
 const SESSION_SCRATCHPAD_FILE_SUFFIX = ".jsonl";
@@ -81,12 +81,13 @@ export interface SessionScratchpadEntry {
  * cleanup/backup semantics as conversation history.
  */
 export function getSessionScratchpadPath(
+  config: RollingWindowConfig,
   cwd: string,
   threadId: string,
   parentTurnId: string,
 ): string {
   return join(
-    getThreadArchiveDir(cwd, threadId),
+    getThreadArchiveDir(config, cwd, threadId),
     `${SESSION_SCRATCHPAD_FILE_PREFIX}${parentTurnId}${SESSION_SCRATCHPAD_FILE_SUFFIX}`,
   );
 }
@@ -97,8 +98,12 @@ export function getSessionScratchpadPath(
  * adapter on first append. Safe to call before every session-
  * scratchpad append.
  */
-export async function ensureSessionScratchpadDir(cwd: string, threadId: string): Promise<void> {
-  await fs.mkdir(getThreadArchiveDir(cwd, threadId), { recursive: true });
+export async function ensureSessionScratchpadDir(
+  config: RollingWindowConfig,
+  cwd: string,
+  threadId: string,
+): Promise<void> {
+  await fs.mkdir(getThreadArchiveDir(config, cwd, threadId), { recursive: true });
 }
 
 /**
@@ -132,11 +137,12 @@ function parseEntry(line: string): SessionScratchpadEntry | null {
  * file doesn't exist (no writes yet this turn).
  */
 export async function readSessionScratchpadEntries(
+  config: RollingWindowConfig,
   cwd: string,
   threadId: string,
   parentTurnId: string,
 ): Promise<ReadonlyArray<SessionScratchpadEntry>> {
-  const path = getSessionScratchpadPath(cwd, threadId, parentTurnId);
+  const path = getSessionScratchpadPath(config, cwd, threadId, parentTurnId);
   let raw: string;
   try {
     raw = await fs.readFile(path, "utf8");
@@ -164,14 +170,15 @@ export async function readSessionScratchpadEntries(
  * level (O_APPEND), fsynced via flush:true.
  */
 export async function appendSessionScratchpadEntry(
+  config: RollingWindowConfig,
   cwd: string,
   threadId: string,
   parentTurnId: string,
   entry: SessionScratchpadEntry,
 ): Promise<void> {
-  await ensureSessionScratchpadDir(cwd, threadId);
+  await ensureSessionScratchpadDir(config, cwd, threadId);
   const line = JSON.stringify(entry) + "\n";
-  await fs.appendFile(getSessionScratchpadPath(cwd, threadId, parentTurnId), line, {
+  await fs.appendFile(getSessionScratchpadPath(config, cwd, threadId, parentTurnId), line, {
     encoding: "utf8",
     flush: true,
   });

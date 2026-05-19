@@ -1,3 +1,4 @@
+import { lstat as nodeLstat } from "node:fs/promises";
 import {
   Cache,
   Data,
@@ -923,10 +924,12 @@ export const makeGitCore = Effect.fn("makeGitCore")(function* (options?: {
   ): Effect.Effect<void, GitCommandError> => {
     const fetchCwd =
       path.basename(gitCommonDir) === ".git" ? path.dirname(gitCommonDir) : gitCommonDir;
+    // Slice R / M4-9.3 — `--` before remoteName so a config-injected
+    // remote like `--upload-pack=evil` can't be parsed as a flag.
     return executeGit(
       "GitCore.fetchRemoteForStatus",
       fetchCwd,
-      ["--git-dir", gitCommonDir, "fetch", "--quiet", "--no-tags", remoteName],
+      ["--git-dir", gitCommonDir, "fetch", "--quiet", "--no-tags", "--", remoteName],
       {
         allowNonZeroExit: true,
         timeoutMs: Duration.toMillis(STATUS_UPSTREAM_REFRESH_TIMEOUT),
@@ -1080,7 +1083,16 @@ export const makeGitCore = Effect.fn("makeGitCore")(function* (options?: {
       suffix += 1;
     }
 
-    yield* runGit("GitCore.ensureRemote.add", input.cwd, ["remote", "add", remoteName, input.url]);
+    // Slice R / M4-9.4 — `--` before input.url so an API-supplied
+    // URL like `--upload-pack=evil` or `-t evil-branch` can't be
+    // parsed as a flag. HIGH severity — wire-input attack vector.
+    yield* runGit("GitCore.ensureRemote.add", input.cwd, [
+      "remote",
+      "add",
+      remoteName,
+      "--",
+      input.url,
+    ]);
     return remoteName;
   });
 
@@ -1146,6 +1158,19 @@ export const makeGitCore = Effect.fn("makeGitCore")(function* (options?: {
       return 0;
     }
 
+    // Slice R / M4-9.5 — `--` separator NOT applicable here.
+    //
+    // `git rev-list <commits> -- <pathspec>` uses `--` to separate
+    // revision range from pathspec. Inserting `--` BEFORE the range
+    // makes git parse the range string as a pathspec (no files
+    // match → count returns 0). Aris's audit flagged this site but
+    // `bun run test` caught the regression: `expected 1 to be 0` in
+    // computes-ahead-count tests.
+    //
+    // Defense-in-depth for the original concern (baseBranch from
+    // git config could be `--all`) belongs in the resolver layer —
+    // `resolveBaseBranchForNoUpstream` should validate the candidate
+    // doesn't start with `-`. Deferred to a future slice.
     const result = yield* executeGit(
       "GitCore.computeAheadCountAgainstBase",
       cwd,
@@ -1943,15 +1968,210 @@ export const makeGitCore = Effect.fn("makeGitCore")(function* (options?: {
     };
   });
 
+  // Slice B / H5 + Slice F.3 / M-2B — shared worktree path validator.
+  //
+  // `git worktree add` and `git worktree remove` both accept a path
+  // argument that lands directly on the filesystem (add populates,
+  // remove deletes). When that path is user-controlled (model-emitted
+  // or UI-supplied), it MUST be confined to a known-safe parent
+  // location — otherwise an attacker can ask git to materialize repo
+  // content into `/etc/evil` or unwind a worktree registration whose
+  // path points at `~/Documents/important-dir`.
+  //
+  // Containment is enforced against EITHER of two legitimate parents:
+  //
+  //   1. `worktreesDir` — the configured app worktrees directory
+  //      (`~/.aris/worktrees` by default). The createWorktree
+  //      default-path branch lives here by construction.
+  //
+  //   2. `cwd` — the project's working directory. Lets callers place
+  //      worktrees inside the repo (a common git pattern, used by
+  //      tests and some advanced workflows).
+  //
+  // Paths that resolve anywhere else (`/etc`, `~/.ssh`, sibling
+  // directories, etc.) are rejected with a descriptive detail.
+  //
+  // Returns `null` when the path is acceptable, or a detail string
+  // explaining the rejection. Callers wrap the detail in their own
+  // `GitCommandError` so the diagnostic surfaces the correct
+  // operation/command context.
+  //
+  // The NUL-byte check uses a regex literal /\0/ — earlier Slice B
+  // edits showed that the source-level representation of a literal
+  // NUL byte is editor/format-tool-sensitive; the escape form is
+  // unambiguous in source and always matches the actual NUL
+  // character at runtime.
+  // Slice H.4 / H3-4 fix (2026-05-16) — promote the worktree path
+  // validator to a realpath-walking containment check. Mirrors the
+  // pattern already shipped in `WorkspacePaths.validateContainment`
+  // (Slice B / C1 fix).
+  //
+  // Pre-Slice-H, this function used pure string arithmetic
+  // (`path.resolve` + `path.relative`) to verify containment. That's
+  // sufficient against syntactic traversal (`../../etc`), but a
+  // symlink INSIDE `worktreesDir` pointing OUTSIDE it passed the
+  // string check because `path.relative` doesn't touch the filesystem.
+  // Attack: `worktreesDir/evil → /etc`; `git worktree remove
+  // worktreesDir/evil --force` follows the symlink and unwinds the
+  // outside target.
+  //
+  // The new walker:
+  //   1. Null-byte rejection (existing).
+  //   2. String-level containment as fast reject (existing — catches
+  //      `..` traversal and absolute-path escapes before any FS hit).
+  //   3. Realpath the chosen containment root once (handles macOS
+  //      `/tmp → /private/tmp` and equivalent OS-level symlinks).
+  //   4. Walk the resolved target from the real root component-by-
+  //      component, `lstat`'ing each. Symlinks → `realPath` + re-verify
+  //      containment. Broken symlinks → reject (can't verify). Missing
+  //      components → break (we're past the deepest-existing prefix,
+  //      remainder is to-be-created or already-removed).
+  //   5. TOCTOU defense: if any symlink was encountered during the
+  //      walk, `realPath` the deepest existing dir ONCE MORE at the
+  //      end to catch a swap of a regular dir for a symlink between
+  //      our per-component lstats and now.
+  //
+  // Returns an `Effect<string | null>` — `null` means accepted, a
+  // string is the rejection detail the caller wraps in
+  // `GitCommandError`. Lean on the existing realpath-walker prior
+  // art in `WorkspacePaths.validateContainment` for the algorithm
+  // shape so future maintenance touches one mental model, not two.
+  const validateWorktreePath = (targetPath: string, cwd: string): Effect.Effect<string | null> =>
+    Effect.gen(function* () {
+      if (/\0/.test(targetPath)) {
+        return "Worktree path cannot contain null bytes.";
+      }
+      const resolvedTarget = path.resolve(targetPath);
+
+      const isContainedStringwise = (root: string): boolean => {
+        const rel = path.relative(root, resolvedTarget);
+        if (rel.length === 0 || rel === ".") return false;
+        return !rel.startsWith("..") && !path.isAbsolute(rel);
+      };
+      const insideWorktreesDir = isContainedStringwise(worktreesDir);
+      const insideCwd = isContainedStringwise(cwd);
+      if (!insideWorktreesDir && !insideCwd) {
+        return `Worktree path must be inside the worktrees directory (${worktreesDir}) or the project working directory.`;
+      }
+
+      // Realpath the containing root. If it doesn't exist yet (fresh
+      // install where `~/.aris/worktrees/` hasn't been provisioned),
+      // fall back to the syntactic resolve — there can't be a symlink
+      // inside a directory that doesn't exist, so symlink defense is
+      // moot in that branch.
+      const containingRoot = insideWorktreesDir ? worktreesDir : cwd;
+      const realRootResult = yield* fileSystem.realPath(containingRoot).pipe(
+        Effect.map((p) => ({ ok: true as const, value: p })),
+        Effect.catch(() => Effect.succeed({ ok: false as const })),
+      );
+      const realRoot = realRootResult.ok ? realRootResult.value : path.resolve(containingRoot);
+
+      const rel = path.relative(containingRoot, resolvedTarget);
+      const parts = rel.split(/[/\\]/).filter((p) => p.length > 0 && p !== ".");
+
+      let current = realRoot;
+      let deepestExisting = realRoot;
+      let sawSymlink = false;
+
+      for (let i = 0; i < parts.length; i += 1) {
+        const part = parts[i]!;
+        if (part === "..") {
+          // Defense in depth — string check above already rejected
+          // traversal, but never trust prior checks.
+          return "Worktree path traversal sequences rejected.";
+        }
+        const next = path.join(current, part);
+
+        const lstatResult = yield* Effect.tryPromise(() => nodeLstat(next)).pipe(
+          Effect.map((info) => ({ ok: true as const, info })),
+          Effect.catch(() => Effect.succeed({ ok: false as const })),
+        );
+
+        if (!lstatResult.ok) {
+          // Component doesn't exist (yet, or anymore). Rest of the
+          // path is to-be-created (createWorktree) or already-removed
+          // (removeWorktree). Deepest existing ancestor is `current`.
+          deepestExisting = current;
+          break;
+        }
+
+        if (lstatResult.info.isSymbolicLink()) {
+          sawSymlink = true;
+          const realNextResult = yield* fileSystem.realPath(next).pipe(
+            Effect.map((p) => ({ ok: true as const, value: p })),
+            Effect.catch(() => Effect.succeed({ ok: false as const })),
+          );
+          if (!realNextResult.ok) {
+            return "Broken symlink in worktree path — cannot verify containment.";
+          }
+          const realRel = path.relative(realRoot, realNextResult.value);
+          if (realRel.startsWith("..") || path.isAbsolute(realRel)) {
+            return "Worktree path resolves outside the containment root via a symlink.";
+          }
+          current = realNextResult.value;
+          deepestExisting = current;
+        } else {
+          current = next;
+          deepestExisting = current;
+        }
+      }
+
+      // TOCTOU defense: realpath the deepest existing directory once
+      // more if any symlink was encountered. Catches a swap between
+      // our per-component lstats and the caller's git invocation.
+      if (sawSymlink) {
+        const realDeepestResult = yield* fileSystem.realPath(deepestExisting).pipe(
+          Effect.map((p) => ({ ok: true as const, value: p })),
+          Effect.catch(() => Effect.succeed({ ok: false as const })),
+        );
+        if (!realDeepestResult.ok) {
+          return "Worktree path resolution failed during containment re-check.";
+        }
+        const realDeepestRel = path.relative(realRoot, realDeepestResult.value);
+        if (realDeepestRel.startsWith("..") || path.isAbsolute(realDeepestRel)) {
+          return "Worktree path resolves outside the containment root via a symlink (TOCTOU re-check).";
+        }
+      }
+
+      return null;
+    });
+
   const createWorktree: GitCoreShape["createWorktree"] = Effect.fn("createWorktree")(
     function* (input) {
       const targetBranch = input.newBranch ?? input.branch;
       const sanitizedBranch = targetBranch.replace(/\//g, "-");
       const repoName = path.basename(input.cwd);
       const worktreePath = input.path ?? path.join(worktreesDir, repoName, sanitizedBranch);
+
+      // Slice B / H5 — gate an attacker-controlled `input.path` via
+      // the shared `validateWorktreePath` helper. Production callers
+      // in `GitManager.ts` and `ws.ts` always pass `path: null`, so
+      // they hit the default-path branch above and skip this check
+      // entirely. The validation only fires when a caller explicitly
+      // provides a path — typically tests or future UI features.
+      if (typeof input.path === "string") {
+        const detail = yield* validateWorktreePath(input.path, input.cwd);
+        if (detail !== null) {
+          return yield* new GitCommandError({
+            operation: "GitCore.createWorktree",
+            command: `worktree add ${input.path} ${input.branch}`,
+            cwd: input.cwd,
+            detail,
+          });
+        }
+      }
+
+      // Slice J.2 / M3-6 fix (2026-05-16) — `--` separator before any
+      // user-controlled arguments. Branch names like `--upload-pack=evil`
+      // or `--exec=evil` get parsed by `git worktree add` as flags
+      // when they appear in argv positions that accept flags. Once
+      // `--` is seen, git treats remaining args as positional. The
+      // ordering matters: `-b` and its branch-name value must come
+      // BEFORE `--` (since `-b` is a flag git needs to parse); the
+      // user-controlled `worktreePath` and `input.branch` come AFTER.
       const args = input.newBranch
-        ? ["worktree", "add", "-b", input.newBranch, worktreePath, input.branch]
-        : ["worktree", "add", worktreePath, input.branch];
+        ? ["worktree", "add", "-b", input.newBranch, "--", worktreePath, input.branch]
+        : ["worktree", "add", "--", worktreePath, input.branch];
 
       yield* executeGit("GitCore.createWorktree", input.cwd, args, {
         fallbackErrorMessage: "git worktree add failed",
@@ -1970,6 +2190,9 @@ export const makeGitCore = Effect.fn("makeGitCore")(function* (options?: {
     "fetchPullRequestBranch",
   )(function* (input) {
     const remoteName = yield* resolvePrimaryRemoteName(input.cwd);
+    // Slice R / M4-9.9 — `--` before remoteName + refspec so a
+    // crafted remote name from repo config can't inject transport
+    // flags like `--upload-pack=evil`.
     yield* executeGit(
       "GitCore.fetchPullRequestBranch",
       input.cwd,
@@ -1977,6 +2200,7 @@ export const makeGitCore = Effect.fn("makeGitCore")(function* (options?: {
         "fetch",
         "--quiet",
         "--no-tags",
+        "--",
         remoteName,
         `+refs/pull/${input.prNumber}/head:refs/heads/${input.branch}`,
       ],
@@ -1988,22 +2212,29 @@ export const makeGitCore = Effect.fn("makeGitCore")(function* (options?: {
 
   const fetchRemoteBranch: GitCoreShape["fetchRemoteBranch"] = Effect.fn("fetchRemoteBranch")(
     function* (input) {
+      // Slice R / M4-9 runGit wrapper (fetch) — `--` before
+      // input.remoteName so an API-supplied remote name can't inject
+      // transport flags. HIGH severity — wire-input attack vector.
       yield* runGit("GitCore.fetchRemoteBranch.fetch", input.cwd, [
         "fetch",
         "--quiet",
         "--no-tags",
+        "--",
         input.remoteName,
         `+refs/heads/${input.remoteBranch}:refs/remotes/${input.remoteName}/${input.remoteBranch}`,
       ]);
 
       const localBranchAlreadyExists = yield* branchExists(input.cwd, input.localBranch);
       const targetRef = `${input.remoteName}/${input.remoteBranch}`;
+      // Slice R / M4-9 runGit wrapper (materialize) — `--` before
+      // input.localBranch + targetRef so a branch name like `-d` or
+      // `-f` can't override the create-vs-force decision.
       yield* runGit(
         "GitCore.fetchRemoteBranch.materialize",
         input.cwd,
         localBranchAlreadyExists
-          ? ["branch", "--force", input.localBranch, targetRef]
-          : ["branch", input.localBranch, targetRef],
+          ? ["branch", "--force", "--", input.localBranch, targetRef]
+          : ["branch", "--", input.localBranch, targetRef],
       );
     },
   );
@@ -2018,11 +2249,32 @@ export const makeGitCore = Effect.fn("makeGitCore")(function* (options?: {
 
   const removeWorktree: GitCoreShape["removeWorktree"] = Effect.fn("removeWorktree")(
     function* (input) {
+      // Slice F.3 / M-2B + Slice H.4 / H3-4 — gate `input.path` through
+      // the shared `validateWorktreePath` helper. Slice F.3 introduced
+      // the gate but used string-only containment; Slice H.4 promotes
+      // it to a realpath walker so a symlink inside `worktreesDir`
+      // pointing outside can no longer pass the check. Same
+      // containment rules apply: path must resolve inside
+      // `worktreesDir` or `input.cwd`, evaluated against the real
+      // filesystem (not just the syntactic string form).
+      const detail = yield* validateWorktreePath(input.path, input.cwd);
+      if (detail !== null) {
+        return yield* new GitCommandError({
+          operation: "GitCore.removeWorktree",
+          command: `worktree remove ${input.path}`,
+          cwd: input.cwd,
+          detail,
+        });
+      }
+
       const args = ["worktree", "remove"];
       if (input.force) {
         args.push("--force");
       }
-      args.push(input.path);
+      // Slice R / M4-9.6 — `--` before input.path so an API-supplied
+      // path like `-f` can't override the explicit --force decision
+      // (or worse, inject `--expire=<time>` style flags). HIGH severity.
+      args.push("--", input.path);
       yield* executeGit("GitCore.removeWorktree", input.cwd, args, {
         timeoutMs: 15_000,
         fallbackErrorMessage: "git worktree remove failed",
@@ -2117,6 +2369,25 @@ export const makeGitCore = Effect.fn("makeGitCore")(function* (options?: {
             ).pipe(Effect.map((result) => result.code === 0))
           : false;
 
+      // Slice R / M4-9.7 — `--` separator NOT applicable here.
+      //
+      // `git checkout <name>` is the branch-switch form. `git checkout
+      // -- <name>` is the FILE-RESTORE form (pathspec). They are
+      // semantically distinct — inserting `--` changes the operation
+      // from "switch to branch foo" to "restore file foo from index".
+      // Aris's Round 5 audit flagged this site as needing `--` but
+      // the fix was reverted after `bun run test` caught the
+      // regression: `error: pathspec 'feature' did not match any
+      // file(s) known to git`.
+      //
+      // The original defensive concern (branch name like `-b evil`
+      // injects a flag) needs a different defense for this site:
+      // validate `input.branch` against a safe-name regex before
+      // dispatch. That validation belongs to the contract layer
+      // (`Schema.pattern` on the branch field) or a runtime
+      // `assertSafeBranchName` guard here. Deferred to a future
+      // slice — the existing contract uses `TrimmedNonEmptyString`
+      // which doesn't constrain leading `-`.
       const checkoutArgs = localInputExists
         ? ["checkout", input.branch]
         : remoteExists && !localTrackingBranch && localTrackedBranchTargetExists
@@ -2142,7 +2413,11 @@ export const makeGitCore = Effect.fn("makeGitCore")(function* (options?: {
   );
 
   const createBranch: GitCoreShape["createBranch"] = Effect.fn("createBranch")(function* (input) {
-    yield* executeGit("GitCore.createBranch", input.cwd, ["branch", input.branch], {
+    // Slice R / M4-9.8 — `--` before input.branch so a wire-input
+    // branch like `-d <existing>` can't delete an existing branch
+    // through this path. HIGH severity — sibling of renameBranch
+    // (Slice J.2) which already has the separator.
+    yield* executeGit("GitCore.createBranch", input.cwd, ["branch", "--", input.branch], {
       timeoutMs: 10_000,
       fallbackErrorMessage: "git branch create failed",
     });

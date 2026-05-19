@@ -23,10 +23,13 @@
  */
 import type { ArisEvent } from "@t3tools/contracts";
 
+import type { AgentTemplate } from "./ArisAgentTemplatesLoader.ts";
 import { createArisAgentTools, type ArisAgentToolsOptions } from "./ArisAgentTools.ts";
 import { createDeepSeekAgentTool } from "./DeepSeekAgentTool.ts";
 import { createDeepSeekArchiveTools } from "./DeepSeekArchiveTools.ts";
 import { createDeepSeekFactsTools } from "./DeepSeekFactsTool.ts";
+import type { FactsConfig } from "./FactsMemory.ts";
+import type { RollingWindowConfig } from "./RollingWindowMemory.ts";
 import { createDeepSeekScratchpadTool } from "./DeepSeekScratchpadTool.ts";
 import { createDeepSeekSearchTools } from "./DeepSeekSearchTools.ts";
 import { createDeepSeekWebSearchTools } from "./DeepSeekWebSearchTools.ts";
@@ -41,6 +44,12 @@ export interface DeepSeekAgentToolsOptions extends ArisAgentToolsOptions {
    * directory. The base Aris tools don't need it.
    */
   readonly threadId: string;
+  /**
+   * Slice L / M3-2 — resolved rolling-window paths from the adapter
+   * composition root. Threaded through to archive tools so they
+   * don't reach for `homedir()` implicitly.
+   */
+  readonly rollingWindowConfig: RollingWindowConfig;
   /**
    * COORD-1 — cloud creds + default model needed by `spawn_worker`
    * to construct fresh OpenAIClients for sub-agents. Optional so
@@ -60,6 +69,13 @@ export interface DeepSeekAgentToolsOptions extends ArisAgentToolsOptions {
    */
   readonly parentTurnId?: string;
   /**
+   * MEM-3 — FactsConfig carrying resolved paths for the user-global
+   * facts store. Required so `createDeepSeekFactsTools` doesn't
+   * call `homedir()` implicitly at tool-execute time. Production
+   * callers pass `makeFactsConfig()`; tests pass a temp-dir config.
+   */
+  readonly factsConfig: FactsConfig;
+  /**
    * COORD-6.1 — emit aris.worker.spawn.* and
    * aris.session_scratchpad.appended events when workers spawn /
    * complete and when entries are appended. The adapter passes a
@@ -67,6 +83,16 @@ export interface DeepSeekAgentToolsOptions extends ArisAgentToolsOptions {
    * hook. Optional so non-adapter callers can skip the event channel.
    */
   readonly emitCoordinatorEvent?: (event: ArisEvent) => void;
+  /**
+   * Slice 4 — Pre-baked agent templates from `.aris/agents/`. Threaded
+   * through to `createDeepSeekAgentTool` so spawn_worker's tool
+   * description includes the template manifest and its execute() can
+   * look up templates by name. Optional — when absent, spawn_worker
+   * works exactly like the pre-Slice-4 behavior (the `template` param
+   * still validates as a string but always returns the unknown-template
+   * error string because there are no templates to look up).
+   */
+  readonly templates?: ReadonlyArray<AgentTemplate>;
 }
 
 export function createDeepSeekAgentTools(opts: DeepSeekAgentToolsOptions) {
@@ -83,6 +109,7 @@ export function createDeepSeekAgentTools(opts: DeepSeekAgentToolsOptions) {
   const archiveTools = createDeepSeekArchiveTools({
     cwd: opts.cwd,
     threadId: opts.threadId,
+    rollingWindowConfig: opts.rollingWindowConfig,
   });
   // MEM-1 — Scratchpad tool. Like archive tools, gated on cwd because
   // the underlying jsonl lives at `~/.aris/projects/<key>/scratchpad.jsonl`
@@ -99,7 +126,7 @@ export function createDeepSeekAgentTools(opts: DeepSeekAgentToolsOptions) {
   // surface when cwd is present, but `createDeepSeekFactsTools`
   // takes no context — facts are scoped to the host user, not the
   // project).
-  const factsTools = createDeepSeekFactsTools();
+  const factsTools = createDeepSeekFactsTools(opts.factsConfig);
   // KG search tools (search_knowledge / search_cve / search_code).
   // Backed by the cloud's `/api/local/search/*` routes which run the
   // 3-pass + GAT rescore pipeline against the Lightsail-hosted
@@ -135,6 +162,7 @@ export function createDeepSeekAgentTools(opts: DeepSeekAgentToolsOptions) {
   // dependency chain.
   const sessionScratchpadTools = opts.parentTurnId
     ? createDeepSeekSessionScratchpadTools({
+        rollingWindowConfig: opts.rollingWindowConfig,
         cwd: opts.cwd,
         threadId: opts.threadId,
         parentTurnId: opts.parentTurnId,
@@ -174,6 +202,7 @@ export function createDeepSeekAgentTools(opts: DeepSeekAgentToolsOptions) {
           ...(opts.parentTurnId
             ? {
                 sessionScratchpadCtx: {
+                  rollingWindowConfig: opts.rollingWindowConfig,
                   cwd: opts.cwd,
                   threadId: opts.threadId,
                   parentTurnId: opts.parentTurnId,
@@ -181,6 +210,10 @@ export function createDeepSeekAgentTools(opts: DeepSeekAgentToolsOptions) {
               }
             : {}),
           ...(opts.emitCoordinatorEvent ? { emitCoordinatorEvent: opts.emitCoordinatorEvent } : {}),
+          // Slice 4 — templates pass through unchanged. Omitted-when-
+          // absent matches the conditional-spread pattern used for the
+          // other optional deps to satisfy `exactOptionalPropertyTypes`.
+          ...(opts.templates ? { templates: opts.templates } : {}),
         })
       : [];
   return [...parentTools, ...agentToolFamily];

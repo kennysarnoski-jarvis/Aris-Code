@@ -136,9 +136,28 @@ export const AuthPairingCredentialResult = Schema.Struct({
 });
 export type AuthPairingCredentialResult = typeof AuthPairingCredentialResult.Type;
 
+/**
+ * Slice F.2 / M-2E fix (2026-05-16) — `credential` is now an optional
+ * field on `AuthPairingLink`, present ONLY in the one-shot issue
+ * response and the matching `pairingLinkUpserted` live-stream event.
+ * Subsequent listings (HTTP `GET /api/auth/pairing-links`, WS
+ * subscribeAuthAccess snapshot) MUST omit it.
+ *
+ * Pre-Slice-F.2 the field was required, which forced both the HTTP
+ * list endpoint and the WS snapshot to keep emitting the raw
+ * credential on every fetch — meaning an owner cookie holder could
+ * re-read it any time, server response logs captured it, and the UI
+ * happily re-rendered it for share-URL copying long after issue. The
+ * standard one-shot-secret pattern (AWS access keys, GitHub PATs) is
+ * "credential is shown once at issue time, never again."
+ *
+ * Consumers must treat `credential` as `undefined` for re-fetched
+ * links and surface a "revoke + reissue" path if a fresh share URL
+ * is needed.
+ */
 export const AuthPairingLink = Schema.Struct({
   id: TrimmedNonEmptyString,
-  credential: TrimmedNonEmptyString,
+  credential: Schema.optionalKey(TrimmedNonEmptyString),
   role: AuthSessionRole,
   subject: TrimmedNonEmptyString,
   label: Schema.optionalKey(TrimmedNonEmptyString),

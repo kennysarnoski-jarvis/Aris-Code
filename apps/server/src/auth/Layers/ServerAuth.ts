@@ -95,8 +95,14 @@ export const makeServerAuth = Effect.gen(function* () {
   const authenticateRequest = (request: HttpServerRequest.HttpServerRequest) => {
     const cookieToken = request.cookies[sessions.cookieName];
     const bearerToken = parseBearerToken(request);
-    const credential = cookieToken ?? bearerToken;
-    if (!credential) {
+    // Slice J.4 / M3-13 fix (2026-05-16) — try BOTH tokens, fall
+    // through on the first one's failure to the second. Pre-Slice-J
+    // this used `cookieToken ?? bearerToken` — if the cookie was
+    // present-but-invalid (stale, corrupted, revoked) the bearer was
+    // silently ignored. Result: a client with a valid Authorization
+    // header could be denied because their browser still had an old
+    // cookie. DoS for any caller that had both.
+    if (!cookieToken && !bearerToken) {
       return Effect.fail(
         new AuthError({
           message: "Authentication required.",
@@ -104,7 +110,14 @@ export const makeServerAuth = Effect.gen(function* () {
         }),
       );
     }
-    return authenticateToken(credential);
+    if (cookieToken && bearerToken) {
+      // Prefer cookie (the typical browser path), fall through to
+      // bearer if cookie auth fails for any reason.
+      return authenticateToken(cookieToken).pipe(
+        Effect.catch(() => authenticateToken(bearerToken)),
+      );
+    }
+    return authenticateToken((cookieToken ?? bearerToken)!);
   };
 
   const getSessionState: ServerAuthShape["getSessionState"] = (request) =>

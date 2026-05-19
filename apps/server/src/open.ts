@@ -312,9 +312,7 @@ export const launchDetached = (launch: EditorLaunch) =>
           },
         );
       } catch (error) {
-        return resume(
-          Effect.fail(new OpenError({ message: "failed to spawn detached process", cause: error })),
-        );
+        return resume(Effect.fail(new OpenError({ message: "failed to spawn detached process" })));
       }
 
       const handleSpawn = () => {
@@ -323,8 +321,8 @@ export const launchDetached = (launch: EditorLaunch) =>
       };
 
       child.once("spawn", handleSpawn);
-      child.once("error", (cause) =>
-        resume(Effect.fail(new OpenError({ message: "failed to spawn detached process", cause }))),
+      child.once("error", (_cause) =>
+        resume(Effect.fail(new OpenError({ message: "failed to spawn detached process" }))),
       );
     });
   });
@@ -332,14 +330,14 @@ export const launchDetached = (launch: EditorLaunch) =>
 const make = Effect.gen(function* () {
   const open = yield* Effect.tryPromise({
     try: () => import("open"),
-    catch: (cause) => new OpenError({ message: "failed to load browser opener", cause }),
+    catch: (_cause) => new OpenError({ message: "failed to load browser opener" }),
   });
 
   return {
     openBrowser: (target) =>
       Effect.tryPromise({
         try: () => open.default(target),
-        catch: (cause) => new OpenError({ message: "Browser auto-open failed", cause }),
+        catch: (_cause) => new OpenError({ message: "Browser auto-open failed" }),
       }),
     openInEditor: (input) => Effect.flatMap(resolveEditorLaunch(input), launchDetached),
   } satisfies OpenShape;

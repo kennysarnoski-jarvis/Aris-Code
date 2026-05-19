@@ -58,7 +58,14 @@ it.layer(NodeServices.layer)("AuthControlPlane", (it) => {
       expect(listedBeforeRevoke).toHaveLength(1);
       expect(listedBeforeRevoke[0]?.id).toBe(created.id);
       expect(listedBeforeRevoke[0]?.label).toBe("CI phone");
-      expect(listedBeforeRevoke[0]?.credential).toBe(created.credential);
+      // Slice F.2 / M-2E — the listed pairing link MUST NOT include
+      // the raw credential. The owner sees the credential exactly once
+      // at issue time (via `created.credential` above); every
+      // subsequent listing scrubs it. This assertion pins the
+      // redaction so a future refactor that reintroduces the field
+      // trips here before the regression ships.
+      expect("credential" in (listedBeforeRevoke[0] ?? {})).toBe(false);
+      expect(listedBeforeRevoke[0]?.credential).toBeUndefined();
       expect(revoked).toBe(true);
       expect(listedAfterRevoke).toHaveLength(0);
     }).pipe(Effect.provide(makeAuthControlPlaneLayer())),

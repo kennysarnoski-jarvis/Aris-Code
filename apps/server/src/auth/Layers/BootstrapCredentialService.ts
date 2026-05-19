@@ -98,11 +98,16 @@ export const makeBootstrapCredentialService = Effect.gen(function* () {
       const now = yield* DateTime.now;
       const rows = yield* pairingLinks.listActive({ now });
 
+      // Slice F.2 / M-2E — `credential` is deliberately OMITTED from
+      // every row. The schema (`AuthPairingLink`) makes the field
+      // optional precisely so this listing path can refuse to emit
+      // the raw secret. Consumers that need the credential get it
+      // exactly once: in the `issueOneTimeToken` return value and
+      // the matching `pairingLinkUpserted` live-stream event.
       return rows.map((row) =>
         row.label
           ? ({
               id: row.id,
-              credential: row.credential,
               role: row.role,
               subject: row.subject,
               label: row.label,
@@ -111,7 +116,6 @@ export const makeBootstrapCredentialService = Effect.gen(function* () {
             } satisfies AuthPairingLink)
           : ({
               id: row.id,
-              credential: row.credential,
               role: row.role,
               subject: row.subject,
               createdAt: row.createdAt,

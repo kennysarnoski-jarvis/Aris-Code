@@ -27,7 +27,15 @@ const isBootstrapHttpError = (u: unknown): u is BootstrapHttpError =>
 
 export interface ServerPairingLinkRecord {
   readonly id: string;
-  readonly credential: string;
+  /**
+   * Slice F.2 / M-2E — `credential` is the raw pairing secret and is
+   * only present in the one-shot issue response and the matching
+   * `pairingLinkUpserted` live-stream event. The HTTP list endpoint
+   * (`GET /api/auth/pairing-links`) and the WS snapshot omit it.
+   * Treat as `undefined` when re-fetching an existing link; reissue
+   * if a fresh share URL is required.
+   */
+  readonly credential?: string;
   readonly role: "owner" | "client";
   readonly subject: string;
   readonly label?: string;

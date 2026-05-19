@@ -116,7 +116,6 @@ const makeArisTextGeneration = Effect.gen(function* () {
             cause instanceof Error
               ? `Aris text generation failed: ${cause.message}`
               : `Aris text generation failed: ${String(cause)}`,
-          cause,
         }),
     }).pipe(
       Effect.timeoutOption(ARIS_TEXT_TIMEOUT_MS),
@@ -135,12 +134,11 @@ const makeArisTextGeneration = Effect.gen(function* () {
     );
 
     return yield* Schema.decodeEffect(outputSchema)(rawResponse).pipe(
-      Effect.catchTag("SchemaError", (cause) =>
+      Effect.catchTag("SchemaError", (_cause) =>
         Effect.fail(
           new TextGenerationError({
             operation,
             detail: "Aris returned invalid structured output.",
-            cause,
           }),
         ),
       ),

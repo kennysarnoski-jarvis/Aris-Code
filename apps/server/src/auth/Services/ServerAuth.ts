@@ -27,7 +27,10 @@ export interface AuthenticatedSession {
 
 export class AuthError extends Data.TaggedError("AuthError")<{
   readonly message: string;
-  readonly status?: 400 | 401 | 403 | 500;
+  // Slice J.5 / M3-3 — `503` added for the WS connection-limit
+  // rejection (Service Unavailable is the correct semantic when the
+  // server is healthy but at-capacity).
+  readonly status?: 400 | 401 | 403 | 500 | 503;
   readonly cause?: unknown;
 }> {}
 

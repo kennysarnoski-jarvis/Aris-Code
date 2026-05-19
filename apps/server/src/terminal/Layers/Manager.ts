@@ -58,7 +58,6 @@ class TerminalSubprocessCheckError extends Schema.TaggedErrorClass<TerminalSubpr
   "TerminalSubprocessCheckError",
   {
     message: Schema.String,
-    cause: Schema.optional(Schema.Defect),
     terminalPid: Schema.Number,
     command: Schema.Literals(["powershell", "pgrep", "ps"]),
   },
@@ -68,7 +67,6 @@ class TerminalProcessSignalError extends Schema.TaggedErrorClass<TerminalProcess
   "TerminalProcessSignalError",
   {
     message: Schema.String,
-    cause: Schema.optional(Schema.Defect),
     signal: Schema.Literals(["SIGTERM", "SIGKILL"]),
   },
 ) {}
@@ -323,7 +321,6 @@ function checkWindowsSubprocessActivity(
     catch: (cause) =>
       new TerminalSubprocessCheckError({
         message: "Failed to check Windows terminal subprocess activity.",
-        cause,
         terminalPid,
         command: "powershell",
       }),
@@ -344,7 +341,6 @@ const checkPosixSubprocessActivity = Effect.fn("terminal.checkPosixSubprocessAct
     catch: (cause) =>
       new TerminalSubprocessCheckError({
         message: "Failed to inspect terminal subprocesses with pgrep.",
-        cause,
         terminalPid,
         command: "pgrep",
       }),
@@ -358,10 +354,9 @@ const checkPosixSubprocessActivity = Effect.fn("terminal.checkPosixSubprocessAct
         maxBufferBytes: 262_144,
         outputMode: "truncate",
       }),
-    catch: (cause) =>
+    catch: (_cause) =>
       new TerminalSubprocessCheckError({
         message: "Failed to inspect terminal subprocesses with ps.",
-        cause,
         terminalPid,
         command: "ps",
       }),
@@ -713,12 +708,11 @@ export const makeTerminalManagerWithOptions = Effect.fn("makeTerminalManagerWith
 
     const toTerminalHistoryError =
       (operation: "read" | "truncate" | "migrate", threadId: string, terminalId: string) =>
-      (cause: unknown) =>
+      (_cause: unknown) =>
         new TerminalHistoryError({
           operation,
           threadId,
           terminalId,
-          cause,
         });
 
     const readManagerState = SynchronizedRef.get(managerStateRef);
@@ -794,7 +788,6 @@ export const makeTerminalManagerWithOptions = Effect.fn("makeTerminalManagerWith
         catch: (cause) =>
           new TerminalProcessSignalError({
             message: "Failed to send SIGTERM to terminal process.",
-            cause,
             signal: "SIGTERM",
           }),
       }).pipe(
@@ -816,10 +809,9 @@ export const makeTerminalManagerWithOptions = Effect.fn("makeTerminalManagerWith
 
       yield* Effect.try({
         try: () => process.kill("SIGKILL"),
-        catch: (cause) =>
+        catch: (_cause) =>
           new TerminalProcessSignalError({
             message: "Failed to send SIGKILL to terminal process.",
-            cause,
             signal: "SIGKILL",
           }),
       }).pipe(
@@ -1031,7 +1023,6 @@ export const makeTerminalManagerWithOptions = Effect.fn("makeTerminalManagerWith
             new TerminalCwdError({
               cwd,
               reason: cause.reason._tag === "NotFound" ? "notFound" : "statFailed",
-              cause,
             }),
         ),
       );

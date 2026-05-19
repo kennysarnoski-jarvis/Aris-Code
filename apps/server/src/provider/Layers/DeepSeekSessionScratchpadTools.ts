@@ -24,6 +24,7 @@ import { tool } from "@openai/agents";
 import { z } from "zod";
 
 import type { ArisEvent, TurnId } from "@t3tools/contracts";
+import type { RollingWindowConfig } from "./RollingWindowMemory.ts";
 
 import {
   appendSessionScratchpadEntry,
@@ -33,6 +34,12 @@ import {
 } from "./SessionScratchpadMemory.ts";
 
 export interface SessionScratchpadToolContext {
+  /**
+   * Slice L / M3-2 — resolved rolling-window paths threaded from the
+   * adapter so session-scratchpad IO doesn't reach for `homedir()`
+   * implicitly.
+   */
+  readonly rollingWindowConfig: RollingWindowConfig;
   /** Workspace cwd — used to derive the per-thread archive directory. */
   readonly cwd: string;
   /** Thread id — selects the per-thread directory under projects/<key>/sessions/. */
@@ -81,7 +88,12 @@ export function createDeepSeekSessionScratchpadTools(ctx: SessionScratchpadToolC
       "cheap and the latest writes are always visible.",
     parameters: z.object({}),
     async execute() {
-      const entries = await readSessionScratchpadEntries(ctx.cwd, ctx.threadId, ctx.parentTurnId);
+      const entries = await readSessionScratchpadEntries(
+        ctx.rollingWindowConfig,
+        ctx.cwd,
+        ctx.threadId,
+        ctx.parentTurnId,
+      );
       return renderSessionScratchpad(entries);
     },
   });
@@ -118,8 +130,19 @@ export function createDeepSeekSessionScratchpadTools(ctx: SessionScratchpadToolC
         return "append_session_scratchpad requires a non-empty 'content' string.";
       }
       const entry = newSessionScratchpadEntry({ writer: ctx.writerLabel, content });
-      await appendSessionScratchpadEntry(ctx.cwd, ctx.threadId, ctx.parentTurnId, entry);
-      const all = await readSessionScratchpadEntries(ctx.cwd, ctx.threadId, ctx.parentTurnId);
+      await appendSessionScratchpadEntry(
+        ctx.rollingWindowConfig,
+        ctx.cwd,
+        ctx.threadId,
+        ctx.parentTurnId,
+        entry,
+      );
+      const all = await readSessionScratchpadEntries(
+        ctx.rollingWindowConfig,
+        ctx.cwd,
+        ctx.threadId,
+        ctx.parentTurnId,
+      );
 
       // COORD-6.1 — Emit live event so the sidebar renders this
       // entry without needing to re-read the whole file. Frontend

@@ -40,6 +40,19 @@
  * Why `factType` not `type`: the term `type` is overloaded inside
  * tool param schemas; `factType` reads unambiguously in code AND in
  * the persisted line.
+ *
+ * ### Slice F.3 — FactsConfig (2026-01-20)
+ *
+ * `homedir()` was previously called at write time by every IO function
+ * via `getFactsPath()` / `getArisHomeDir()`. Any test runner (or worker
+ * sub-agent) that touched the facts store without swapping
+ * `process.env.HOME` polluted the real `~/.aris/facts.jsonl`.
+ *
+ * The fix: `FactsConfig` is a value object carrying the resolved paths.
+ * `makeFactsConfig()` is the ONE place `homedir()` is called — at the
+ * composition root. Every IO function takes `config` explicitly. Tests
+ * create their own config pointed at a temp dir; no HOME swapping
+ * needed. The gun is no longer loaded.
  */
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
@@ -50,6 +63,38 @@ import { Data } from "effect";
 
 const ARIS_HOME_DIR = ".aris";
 const FACTS_FILENAME = "facts.jsonl";
+
+// ---------------------------------------------------------------------------
+// FactsConfig — resolved paths, constructed ONCE at the composition root
+// ---------------------------------------------------------------------------
+
+/** Resolved filesystem paths for the facts store. */
+export interface FactsConfig {
+  readonly factsPath: string;
+  readonly arisHomeDir: string;
+}
+
+/**
+ * Construct a `FactsConfig` from a home directory. This is the ONLY
+ * call site for `homedir()` in the entire facts subsystem — all IO
+ * functions receive an explicit config instead of reaching for HOME
+ * implicitly.
+ *
+ * `homeOverride` exists for the test (and for hypothetical in-process
+ * multi-tenancy); production callers omit it and `homedir()` resolves
+ * naturally.
+ */
+export function makeFactsConfig(homeOverride?: string): FactsConfig {
+  const home = homeOverride ?? homedir();
+  return {
+    factsPath: join(home, ARIS_HOME_DIR, FACTS_FILENAME),
+    arisHomeDir: join(home, ARIS_HOME_DIR),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
 
 /**
  * Tagged error for any facts I/O failure. Mirrors the patterns in
@@ -75,6 +120,10 @@ export function toFactsIOError(operation: "read" | "append" | "mkdir") {
       cause,
     });
 }
+
+// ---------------------------------------------------------------------------
+// Domain types
+// ---------------------------------------------------------------------------
 
 /**
  * Allowed fact types. User-global only — scope decision per Kenny:
@@ -120,24 +169,36 @@ export interface Fact {
   readonly content: string;
 }
 
-/** Path to the user-global facts file. Pure path math — no fs touch. */
-export function getFactsPath(): string {
-  return join(homedir(), ARIS_HOME_DIR, FACTS_FILENAME);
+// ---------------------------------------------------------------------------
+// Internal: path helpers (not exported — use makeFactsConfig)
+// ---------------------------------------------------------------------------
+
+/** @internal Path to the user-global facts file. */
+function getFactsPath(home: string): string {
+  return join(home, ARIS_HOME_DIR, FACTS_FILENAME);
 }
 
-/** Path to the user-global ARIS_HOME dir (parent of facts.jsonl). */
-export function getArisHomeDir(): string {
-  return join(homedir(), ARIS_HOME_DIR);
+/** @internal Path to the user-global ARIS_HOME dir. */
+function getArisHomeDir(home: string): string {
+  return join(home, ARIS_HOME_DIR);
 }
+
+// ---------------------------------------------------------------------------
+// Idempotent directory creation
+// ---------------------------------------------------------------------------
 
 /**
  * Idempotent `mkdir -p` on the ARIS_HOME directory. Safe to call
  * before every append. (The dir is created lazily so a fresh install
  * doesn't have to provision it explicitly.)
  */
-export async function ensureArisHomeDir(): Promise<void> {
-  await fs.mkdir(getArisHomeDir(), { recursive: true });
+export async function ensureArisHomeDir(config: FactsConfig): Promise<void> {
+  await fs.mkdir(config.arisHomeDir, { recursive: true });
 }
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
 
 /**
  * Parse one line into a `FactsRecord`. Returns `null` for lines that
@@ -174,12 +235,16 @@ function parseRecord(line: string): FactsRecord | null {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Read path
+// ---------------------------------------------------------------------------
+
 /**
  * Read the raw record stream from disk in file order. Returns `[]`
  * for a missing file (no facts written yet for this user).
  */
-export async function readFactsRecords(): Promise<ReadonlyArray<FactsRecord>> {
-  const path = getFactsPath();
+export async function readFactsRecords(config: FactsConfig): Promise<ReadonlyArray<FactsRecord>> {
+  const path = config.factsPath;
   let raw: string;
   try {
     raw = await fs.readFile(path, "utf8");
@@ -238,19 +303,23 @@ export function replayFacts(records: ReadonlyArray<FactsRecord>): ReadonlyArray<
 }
 
 /** Convenience: read the file and replay in one call. */
-export async function readFacts(): Promise<ReadonlyArray<Fact>> {
-  const records = await readFactsRecords();
+export async function readFacts(config: FactsConfig): Promise<ReadonlyArray<Fact>> {
+  const records = await readFactsRecords(config);
   return replayFacts(records);
 }
+
+// ---------------------------------------------------------------------------
+// Write path
+// ---------------------------------------------------------------------------
 
 /**
  * Append one record to the facts file. Atomic at the line level
  * (O_APPEND) and fsynced via `flush: true`.
  */
-export async function appendFactsRecord(record: FactsRecord): Promise<void> {
-  await ensureArisHomeDir();
+export async function appendFactsRecord(config: FactsConfig, record: FactsRecord): Promise<void> {
+  await ensureArisHomeDir(config);
   const line = JSON.stringify(record) + "\n";
-  await fs.appendFile(getFactsPath(), line, { encoding: "utf8", flush: true });
+  await fs.appendFile(config.factsPath, line, { encoding: "utf8", flush: true });
 }
 
 /**
@@ -287,6 +356,10 @@ export function newFactsRecord(
   }
   return { id, ts, action: "delete", factType: input.factType, label: input.label };
 }
+
+// ---------------------------------------------------------------------------
+// Render (pure — no config needed)
+// ---------------------------------------------------------------------------
 
 /**
  * Render the current facts list as a compact text block for the
@@ -340,6 +413,10 @@ export function renderFacts(facts: ReadonlyArray<Fact>): string {
   return sections.join("\n\n");
 }
 
+// ---------------------------------------------------------------------------
+// Write lock
+// ---------------------------------------------------------------------------
+
 /**
  * Per-file write lock. Same pattern as `TodosMemory.withTodosWriteLock`
  * — keyed on the file path so concurrent upserts don't lose writes
@@ -352,8 +429,8 @@ export function renderFacts(facts: ReadonlyArray<Fact>): string {
  */
 const FACTS_WRITE_LOCKS = new Map<string, Promise<unknown>>();
 
-export async function withFactsWriteLock<T>(fn: () => Promise<T>): Promise<T> {
-  const key = getFactsPath();
+export async function withFactsWriteLock<T>(config: FactsConfig, fn: () => Promise<T>): Promise<T> {
+  const key = config.factsPath;
   const prior = FACTS_WRITE_LOCKS.get(key) ?? Promise.resolve();
   const ours = prior.then(
     () => fn(),

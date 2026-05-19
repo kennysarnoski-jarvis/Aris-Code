@@ -1,5 +1,5 @@
 import { Schema } from "effect";
-import { TrimmedNonEmptyString } from "./baseSchemas";
+import { TrimmedNonEmptyString, WorkspacePathString } from "./baseSchemas";
 import {
   ApprovalRequestId,
   EventId,
@@ -35,7 +35,11 @@ export const ProviderSession = Schema.Struct({
   provider: ProviderKind,
   status: ProviderSessionStatus,
   runtimeMode: RuntimeMode,
-  cwd: Schema.optional(TrimmedNonEmptyString),
+  // Slice O / M4-3 — `WorkspacePathString` caps at 4096 chars and
+  // rejects NUL bytes so a malformed projection row or replayed
+  // event can't bring a giant or NUL-laden cwd back into runtime
+  // memory. See baseSchemas.ts for the rationale.
+  cwd: Schema.optional(WorkspacePathString),
   model: Schema.optional(TrimmedNonEmptyString),
   threadId: ThreadId,
   resumeCursor: Schema.optional(Schema.Unknown),
@@ -49,7 +53,10 @@ export type ProviderSession = typeof ProviderSession.Type;
 export const ProviderSessionStartInput = Schema.Struct({
   threadId: ThreadId,
   provider: Schema.optional(ProviderKind),
-  cwd: Schema.optional(TrimmedNonEmptyString),
+  // Slice O / M4-3 — see ProviderSession.cwd above. This is the
+  // user-controlled wire input variant — same guard, more
+  // load-bearing because it's where an attacker payload would land.
+  cwd: Schema.optional(WorkspacePathString),
   modelSelection: Schema.optional(ModelSelection),
   resumeCursor: Schema.optional(Schema.Unknown),
   approvalPolicy: Schema.optional(ProviderApprovalPolicy),

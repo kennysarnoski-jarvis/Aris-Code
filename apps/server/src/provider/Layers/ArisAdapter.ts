@@ -66,6 +66,13 @@ import { Agent, type AgentInputItem, run } from "@openai/agents";
 import { OpenAIChatCompletionsModel } from "@openai/agents-openai";
 import { runArisAgentEffect } from "./ArisAgentRunnerEffect.ts";
 import { createArisAgentTools } from "./ArisAgentTools.ts";
+// Slice M.1 / H-4B — error sanitizer is shared with the DeepSeek path
+// so both providers agree on what's safe to ship to the renderer. See
+// `sanitizeProviderErrorForUi` for the rationale (cap length, strip
+// token/key-like substrings, single-line). Aris path was missed when
+// Slice J.3 (M3-1) landed sanitization on the DeepSeek path; Slice M
+// closes that parity gap.
+import { sanitizeProviderErrorForUi } from "./DeepSeekAgentRunner.ts";
 import {
   createArisOpenAIClient,
   makeConversationIdHolder,
@@ -630,6 +637,11 @@ const makeArisAdapter = Effect.fn("makeArisAdapter")(function* () {
               `detail=${JSON.stringify(err.message ?? String(err)).slice(0, 300)}`,
           );
           const failedAt = yield* nowIso;
+          // Slice M.1 / H-4B — sanitize before publishing to UI bus.
+          // Bind once and reuse across both publishes so both events
+          // ship the same redacted string. Mirrors the DeepSeek path
+          // at DeepSeekAdapter.ts (see Slice J.3 / M3-1).
+          const safeMessage = sanitizeProviderErrorForUi(err.message);
           yield* publishArisEvent({
             type: "aris.error",
             threadId: ctx.session.threadId,
@@ -637,7 +649,7 @@ const makeArisAdapter = Effect.fn("makeArisAdapter")(function* () {
             createdAt: failedAt,
             payload: {
               code: "provider_error",
-              message: err.message,
+              message: safeMessage,
               recoverable: false,
             },
           });
@@ -646,7 +658,7 @@ const makeArisAdapter = Effect.fn("makeArisAdapter")(function* () {
             threadId: ctx.session.threadId,
             turnId,
             createdAt: failedAt,
-            payload: { errorMessage: err.message },
+            payload: { errorMessage: safeMessage },
           });
           const idleAt = yield* nowIso;
           ctx.session = {

@@ -54,6 +54,18 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import {
+  asBoolean,
+  asString,
+  asStringArray,
+  parseMarkdownWithFrontmatter,
+  type RawFrontmatter,
+} from "./MarkdownFrontmatterParser.ts";
+
+// Re-export RawFrontmatter so downstream callers that import it from
+// ArisSkillsLoader (pre-Slice-2 surface) keep working without churn.
+export type { RawFrontmatter };
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -70,14 +82,6 @@ import * as path from "node:path";
  *                precedence; project and user can override by name.
  */
 export type SkillSource = "project" | "user" | "bundled";
-
-/**
- * Raw frontmatter record — the literal key→value pairs the parser
- * extracted, with original kebab-case keys preserved. Callers should
- * read through `SkillFrontmatter` for typed access; this is exposed for
- * forward-compat (unknown fields survive).
- */
-export type RawFrontmatter = Readonly<Record<string, string | ReadonlyArray<string> | boolean>>;
 
 /**
  * Typed view over `RawFrontmatter`. All fields optional — a SKILL.md is
@@ -197,8 +201,6 @@ export interface LoadSkillsResult {
 // Frontmatter parser
 // ---------------------------------------------------------------------------
 
-const FRONTMATTER_DELIMITER = /^---\s*$/;
-
 /**
  * Result of `parseSkillFile`. Either the frontmatter-and-body pair we
  * extracted, or a non-fatal error string. Errors here surface as
@@ -221,169 +223,21 @@ export interface ParsedSkillFile {
  * but never closed). Malformed individual lines are skipped silently —
  * the partial frontmatter is still returned so that one typo doesn't
  * disable the whole skill.
+ *
+ * Slice 2 (2026-05-16) — the parsing primitive moved to
+ * `MarkdownFrontmatterParser.ts` so the agent-templates loader (Slice 3)
+ * can share the same dialect. This function is now a thin wrapper that
+ * applies the skill-specific typed projection (`typedFrontmatter`) on
+ * top of the shared parser's output. Behavior is bit-identical to the
+ * pre-Slice-2 implementation.
  */
 export function parseSkillFile(content: string): ParsedSkillFile | null {
-  const lines = content.split(/\r?\n/);
-  if (lines.length === 0 || !FRONTMATTER_DELIMITER.test(lines[0]!)) {
-    // No frontmatter — entire file is body.
-    return {
-      frontmatter: { raw: Object.freeze({}) },
-      body: content.trim(),
-    };
-  }
-
-  // Find the closing delimiter, skipping the opening one.
-  let closingIndex = -1;
-  for (let i = 1; i < lines.length; i += 1) {
-    if (FRONTMATTER_DELIMITER.test(lines[i]!)) {
-      closingIndex = i;
-      break;
-    }
-  }
-  if (closingIndex === -1) {
-    // Opened but never closed — treat as malformed, refuse to load.
-    return null;
-  }
-
-  const fmLines = lines.slice(1, closingIndex);
-  const bodyLines = lines.slice(closingIndex + 1);
-  const raw = parseFrontmatterLines(fmLines);
+  const parsed = parseMarkdownWithFrontmatter(content);
+  if (parsed === null) return null;
   return {
-    frontmatter: typedFrontmatter(raw),
-    body: bodyLines.join("\n").trim(),
+    frontmatter: typedFrontmatter(parsed.rawFrontmatter),
+    body: parsed.body,
   };
-}
-
-/**
- * Parse the lines between the two `---` delimiters into a flat record.
- * Supports:
- *
- *   - `key: value`                     → string
- *   - `key: "quoted"` or `'quoted'`    → string (quotes stripped)
- *   - `key: true | false | yes | no`   → boolean
- *   - `key: [a, b, "c"]`               → string[] (inline JSON-ish array)
- *   - `key:\n  - item1\n  - item2`     → string[] (block-list)
- *   - blank lines and `#` comments     → ignored
- *
- * Block-list items continue while subsequent lines are indented and
- * start with `- `. Indentation is tracked relative to the list's first
- * `- ` line, not absolute, to be forgiving about author tab/space mixes.
- *
- * Unknown / malformed lines are skipped. The goal is "extract what we
- * can" — strict YAML compliance is out of scope.
- */
-function parseFrontmatterLines(
-  lines: ReadonlyArray<string>,
-): Record<string, string | string[] | boolean> {
-  const record: Record<string, string | string[] | boolean> = {};
-  let i = 0;
-  while (i < lines.length) {
-    const raw = lines[i]!;
-    const line = raw.trimEnd();
-    const trimmed = line.trim();
-
-    // Skip blanks and comments.
-    if (trimmed === "" || trimmed.startsWith("#")) {
-      i += 1;
-      continue;
-    }
-
-    // Match `key:` or `key: value`.
-    const match = /^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/.exec(line);
-    if (!match) {
-      i += 1;
-      continue;
-    }
-    const key = match[1]!;
-    const rest = match[2] ?? "";
-
-    if (rest === "") {
-      // Possibly a block list — peek ahead.
-      const collected: string[] = [];
-      let j = i + 1;
-      while (j < lines.length) {
-        const next = lines[j]!;
-        const nextTrimmed = next.trim();
-        if (nextTrimmed === "" || nextTrimmed.startsWith("#")) {
-          j += 1;
-          continue;
-        }
-        // Block-list item must start with whitespace + "- ".
-        const itemMatch = /^\s+-\s+(.*)$/.exec(next);
-        if (!itemMatch) break;
-        collected.push(stripQuotes(itemMatch[1]!.trim()));
-        j += 1;
-      }
-      if (collected.length > 0) {
-        record[key] = collected;
-        i = j;
-        continue;
-      }
-      // No block-list items found → treat as empty string value.
-      record[key] = "";
-      i += 1;
-      continue;
-    }
-
-    record[key] = parseScalarOrInlineArray(rest);
-    i += 1;
-  }
-  return record;
-}
-
-/**
- * Parse a value-side token. Recognizes inline arrays (`[a, b]`),
- * booleans (`true|false|yes|no`, case-insensitive), and quoted strings.
- * Anything else falls through as a plain trimmed string.
- */
-function parseScalarOrInlineArray(value: string): string | string[] | boolean {
-  const trimmed = value.trim();
-  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-    // Inline array. Split on commas, but respect quoted strings so
-    // `[a, "b, c", d]` yields ["a", "b, c", "d"]. Hand-rolled because
-    // a regex split would either over- or under-segment the quoted case.
-    const inner = trimmed.slice(1, -1);
-    const items: string[] = [];
-    let buf = "";
-    let inQuote: '"' | "'" | null = null;
-    for (let i = 0; i < inner.length; i += 1) {
-      const ch = inner[i]!;
-      if (inQuote) {
-        if (ch === inQuote) inQuote = null;
-        else buf += ch;
-        continue;
-      }
-      if (ch === '"' || ch === "'") {
-        inQuote = ch;
-        continue;
-      }
-      if (ch === ",") {
-        items.push(buf.trim());
-        buf = "";
-        continue;
-      }
-      buf += ch;
-    }
-    if (buf.trim() !== "" || items.length > 0) items.push(buf.trim());
-    return items.filter((s) => s.length > 0);
-  }
-
-  const lower = trimmed.toLowerCase();
-  if (lower === "true" || lower === "yes") return true;
-  if (lower === "false" || lower === "no") return false;
-
-  return stripQuotes(trimmed);
-}
-
-function stripQuotes(value: string): string {
-  if (value.length >= 2) {
-    const first = value[0];
-    const last = value[value.length - 1];
-    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-      return value.slice(1, -1);
-    }
-  }
-  return value;
 }
 
 /**
@@ -392,23 +246,13 @@ function stripQuotes(value: string): string {
  * conservative: an array-shaped value never becomes a scalar field, a
  * scalar never becomes an array field — mismatched types produce
  * `undefined` for that field rather than a partial value.
+ *
+ * Type-narrowing helpers (`asString`, `asBoolean`, `asStringArray`)
+ * come from `MarkdownFrontmatterParser` so they stay consistent across
+ * loaders (skills, agents, anything future). The skill-specific shape
+ * — which fields are recognized, valid context values — lives here.
  */
-// Type-narrowing helpers — hoisted to module scope so the lint rule
-// (consistent-function-scoping) is satisfied and so they're cheap to
-// reuse if other parsers want them later.
-const asString = (v: unknown): string | undefined =>
-  typeof v === "string" && v.length > 0 ? v : undefined;
-
-const asBoolean = (v: unknown): boolean | undefined => (typeof v === "boolean" ? v : undefined);
-
-const asStringArray = (v: unknown): ReadonlyArray<string> | undefined => {
-  if (Array.isArray(v) && v.every((x) => typeof x === "string")) return Object.freeze([...v]);
-  return undefined;
-};
-
-function typedFrontmatter(raw: Record<string, string | string[] | boolean>): SkillFrontmatter {
-  // Freeze the raw side so callers can't accidentally mutate it.
-  const frozen = Object.freeze({ ...raw }) as RawFrontmatter;
+function typedFrontmatter(raw: RawFrontmatter): SkillFrontmatter {
   const contextValue = asString(raw["context"]);
   const context: "inline" | "fork" | undefined =
     contextValue === "inline" || contextValue === "fork" ? contextValue : undefined;
@@ -442,7 +286,10 @@ function typedFrontmatter(raw: Record<string, string | string[] | boolean>): Ski
     ...(disableNonInteractive !== undefined ? { disableNonInteractive } : {}),
     ...(context !== undefined ? { context } : {}),
     ...(agent !== undefined ? { agent } : {}),
-    raw: frozen,
+    // `raw` is the parameter — already frozen by the shared parser
+    // (`parseMarkdownWithFrontmatter` calls `Object.freeze` before
+    // returning). No second freeze needed here.
+    raw,
   };
 }
 

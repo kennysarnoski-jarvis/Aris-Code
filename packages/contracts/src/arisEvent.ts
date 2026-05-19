@@ -32,14 +32,26 @@ import {
   MessageId,
   NonNegativeInt,
   PositiveInt,
+  SafeRecordKey,
   ThreadId,
   TrimmedNonEmptyString,
   TurnId,
+  WorkspacePathString,
 } from "./baseSchemas";
-import { ChatAttachment, ProviderApprovalDecision, RuntimeMode } from "./orchestration";
+import {
+  ChatAttachment,
+  PROVIDER_ASSISTANT_DELTA_MAX_CHARS,
+  PROVIDER_ASSISTANT_TEXT_MAX_CHARS,
+  ProviderApprovalDecision,
+  RuntimeMode,
+} from "./orchestration";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
-const UnknownRecordSchema = Schema.Record(Schema.String, Schema.Unknown);
+// Slice E.1 / H-2C — `SafeRecordKey` blocks prototype-magic keys
+// (`__proto__`, `constructor`, `prototype`) at the schema boundary. See
+// baseSchemas.ts for the full rationale. Used here for tool-call `args`
+// records emitted by Aris events.
+const UnknownRecordSchema = Schema.Record(SafeRecordKey, Schema.Unknown);
 
 // ── Shared sub-types ────────────────────────────────────────────────
 
@@ -255,18 +267,22 @@ export type ArisTurnCancelledPayload = typeof ArisTurnCancelledPayload.Type;
 
 const ArisAssistantDeltaPayload = Schema.Struct({
   messageId: MessageId,
-  text: Schema.String,
+  // Slice I / H3-7 — streaming delta cap.
+  text: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_DELTA_MAX_CHARS)),
 });
 export type ArisAssistantDeltaPayload = typeof ArisAssistantDeltaPayload.Type;
 
 const ArisReasoningDeltaPayload = Schema.Struct({
-  text: Schema.String,
+  // Slice I / H3-7 — streaming delta cap. Reasoning streams can be
+  // verbose (long chain-of-thought), still bounded.
+  text: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_DELTA_MAX_CHARS)),
 });
 export type ArisReasoningDeltaPayload = typeof ArisReasoningDeltaPayload.Type;
 
 const ArisAssistantMessageCompletedPayload = Schema.Struct({
   messageId: MessageId,
-  finalText: Schema.String,
+  // Slice I / H3-7 — assembled final-text cap.
+  finalText: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_TEXT_MAX_CHARS)),
   contentLength: NonNegativeInt,
 });
 export type ArisAssistantMessageCompletedPayload = typeof ArisAssistantMessageCompletedPayload.Type;
@@ -859,7 +875,15 @@ export const WsArisApprovalDecideRpc = Rpc.make(ARIS_WS_METHODS.decideApproval, 
 export const ArisArchiveMessage = Schema.Struct({
   id: MessageId,
   role: Schema.Literals(["user", "assistant"]),
-  content: Schema.String,
+  // Slice N.2 / M4-11 — cap archive content at the same ceiling used
+  // for live assistant text (`PROVIDER_ASSISTANT_TEXT_MAX_CHARS`,
+  // 10M). Archive messages get replayed verbatim into the renderer
+  // chat history on reload; without a cap, a corrupted or malicious
+  // archive file could ship a multi-hundred-MB string through every
+  // archive.read RPC response. Matches the live-stream final-text
+  // cap at line 284 in this file so an archived message can't be
+  // larger than the live message it was archived from.
+  content: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_TEXT_MAX_CHARS)),
   turnId: Schema.NullOr(Schema.String),
   createdAt: Schema.String,
   // Image attachments persisted alongside this user message (added
@@ -879,7 +903,13 @@ export type ArisArchiveMessage = typeof ArisArchiveMessage.Type;
  */
 export const ArisArchiveReadInput = Schema.Struct({
   threadId: ThreadId,
-  cwd: Schema.String,
+  // Slice O / M4-3 — cap cwd at WORKSPACE_PATH_MAX_LENGTH (4096) and
+  // reject NUL bytes. The cwd flows through
+  // `RollingWindowMemory.projectKeyFromCwd` → on-disk path → fs.readFile.
+  // Pre-Slice-O this accepted any string, including a 10MB cwd that
+  // would burn CPU through split/join/toLowerCase before fs rejected
+  // it. See baseSchemas.ts for the rationale on the shared schema.
+  cwd: WorkspacePathString,
 });
 export type ArisArchiveReadInput = typeof ArisArchiveReadInput.Type;
 

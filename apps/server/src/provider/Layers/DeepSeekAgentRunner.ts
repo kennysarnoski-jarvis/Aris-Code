@@ -63,6 +63,7 @@ import type {
 } from "@t3tools/contracts";
 
 import { getRequestReasoningEffort, setRequestReasoningEffort } from "./DeepSeekOpenAIClient.ts";
+import { formatRunnerToolCallLog } from "./DeepSeekToolCallLog.ts";
 import {
   clearReasoningRoundtripCache,
   setDeepSeekReasoningHandler,
@@ -137,6 +138,41 @@ export interface RunDeepSeekAgentResult {
 // ── Implementation ─────────────────────────────────────────────────
 
 const nowIso = (): string => new Date().toISOString();
+
+/**
+ * Slice J.3 / M3-1 fix (2026-05-16) — sanitize an SDK / network error
+ * message for safe publishing to the UI event bus.
+ *
+ * V8 / SDK / network error messages can carry user-controlled or
+ * secret content: full request URLs (with auth query strings), HTTP
+ * response bodies that echo input back, provider-side stack traces.
+ * Raw `err.message` is appropriate for server-side stderr where the
+ * operator is debugging; it is NOT appropriate for the renderer where
+ * it persists in browser memory, screenshots, screen-shared video, or
+ * error reports the user later submits.
+ *
+ * The sanitizer:
+ *   1. Caps the message at 512 chars (typical legitimate provider
+ *      errors are < 200 chars; pathological multi-KB strings get
+ *      truncated).
+ *   2. Strips substrings that look like bearer tokens or API keys —
+ *      hex/base64 runs of ≥20 chars, `sk-...` prefixes, `Bearer ...`
+ *      headers. Replaced with `<redacted>` so the message remains
+ *      readable while the secret is gone.
+ *   3. Strips newlines so multi-line stack traces don't bloat the UI
+ *      string (the first line of an error is almost always enough).
+ */
+export const SANITIZED_ERROR_MAX_CHARS = 512;
+const TOKEN_LIKE_RE =
+  /(?:sk-[A-Za-z0-9_-]{16,}|Bearer\s+[A-Za-z0-9._-]{16,}|[A-Fa-f0-9]{32,}|[A-Za-z0-9+/=]{40,})/g;
+export function sanitizeProviderErrorForUi(raw: string): string {
+  const oneLine = raw.replace(/[\r\n]+/g, " ").trim();
+  const redacted = oneLine.replace(TOKEN_LIKE_RE, "<redacted>");
+  if (redacted.length <= SANITIZED_ERROR_MAX_CHARS) {
+    return redacted;
+  }
+  return `${redacted.slice(0, SANITIZED_ERROR_MAX_CHARS)}…`;
+}
 
 /**
  * Default max iterations the SDK is allowed to take per turn before
@@ -340,30 +376,37 @@ export async function runDeepSeekAgent(
                 } else {
                   parseError = `parsed value is not an object: ${typeof parsed}`;
                 }
-              } catch (err) {
-                parseError = err instanceof Error ? err.message : String(err);
+              } catch {
+                // Slice H.2 / H3-1 fix (2026-05-16) — V8's `JSON.parse`
+                // error messages embed input snippets for common failure
+                // modes (e.g. `Unexpected token 'b', "{"apiKey": badvalue}"
+                // is not valid JSON`). The pre-Slice-H code captured
+                // `err.message` directly, which leaked the offending JSON
+                // body — including any secrets the tool call carried — into
+                // stderr via the formatter below. The Slice A H12 fix made
+                // the formatter only accept `argsBytes: number`, but
+                // `parseError` was a separate string field that bypassed
+                // that guarantee. We now record only a byte-count-stamped
+                // generic message: no user-controlled content can land
+                // here, by construction.
+                parseError = `invalid JSON (${argsRaw.length} bytes)`;
                 args = {};
               }
-              // Diagnostic for tool-arg JSON failures (DS sometimes emits
-              // malformed JSON for tools with multi-line string fields,
-              // especially edit_file's old_string/new_string). Logging
-              // the first 600 chars of raw args so we can see exactly
-              // what DS sent. Truncated to keep terminals readable.
-              const argsPreview = argsRaw.length > 600 ? argsRaw.slice(0, 600) + "…" : argsRaw;
-              if (parseError !== null) {
-                console.error(
-                  `[DeepSeekAgentRunner] tool_call_item: ` +
-                    `name=${raw.name} callId=${raw.callId} ` +
-                    `argsBytes=${argsRaw.length} JSON_PARSE_FAILED=${parseError} ` +
-                    `argsPreview=${JSON.stringify(argsPreview)}`,
-                );
-              } else {
-                console.error(
-                  `[DeepSeekAgentRunner] tool_call_item: ` +
-                    `name=${raw.name} callId=${raw.callId} ` +
-                    `argsBytes=${argsRaw.length} args=${JSON.stringify(argsPreview)}`,
-                );
-              }
+              // Slice A (H12 fix) — args content removed from stderr.
+              // The shared formatter only accepts argsBytes (a number), so
+              // it's compile-time impossible to leak the args value here.
+              // Slice H.2 (H3-1 fix) — parseError is now a server-generated
+              // byte-count message (see catch above), not V8's
+              // input-embedding error message. Both channels are now
+              // structurally incapable of carrying user-controlled content.
+              console.error(
+                formatRunnerToolCallLog({
+                  toolName: raw.name,
+                  callId: raw.callId,
+                  argsBytes: argsRaw.length,
+                  ...(parseError !== null ? { parseError } : {}),
+                }),
+              );
               await publish({
                 type: "aris.tool.started",
                 threadId,
@@ -560,12 +603,21 @@ export async function runDeepSeekAgent(
     }
 
     if (manageTurnLifecycle) {
+      // Slice J.3 / M3-1 fix (2026-05-16) — sanitize the error message
+      // before publishing it onto the UI event bus. `err.message` can
+      // carry SDK-generated content that includes request URLs (with
+      // auth query params), HTTP response bodies (with API key
+      // fragments echoed back), or provider-side stack traces. The
+      // raw string is fine for server-side logs but should NOT flow
+      // verbatim to the renderer where it can land in browser history,
+      // screenshots, or shared error reports. Cap to 512 chars and
+      // strip anything that looks like a bearer token or sk- key.
       await publish({
         type: "aris.turn.failed",
         threadId,
         turnId,
         createdAt: nowIso(),
-        payload: { errorMessage: errMsg },
+        payload: { errorMessage: sanitizeProviderErrorForUi(errMsg) },
       });
     }
     throw err;

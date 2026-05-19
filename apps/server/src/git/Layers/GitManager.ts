@@ -633,7 +633,11 @@ export const makeGitManager = Effect.fn("makeGitManager")(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
 
-  const tempDir = process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? "/tmp";
+  // Slice J.6 / M3-9 — the previous `tempDir` derivation (TMPDIR /
+  // TEMP / TMP env → /tmp fallback) is gone; PR body files now use
+  // `fileSystem.makeTempDirectory` which creates a private 0700 dir
+  // under the platform tmpdir without going through any of those env
+  // vars.
   const normalizeStatusCacheKey = (cwd: string) => canonicalizeExistingPath(cwd);
   const nonRepositoryStatusDetails = {
     isRepo: false,
@@ -1254,7 +1258,26 @@ export const makeGitManager = Effect.fn("makeGitManager")(function* () {
       modelSelection,
     });
 
-    const bodyFile = path.join(tempDir, `t3code-pr-body-${process.pid}-${randomUUID()}.md`);
+    // Slice J.6 / M3-9 fix (2026-05-16) — write the PR body inside a
+    // freshly-minted private tmpdir (mkdtemp = 0700 mode on POSIX)
+    // rather than directly in the shared `/tmp` root. Pre-Slice-J the
+    // file lived in `/tmp/t3code-pr-body-<pid>-<uuid>.md`; even with
+    // the unguessable UUID, the directory itself is world-traversable
+    // and a co-resident user could read the file between `writeFile`
+    // and `gh pr create` reading it. Private mkdtemp closes the read
+    // window — only this process can list / stat inside.
+    //
+    // Cleanup removes BOTH the file and the enclosing private dir,
+    // wrapped in `Effect.ensuring` so it runs on success and on
+    // failure of the `gh pr create` call.
+    const bodyDir = yield* fileSystem
+      .makeTempDirectory({ prefix: "t3code-pr-body-" })
+      .pipe(
+        Effect.mapError((cause) =>
+          gitManagerError("runPrStep", "Failed to create pull request body temp dir.", cause),
+        ),
+      );
+    const bodyFile = path.join(bodyDir, "body.md");
     yield* fileSystem
       .writeFileString(bodyFile, generated.body)
       .pipe(
@@ -1275,7 +1298,11 @@ export const makeGitManager = Effect.fn("makeGitManager")(function* () {
         title: generated.title,
         bodyFile,
       })
-      .pipe(Effect.ensuring(fileSystem.remove(bodyFile).pipe(Effect.catch(() => Effect.void))));
+      .pipe(
+        Effect.ensuring(
+          fileSystem.remove(bodyDir, { recursive: true }).pipe(Effect.catch(() => Effect.void)),
+        ),
+      );
 
     const created = yield* findOpenPr(cwd, headContext);
     if (!created) {

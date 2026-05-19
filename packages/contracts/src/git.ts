@@ -1,5 +1,11 @@
 import { Schema } from "effect";
-import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas";
+import {
+  NonNegativeInt,
+  PositiveInt,
+  SafeBranchName,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const GIT_LIST_BRANCHES_MAX_LIMIT = 200;
@@ -139,8 +145,11 @@ export type GitListBranchesInput = typeof GitListBranchesInput.Type;
 
 export const GitCreateWorktreeInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
-  branch: TrimmedNonEmptyStringSchema,
-  newBranch: Schema.optional(TrimmedNonEmptyStringSchema),
+  // Slice S / M4-9.7 follow-up — SafeBranchName rejects flag-injection
+  // (`-b evil`), NUL bytes, and `..` ref-traversal at the schema
+  // boundary. See baseSchemas.ts for the rationale.
+  branch: SafeBranchName,
+  newBranch: Schema.optional(SafeBranchName),
   path: Schema.NullOr(TrimmedNonEmptyStringSchema),
 });
 export type GitCreateWorktreeInput = typeof GitCreateWorktreeInput.Type;
@@ -168,7 +177,8 @@ export type GitRemoveWorktreeInput = typeof GitRemoveWorktreeInput.Type;
 
 export const GitCreateBranchInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
-  branch: TrimmedNonEmptyStringSchema,
+  // Slice S / M4-9.7 follow-up — see baseSchemas.ts SafeBranchName.
+  branch: SafeBranchName,
   checkout: Schema.optional(Schema.Boolean),
 });
 export type GitCreateBranchInput = typeof GitCreateBranchInput.Type;
@@ -180,7 +190,11 @@ export type GitCreateBranchResult = typeof GitCreateBranchResult.Type;
 
 export const GitCheckoutInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
-  branch: TrimmedNonEmptyStringSchema,
+  // Slice S / M4-9.7 — load-bearing site. `git checkout <branch>`
+  // can't be defended with `--` (the `--` form switches to file
+  // restore — see GitCore.ts revert comment). SafeBranchName rejects
+  // `-b evil`, `--detach`, etc. before they reach git.
+  branch: SafeBranchName,
 });
 export type GitCheckoutInput = typeof GitCheckoutInput.Type;
 
@@ -326,7 +340,6 @@ export class GitCommandError extends Schema.TaggedErrorClass<GitCommandError>()(
   command: Schema.String,
   cwd: Schema.String,
   detail: Schema.String,
-  cause: Schema.optional(Schema.Defect),
 }) {
   override get message(): string {
     return `Git command failed in ${this.operation}: ${this.command} (${this.cwd}) - ${this.detail}`;
@@ -336,7 +349,6 @@ export class GitCommandError extends Schema.TaggedErrorClass<GitCommandError>()(
 export class GitHubCliError extends Schema.TaggedErrorClass<GitHubCliError>()("GitHubCliError", {
   operation: Schema.String,
   detail: Schema.String,
-  cause: Schema.optional(Schema.Defect),
 }) {
   override get message(): string {
     return `GitHub CLI failed in ${this.operation}: ${this.detail}`;
@@ -348,7 +360,6 @@ export class TextGenerationError extends Schema.TaggedErrorClass<TextGenerationE
   {
     operation: Schema.String,
     detail: Schema.String,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {
   override get message(): string {
@@ -359,7 +370,6 @@ export class TextGenerationError extends Schema.TaggedErrorClass<TextGenerationE
 export class GitManagerError extends Schema.TaggedErrorClass<GitManagerError>()("GitManagerError", {
   operation: Schema.String,
   detail: Schema.String,
-  cause: Schema.optional(Schema.Defect),
 }) {
   override get message(): string {
     return `Git manager failed in ${this.operation}: ${this.detail}`;

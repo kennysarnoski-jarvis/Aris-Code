@@ -546,7 +546,6 @@ const makeKeybindings = Effect.gen(function* () {
         new KeybindingsConfigError({
           configPath: keybindingsConfigPath,
           detail: "failed to access keybindings config",
-          cause,
         }),
     ),
   );
@@ -557,7 +556,6 @@ const makeKeybindings = Effect.gen(function* () {
         new KeybindingsConfigError({
           configPath: keybindingsConfigPath,
           detail: "failed to read keybindings config",
-          cause,
         }),
     ),
   );
@@ -577,7 +575,6 @@ const makeKeybindings = Effect.gen(function* () {
           new KeybindingsConfigError({
             configPath: keybindingsConfigPath,
             detail: "expected JSON array",
-            cause,
           }),
       ),
     );
@@ -672,11 +669,10 @@ const makeKeybindings = Effect.gen(function* () {
       Effect.flatMap(() => fs.rename(tempPath, keybindingsConfigPath)),
       Effect.ensuring(fs.remove(tempPath, { force: true }).pipe(Effect.ignore({ log: true }))),
       Effect.mapError(
-        (cause) =>
+        (_cause) =>
           new KeybindingsConfigError({
             configPath: keybindingsConfigPath,
             detail: "failed to write keybindings config",
-            cause,
           }),
       ),
     );
@@ -805,11 +801,10 @@ const makeKeybindings = Effect.gen(function* () {
 
     yield* fs.makeDirectory(keybindingsConfigDir, { recursive: true }).pipe(
       Effect.mapError(
-        (cause) =>
+        (_cause) =>
           new KeybindingsConfigError({
             configPath: keybindingsConfigPath,
             detail: "failed to prepare keybindings config directory",
-            cause,
           }),
       ),
     );

@@ -54,8 +54,12 @@ import {
   observeRpcStreamEffect,
 } from "./observability/RpcInstrumentation";
 import { ProviderRegistry } from "./provider/Services/ProviderRegistry";
-import { readActiveWindow } from "./provider/Layers/RollingWindowMemory";
-import { readFacts } from "./provider/Layers/FactsMemory.ts";
+import {
+  makeRollingWindowConfig,
+  readActiveWindow,
+  type RollingWindowConfig,
+} from "./provider/Layers/RollingWindowMemory";
+import { makeFactsConfig, readFacts, type FactsConfig } from "./provider/Layers/FactsMemory.ts";
 import { ServerLifecycleEvents } from "./serverLifecycleEvents";
 import { ServerRuntimeStartup } from "./serverRuntimeStartup";
 import { ServerSettingsService } from "./serverSettings";
@@ -66,7 +70,7 @@ import { WorkspacePathOutsideRootError } from "./workspace/Services/WorkspacePat
 import { ProjectSetupScriptRunner } from "./project/Services/ProjectSetupScriptRunner";
 import { RepositoryIdentityResolver } from "./project/Services/RepositoryIdentityResolver";
 import { ServerEnvironment } from "./environment/Services/ServerEnvironment";
-import { ServerAuth } from "./auth/Services/ServerAuth";
+import { AuthError, ServerAuth } from "./auth/Services/ServerAuth";
 import {
   BootstrapCredentialService,
   type BootstrapCredentialChange,
@@ -141,7 +145,11 @@ function toAuthAccessStreamEvent(
   }
 }
 
-const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
+const makeWsRpcLayer = (
+  currentSessionId: AuthSessionId,
+  factsConfig: FactsConfig,
+  rollingWindowConfig: RollingWindowConfig,
+) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
@@ -208,7 +216,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
           ? cause
           : new OrchestrationDispatchCommandError({
               message: cause instanceof Error ? cause.message : fallbackMessage,
-              cause,
             });
 
       const toBootstrapDispatchCommandCauseError = (cause: Cause.Cause<unknown>) => {
@@ -218,7 +225,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
           : new OrchestrationDispatchCommandError({
               message:
                 error instanceof Error ? error.message : "Failed to bootstrap thread turn start.",
-              cause,
             });
       };
 
@@ -585,7 +591,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                   ? cause
                   : new OrchestrationDispatchCommandError({
                       message: "Failed to dispatch orchestration command",
-                      cause,
                     }),
               ),
             ),
@@ -599,7 +604,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                 (cause) =>
                   new OrchestrationGetTurnDiffError({
                     message: "Failed to load turn diff",
-                    cause,
                   }),
               ),
             ),
@@ -613,7 +617,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                 (cause) =>
                   new OrchestrationGetFullThreadDiffError({
                     message: "Failed to load full thread diff",
-                    cause,
                   }),
               ),
             ),
@@ -636,7 +639,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                 (cause) =>
                   new OrchestrationReplayEventsError({
                     message: "Failed to replay orchestration events",
-                    cause,
                   }),
               ),
             ),
@@ -648,10 +650,9 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
             Effect.gen(function* () {
               const snapshot = yield* projectionSnapshotQuery.getShellSnapshot().pipe(
                 Effect.mapError(
-                  (cause) =>
+                  (_cause) =>
                     new OrchestrationGetSnapshotError({
                       message: "Failed to load orchestration shell snapshot",
-                      cause,
                     }),
                 ),
               );
@@ -680,10 +681,9 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
               const [threadDetail, snapshotSequence] = yield* Effect.all([
                 projectionSnapshotQuery.getThreadDetailById(input.threadId).pipe(
                   Effect.mapError(
-                    (cause) =>
+                    (_cause) =>
                       new OrchestrationGetSnapshotError({
                         message: `Failed to load thread ${input.threadId}`,
-                        cause,
                       }),
                   ),
                 ),
@@ -695,7 +695,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
               if (Option.isNone(threadDetail)) {
                 return yield* new OrchestrationGetSnapshotError({
                   message: `Thread ${input.threadId} was not found`,
-                  cause: input.threadId,
                 });
               }
 
@@ -760,7 +759,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                 (cause) =>
                   new ProjectSearchEntriesError({
                     message: `Failed to search workspace entries: ${cause.detail}`,
-                    cause,
                   }),
               ),
             ),
@@ -776,7 +774,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                   : "Failed to write workspace file";
                 return new ProjectWriteFileError({
                   message,
-                  cause,
                 });
               }),
             ),
@@ -792,7 +789,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                   : cause.detail || "Failed to read workspace file";
                 return new ProjectReadFileError({
                   message,
-                  cause,
                 });
               }),
             ),
@@ -806,7 +802,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                 (cause) =>
                   new ProjectListTreeError({
                     message: `Failed to list workspace tree: ${cause.detail}`,
-                    cause,
                   }),
               ),
             ),
@@ -824,7 +819,6 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                 (cause) =>
                   new FilesystemBrowseError({
                     message: cause.detail,
-                    cause,
                   }),
               ),
             ),
@@ -1096,7 +1090,11 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
             ARIS_WS_METHODS.readArchive,
             Effect.tryPromise({
               try: async () => {
-                const persisted = await readActiveWindow(input.cwd, input.threadId);
+                const persisted = await readActiveWindow(
+                  rollingWindowConfig,
+                  input.cwd,
+                  input.threadId,
+                );
                 return {
                   messages: persisted.map((m) => {
                     // Persisted messageId is already in the
@@ -1152,7 +1150,7 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
             ARIS_WS_METHODS.readFacts,
             Effect.tryPromise({
               try: async () => {
-                const facts = await readFacts();
+                const facts = await readFacts(factsConfig);
                 return { facts };
               },
               catch: (cause) =>
@@ -1198,6 +1196,181 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
     }),
   );
 
+/**
+ * Slice E.2 / H-2A fix (2026-05-16) — owner-only WS RPC policy gate.
+ *
+ * Pre-Slice-E.2, `makeWsRpcLayer` accepted `session.sessionId` but
+ * ignored `session.role`. Both owner and client sessions got identical
+ * unrestricted RPC power: file writes, terminal exec, server settings
+ * mutation, git ops, orchestration dispatch. A pairing-link client
+ * token issued for a second device could therefore take full server
+ * control — bypassing the owner-only gate the HTTP layer already
+ * enforces (see `authenticateOwnerSession` in auth/http.ts).
+ *
+ * Aris Code's product model is single-user / single-device — the
+ * T3 Code "share session with paired device" feature is unused
+ * surface here. Closing the WS to non-owner sessions is the
+ * simplest defensible default: one gate, mirrors the HTTP pattern,
+ * zero ongoing per-method audit debt. If a deliberate phone-mirror
+ * UX is ever wanted, the right shape is a read-only push channel
+ * (server → device events only), built from scratch — not a
+ * half-trusted bidirectional pipe with a per-method ACL.
+ *
+ * Returns `null` when the session is allowed to open the WS, or an
+ * `AuthError` (status 403) when the upgrade must be refused. Exported
+ * for direct unit-testing — the call site below just yields the
+ * error when non-null.
+ */
+export function checkWebSocketUpgradePolicy(session: {
+  readonly role: "owner" | "client";
+}): AuthError | null {
+  if (session.role !== "owner") {
+    return new AuthError({
+      message: "Client sessions cannot establish WebSocket RPC connections — owner-only.",
+      status: 403,
+    });
+  }
+  return null;
+}
+
+/**
+ * Slice J.5 / M3-5 fix (2026-05-16) — Cross-Site WebSocket Hijacking
+ * (CSWSH) defense. A malicious page the user visits in a browser can
+ * call `new WebSocket("ws://localhost:<port>/ws")` and ride the user's
+ * authenticated cookie — there is no Same-Origin Policy for
+ * WebSockets. The standard fix is to check the `Origin` header on
+ * upgrade and reject anything that isn't a known-safe origin.
+ *
+ * Allowed origins:
+ *   - **Missing / null** — Electron renderer often sends no Origin
+ *     header at all (custom protocol). Accept.
+ *   - **`file://`** — Electron production renderer when loaded from
+ *     disk. Accept.
+ *   - **Same host as the request's `Host` header** — the typical
+ *     same-origin case for the standalone web build.
+ *   - **`localhost` / `127.0.0.1` / `[::1]`** — dev origins (Vite at
+ *     a different port than the server).
+ *
+ * Anything else is a cross-origin upgrade and gets a 403. Exported
+ * for direct unit-testing.
+ */
+const LOCAL_HOSTS_ALLOWLIST = new Set(["localhost", "127.0.0.1", "[::1]"]);
+export function checkWebSocketOrigin(input: {
+  readonly origin: string | undefined;
+  readonly host: string | undefined;
+}): AuthError | null {
+  const { origin, host } = input;
+  if (!origin) return null;
+  let originUrl: URL;
+  try {
+    originUrl = new URL(origin);
+  } catch {
+    return new AuthError({
+      message: "WebSocket upgrade rejected — malformed Origin header.",
+      status: 403,
+    });
+  }
+  if (originUrl.protocol === "file:") return null;
+  if (host && originUrl.host === host) return null;
+  if (LOCAL_HOSTS_ALLOWLIST.has(originUrl.hostname)) return null;
+  return new AuthError({
+    message: `Cross-origin WebSocket upgrade rejected from ${origin}`,
+    status: 403,
+  });
+}
+
+/**
+ * Slice J.5 / M3-3 fix (2026-05-16) — cap on simultaneous WebSocket
+ * RPC connections. Pre-Slice-J the server accepted unlimited
+ * concurrent upgrades; a hostile (or buggy) client could open
+ * connections faster than they close, exhausting the event loop and
+ * the per-connection fiber pool.
+ *
+ * Aris Code's product model is single-user / single-Electron, so one
+ * connection at steady state. 10 is a generous ceiling that absorbs
+ * page reloads, hot-reload churn during dev, and the occasional
+ * second Electron window without affecting any legitimate workflow.
+ *
+ * Implementation: module-level counter, mutated synchronously
+ * (Node.js single-threaded, so increment/decrement are atomic). The
+ * `tryAcquireWsConnectionSlot` returns a release function the route
+ * wires into `Effect.acquireUseRelease` so the slot is freed on
+ * close (normal exit, error, or revocation interrupt).
+ */
+const MAX_CONCURRENT_WS_CONNECTIONS = 10;
+let activeWsConnectionCount = 0;
+export function tryAcquireWsConnectionSlot(): {
+  readonly acquired: boolean;
+  readonly release: () => void;
+} {
+  if (activeWsConnectionCount >= MAX_CONCURRENT_WS_CONNECTIONS) {
+    return { acquired: false, release: () => undefined };
+  }
+  activeWsConnectionCount += 1;
+  let released = false;
+  return {
+    acquired: true,
+    release: () => {
+      if (released) return;
+      released = true;
+      activeWsConnectionCount -= 1;
+    },
+  };
+}
+
+/** @internal Test-only: reset the global counter. Not exported via index. */
+export function __resetWsConnectionCountForTests(): void {
+  activeWsConnectionCount = 0;
+}
+
+/**
+ * Slice E.3 / H-2D fix (2026-05-16) — revocation-watcher effect.
+ *
+ * Pre-Slice-E.3, revoking a session via `POST /api/auth/clients/revoke`
+ * (or `revoke-others`) updated the DB row and the in-memory connected-
+ * sessions ref, but the WebSocket fiber for that session kept running
+ * with full RPC access. An admin who revoked a compromised session
+ * had no way to actually kick the attacker — the socket stayed alive
+ * until the attacker chose to disconnect.
+ *
+ * `SessionCredentialService.streamChanges` already broadcasts a
+ * `clientRemoved` event on every revoke (it backs the auth-access
+ * live-stream the desktop UI subscribes to). We piggy-back on that
+ * signal: each WS upgrade spawns a sibling effect that subscribes to
+ * the change stream, filters for the connection's own `sessionId`,
+ * and completes when the matching event arrives. The route races
+ * the RPC effect against this watcher — whichever finishes first
+ * wins; the loser is interrupted, the `acquireUseRelease` release
+ * still runs, `markDisconnected` cleans up.
+ *
+ * The watcher never errors and never produces a value — it either
+ * blocks forever (the typical case: the session is never revoked
+ * during this connection's lifetime, so the watcher gets interrupted
+ * when the RPC side closes normally) or completes silently the
+ * instant the revoke fires (so the race's other side gets
+ * interrupted and the socket drops).
+ *
+ * Exported for direct unit-testing without spinning up the full HTTP
+ * / RPC graph.
+ */
+export function watchOwnSessionRevocation(
+  changes: Stream.Stream<SessionCredentialChange>,
+  sessionId: AuthSessionId,
+): Effect.Effect<never> {
+  return changes.pipe(
+    Stream.filter((change) => change.type === "clientRemoved" && change.sessionId === sessionId),
+    Stream.take(1),
+    Stream.runDrain,
+    Effect.orDie,
+    // Terminate the fiber once the matching revoke arrives. The race
+    // partner (the RPC effect) is interrupted, the acquireUseRelease
+    // release runs `markDisconnected`, the WS closes. We never return
+    // a value here — typed `never` so race's success union collapses
+    // to whatever the RPC side produces.
+    Effect.flatMap(() => Effect.interrupt),
+  );
+}
+
 export const websocketRpcRouteLayer = Layer.unwrap(
   Effect.succeed(
     HttpRouter.add(
@@ -1207,7 +1380,40 @@ export const websocketRpcRouteLayer = Layer.unwrap(
         const request = yield* HttpServerRequest.HttpServerRequest;
         const serverAuth = yield* ServerAuth;
         const sessions = yield* SessionCredentialService;
+
+        // Slice J.5 / M3-5 — Origin allowlist BEFORE auth so a
+        // cross-origin browser tab can't even get to the credential
+        // check. Closes CSWSH at the door.
+        const originError = checkWebSocketOrigin({
+          origin: request.headers["origin"],
+          host: request.headers["host"],
+        });
+        if (originError !== null) {
+          return yield* originError;
+        }
+
         const session = yield* serverAuth.authenticateWebSocketUpgrade(request);
+        const factsConfig = makeFactsConfig();
+        // Slice L / M3-2 — same composition-root pattern. One
+        // `homedir()` call per WS upgrade; threaded through every
+        // RPC handler that touches `~/.aris/projects/<key>/sessions`.
+        const rollingWindowConfig = makeRollingWindowConfig();
+        const policyError = checkWebSocketUpgradePolicy(session);
+        if (policyError !== null) {
+          return yield* policyError;
+        }
+
+        // Slice J.5 / M3-3 — try to acquire a WS connection slot. If
+        // the cap is hit, return 503; otherwise reserve the slot and
+        // release it via `acquireUseRelease` below on connection
+        // close.
+        const wsSlot = tryAcquireWsConnectionSlot();
+        if (!wsSlot.acquired) {
+          return yield* new AuthError({
+            message: `WebSocket connection limit reached (${MAX_CONCURRENT_WS_CONNECTIONS}).`,
+            status: 503,
+          });
+        }
         const rpcWebSocketHttpEffect = yield* RpcServer.toHttpEffectWebsocket(WsRpcGroup, {
           spanPrefix: "ws.rpc",
           spanAttributes: {
@@ -1216,13 +1422,32 @@ export const websocketRpcRouteLayer = Layer.unwrap(
           },
         }).pipe(
           Effect.provide(
-            makeWsRpcLayer(session.sessionId).pipe(Layer.provideMerge(RpcSerialization.layerJson)),
+            makeWsRpcLayer(session.sessionId, factsConfig, rollingWindowConfig).pipe(
+              Layer.provideMerge(RpcSerialization.layerJson),
+            ),
           ),
+        );
+        // Slice E.3 / H-2D — race the RPC effect against the
+        // revocation watcher. If `POST /api/auth/clients/revoke` fires
+        // for this session while the WS is alive, the watcher
+        // completes, race wins, the RPC fiber is interrupted, the
+        // `acquireUseRelease` release runs `markDisconnected`, and
+        // the socket drops. If the RPC closes normally first, the
+        // watcher is interrupted (no-op cleanup).
+        const revocationWatcher = watchOwnSessionRevocation(
+          sessions.streamChanges,
+          session.sessionId,
         );
         return yield* Effect.acquireUseRelease(
           sessions.markConnected(session.sessionId),
-          () => rpcWebSocketHttpEffect,
-          () => sessions.markDisconnected(session.sessionId),
+          () => Effect.race(rpcWebSocketHttpEffect, revocationWatcher),
+          () =>
+            // Release BOTH the session-connected mark and the
+            // module-level WS slot counter (Slice J.5 / M3-3). Order
+            // doesn't matter — they're independent counters.
+            sessions
+              .markDisconnected(session.sessionId)
+              .pipe(Effect.tap(() => Effect.sync(() => wsSlot.release()))),
         );
       }).pipe(Effect.catchTag("AuthError", respondToAuthError)),
     ),

@@ -22,7 +22,6 @@ function normalizeGitHubCliError(operation: "execute" | "stdout", error: unknown
       return new GitHubCliError({
         operation,
         detail: "GitHub CLI (`gh`) is required but not available on PATH.",
-        cause: error,
       });
     }
 
@@ -36,7 +35,6 @@ function normalizeGitHubCliError(operation: "execute" | "stdout", error: unknown
       return new GitHubCliError({
         operation,
         detail: "GitHub CLI is not authenticated. Run `gh auth login` and retry.",
-        cause: error,
       });
     }
 
@@ -49,21 +47,18 @@ function normalizeGitHubCliError(operation: "execute" | "stdout", error: unknown
       return new GitHubCliError({
         operation,
         detail: "Pull request not found. Check the PR number or URL and try again.",
-        cause: error,
       });
     }
 
     return new GitHubCliError({
       operation,
       detail: `GitHub CLI command failed: ${error.message}`,
-      cause: error,
     });
   }
 
   return new GitHubCliError({
     operation,
     detail: "GitHub CLI command failed.",
-    cause: error,
   });
 }
 
@@ -95,7 +90,6 @@ function decodeGitHubJson<S extends Schema.Top>(
         new GitHubCliError({
           operation,
           detail: `${invalidDetail}: ${SchemaIssue.makeFormatterDefault()(error.issue)}`,
-          cause: error,
         }),
     ),
   );
@@ -141,7 +135,6 @@ const makeGitHubCli = Effect.sync(() => {
                       new GitHubCliError({
                         operation: "listOpenPullRequests",
                         detail: `GitHub CLI returned invalid PR list JSON: ${formatGitHubJsonDecodeError(decoded.failure)}`,
-                        cause: decoded.failure,
                       }),
                     );
                   }
@@ -173,7 +166,6 @@ const makeGitHubCli = Effect.sync(() => {
                   new GitHubCliError({
                     operation: "getPullRequest",
                     detail: `GitHub CLI returned invalid pull request JSON: ${formatGitHubJsonDecodeError(decoded.failure)}`,
-                    cause: decoded.failure,
                   }),
                 );
               }

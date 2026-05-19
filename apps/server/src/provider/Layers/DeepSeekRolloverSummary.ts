@@ -36,7 +36,11 @@ import { promises as fs } from "node:fs";
 import { join, basename } from "node:path";
 import OpenAI from "openai";
 
-import { getThreadArchiveDir, type PersistedMessage } from "./RollingWindowMemory.ts";
+import {
+  getThreadArchiveDir,
+  type PersistedMessage,
+  type RollingWindowConfig,
+} from "./RollingWindowMemory.ts";
 
 /**
  * Hard cap on the summary's output tokens. Keeps each rollup bounded
@@ -56,6 +60,12 @@ const SUMMARY_MODEL = "deepseek-v4-pro";
 const SUMMARY_FILENAME_SUFFIX = ".summary.md";
 
 export interface GenerateRolloverSummaryOptions {
+  /**
+   * Slice L / M3-2 — resolved rolling-window paths threaded from the
+   * adapter so background summary generation doesn't reach for
+   * `homedir()` implicitly.
+   */
+  readonly rollingWindowConfig: RollingWindowConfig;
   readonly cwd: string;
   readonly threadId: string;
   /** Index of the just-archived window (1, 2, 3, ...). */
@@ -70,9 +80,17 @@ export interface GenerateRolloverSummaryOptions {
  * Path to a window's summary file. Mirrors the archive path naming:
  * `window_NNN.jsonl` ↔ `window_NNN.summary.md`.
  */
-export function getSummaryPath(cwd: string, threadId: string, windowIndex: number): string {
+export function getSummaryPath(
+  config: RollingWindowConfig,
+  cwd: string,
+  threadId: string,
+  windowIndex: number,
+): string {
   const padded = String(windowIndex).padStart(3, "0");
-  return join(getThreadArchiveDir(cwd, threadId), `window_${padded}${SUMMARY_FILENAME_SUFFIX}`);
+  return join(
+    getThreadArchiveDir(config, cwd, threadId),
+    `window_${padded}${SUMMARY_FILENAME_SUFFIX}`,
+  );
 }
 
 /**
@@ -84,10 +102,11 @@ export function getSummaryPath(cwd: string, threadId: string, windowIndex: numbe
  * generation prompt) and RW-5 (to seed the new active window).
  */
 export async function findLatestSummaryPath(
+  config: RollingWindowConfig,
   cwd: string,
   threadId: string,
 ): Promise<{ path: string; windowIndex: number } | null> {
-  const dir = getThreadArchiveDir(cwd, threadId);
+  const dir = getThreadArchiveDir(config, cwd, threadId);
   let entries: string[];
   try {
     entries = await fs.readdir(dir);
@@ -253,14 +272,14 @@ function buildUserPrompt(opts: {
  * failure. Callers wrap this in a fire-and-forget invocation.
  */
 async function generateRolloverSummary(opts: GenerateRolloverSummaryOptions): Promise<string> {
-  const { cwd, threadId, windowIndex, archivedPath, openaiClient } = opts;
+  const { rollingWindowConfig, cwd, threadId, windowIndex, archivedPath, openaiClient } = opts;
 
   const messages = await readArchivedWindow(archivedPath);
   const archiveText = renderArchiveForSummary(messages);
 
   let priorSummary: string | null = null;
   if (windowIndex > 1) {
-    const priorSummaryPath = getSummaryPath(cwd, threadId, windowIndex - 1);
+    const priorSummaryPath = getSummaryPath(rollingWindowConfig, cwd, threadId, windowIndex - 1);
     priorSummary = await readSummary(priorSummaryPath);
   }
 
@@ -284,7 +303,7 @@ async function generateRolloverSummary(opts: GenerateRolloverSummaryOptions): Pr
     throw new Error("DeepSeek returned empty summary content");
   }
 
-  const summaryPath = getSummaryPath(cwd, threadId, windowIndex);
+  const summaryPath = getSummaryPath(rollingWindowConfig, cwd, threadId, windowIndex);
   await fs.writeFile(summaryPath, summaryText + "\n", { encoding: "utf8" });
   return summaryPath;
 }

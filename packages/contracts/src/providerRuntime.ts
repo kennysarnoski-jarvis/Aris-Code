@@ -8,14 +8,21 @@ import {
   RuntimeItemId,
   RuntimeRequestId,
   RuntimeTaskId,
+  SafeRecordKey,
   ThreadId,
   TrimmedNonEmptyString,
   TurnId,
 } from "./baseSchemas";
-import { ProviderKind } from "./orchestration";
+import {
+  PROVIDER_ASSISTANT_DELTA_MAX_CHARS,
+  PROVIDER_ASSISTANT_TEXT_MAX_CHARS,
+  ProviderKind,
+} from "./orchestration";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
-const UnknownRecordSchema = Schema.Record(Schema.String, Schema.Unknown);
+// Slice E.1 / H-2C — see baseSchemas.ts. Used here for runtime `config`,
+// `metadata`, `modelUsage`, and approval-response `answers` records.
+const UnknownRecordSchema = Schema.Record(SafeRecordKey, Schema.Unknown);
 
 const RuntimeEventRawSource = Schema.Literals([
   "codex.app-server.notification",
@@ -378,7 +385,8 @@ const TurnPlanUpdatedPayload = Schema.Struct({
 export type TurnPlanUpdatedPayload = typeof TurnPlanUpdatedPayload.Type;
 
 const TurnProposedDeltaPayload = Schema.Struct({
-  delta: Schema.String,
+  // Slice I / H3-7 — streaming delta cap.
+  delta: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_DELTA_MAX_CHARS)),
 });
 export type TurnProposedDeltaPayload = typeof TurnProposedDeltaPayload.Type;
 
@@ -388,7 +396,10 @@ const TurnProposedCompletedPayload = Schema.Struct({
 export type TurnProposedCompletedPayload = typeof TurnProposedCompletedPayload.Type;
 
 const TurnDiffUpdatedPayload = Schema.Struct({
-  unifiedDiff: Schema.String,
+  // Slice I / H3-7 — assembled-content cap. Unified diffs for sweeping
+  // refactors can be large; 10M chars is the upper bound we accept
+  // before treating it as pathological.
+  unifiedDiff: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_TEXT_MAX_CHARS)),
 });
 export type TurnDiffUpdatedPayload = typeof TurnDiffUpdatedPayload.Type;
 
@@ -403,7 +414,8 @@ export type ItemLifecyclePayload = typeof ItemLifecyclePayload.Type;
 
 const ContentDeltaPayload = Schema.Struct({
   streamKind: RuntimeContentStreamKind,
-  delta: Schema.String,
+  // Slice I / H3-7 — streaming delta cap.
+  delta: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_DELTA_MAX_CHARS)),
   contentIndex: Schema.optional(Schema.Int),
   summaryIndex: Schema.optional(Schema.Int),
 });

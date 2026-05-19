@@ -1,5 +1,5 @@
 import { Effect, Schema } from "effect";
-import { TrimmedNonEmptyString } from "./baseSchemas";
+import { safeRecordKeyFilter, TrimmedNonEmptyString } from "./baseSchemas";
 
 export const DEFAULT_TERMINAL_ID = "default";
 
@@ -11,13 +11,41 @@ const TerminalRowsSchema = Schema.Int.check(Schema.isGreaterThanOrEqualTo(5)).ch
   Schema.isLessThanOrEqualTo(200),
 );
 const TerminalIdSchema = TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(128));
-const TerminalEnvKeySchema = Schema.String.check(
-  Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_]*$/),
-).check(Schema.isMaxLength(128));
+// Slice H.1 / H3-6 — `__proto__`, `constructor`, and `prototype` all
+// match the regex below (they're plain identifier-shaped strings), so
+// the pre-Slice-H schema accepted them as env-var keys. If terminal
+// env values ever flow through a spread into a plain object, that's a
+// prototype-pollution vector. We AND the existing regex with
+// `safeRecordKeyFilter` (Slice E.1 / H-2C) so the prototype-magic
+// names are explicitly rejected at the schema boundary — same
+// guarantee as every other `Schema.Record` site.
+const TerminalEnvKeySchema = Schema.String.check(Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_]*$/))
+  .check(safeRecordKeyFilter)
+  .check(Schema.isMaxLength(128));
 const TerminalEnvValueSchema = Schema.String.check(Schema.isMaxLength(8_192));
 const TerminalEnvSchema = Schema.Record(TerminalEnvKeySchema, TerminalEnvValueSchema).check(
   Schema.isMaxProperties(128),
 );
+
+/**
+ * Slice J.1 / M3-12 fix (2026-05-16) — caps on terminal output payloads.
+ *
+ * - `TERMINAL_HISTORY_MAX_CHARS` — the cumulative scrollback history
+ *   the server retains for replay on session reattach. Pre-Slice-J
+ *   the schema accepted unbounded `Schema.String`; a long-running
+ *   terminal session producing megabytes of output could grow the
+ *   persisted snapshot without bound. 16M chars (~32 MB UTF-16) is
+ *   well above any realistic legitimate scrollback while still
+ *   bounding the worst case.
+ *
+ * - `TERMINAL_OUTPUT_EVENT_MAX_CHARS` — per-event output chunk size.
+ *   Mirrors the input cap (`TerminalWriteInput.data` at 64K) for
+ *   symmetry — neither direction should fire a multi-MB single
+ *   message. Real PTY chunks are typically tens-to-hundreds of bytes;
+ *   64K chars is generous headroom.
+ */
+export const TERMINAL_HISTORY_MAX_CHARS = 16_777_216;
+export const TERMINAL_OUTPUT_EVENT_MAX_CHARS = 65_536;
 
 const TerminalIdWithDefaultSchema = TerminalIdSchema.pipe(
   Schema.withDecodingDefault(Effect.succeed(DEFAULT_TERMINAL_ID)),
@@ -81,13 +109,22 @@ export const TerminalSessionStatus = Schema.Literals(["starting", "running", "ex
 export type TerminalSessionStatus = typeof TerminalSessionStatus.Type;
 
 export const TerminalSessionSnapshot = Schema.Struct({
-  threadId: Schema.String.check(Schema.isNonEmpty()),
-  terminalId: Schema.String.check(Schema.isNonEmpty()),
-  cwd: Schema.String.check(Schema.isNonEmpty()),
+  // Slice F.1 / M-2H — these were `Schema.String.check(Schema.isNonEmpty())`,
+  // inconsistent with the input schemas above which use `TrimmedNonEmptyString`.
+  // `isNonEmpty` checks length > 0 only, so whitespace-only values like
+  // `"   "` slip through and silently mismatch threadId/terminalId/cwd
+  // lookups downstream. Switching to the canonical
+  // `TrimmedNonEmptyStringSchema` matches the input shape and closes the
+  // whitespace-bypass class.
+  threadId: TrimmedNonEmptyStringSchema,
+  terminalId: TrimmedNonEmptyStringSchema,
+  cwd: TrimmedNonEmptyStringSchema,
   worktreePath: Schema.NullOr(TrimmedNonEmptyStringSchema),
   status: TerminalSessionStatus,
   pid: Schema.NullOr(Schema.Int.check(Schema.isGreaterThan(0))),
-  history: Schema.String,
+  // Slice J.1 / M3-12 — bound the scrollback history at the wire so
+  // a runaway terminal can't grow the snapshot payload unbounded.
+  history: Schema.String.check(Schema.isMaxLength(TERMINAL_HISTORY_MAX_CHARS)),
   exitCode: Schema.NullOr(Schema.Int),
   exitSignal: Schema.NullOr(Schema.Int),
   updatedAt: Schema.String,
@@ -95,8 +132,9 @@ export const TerminalSessionSnapshot = Schema.Struct({
 export type TerminalSessionSnapshot = typeof TerminalSessionSnapshot.Type;
 
 const TerminalEventBaseSchema = Schema.Struct({
-  threadId: Schema.String.check(Schema.isNonEmpty()),
-  terminalId: Schema.String.check(Schema.isNonEmpty()),
+  // Slice F.1 / M-2H — see TerminalSessionSnapshot above for rationale.
+  threadId: TrimmedNonEmptyStringSchema,
+  terminalId: TrimmedNonEmptyStringSchema,
   createdAt: Schema.String,
 });
 
@@ -109,7 +147,9 @@ const TerminalStartedEvent = Schema.Struct({
 const TerminalOutputEvent = Schema.Struct({
   ...TerminalEventBaseSchema.fields,
   type: Schema.Literal("output"),
-  data: Schema.String,
+  // Slice J.1 / M3-12 — per-chunk output cap, mirrors the input cap on
+  // TerminalWriteInput.data for symmetry.
+  data: Schema.String.check(Schema.isMaxLength(TERMINAL_OUTPUT_EVENT_MAX_CHARS)),
 });
 
 const TerminalExitedEvent = Schema.Struct({
@@ -122,7 +162,16 @@ const TerminalExitedEvent = Schema.Struct({
 const TerminalErrorEvent = Schema.Struct({
   ...TerminalEventBaseSchema.fields,
   type: Schema.Literal("error"),
-  message: Schema.String.check(Schema.isNonEmpty()),
+  // Slice N.2 / M4-10 — cap error message at the same chunk size used
+  // for data events (`TERMINAL_OUTPUT_EVENT_MAX_CHARS`, 64K). Without
+  // a cap, a hostile or runaway shell could ship a 100MB error
+  // string through every renderer that has the terminal channel
+  // open. Errors are diagnostic — 64K is more than enough for a
+  // stack trace; anything larger is abuse.
+  message: Schema.String.check(
+    Schema.isNonEmpty(),
+    Schema.isMaxLength(TERMINAL_OUTPUT_EVENT_MAX_CHARS),
+  ),
 });
 
 const TerminalClearedEvent = Schema.Struct({
@@ -158,7 +207,6 @@ export class TerminalCwdError extends Schema.TaggedErrorClass<TerminalCwdError>(
   {
     cwd: Schema.String,
     reason: Schema.Literals(["notFound", "notDirectory", "statFailed"]),
-    cause: Schema.optional(Schema.Defect),
   },
 ) {
   override get message() {
@@ -184,7 +232,6 @@ export class TerminalHistoryError extends Schema.TaggedErrorClass<TerminalHistor
     operation: Schema.Literals(["read", "truncate", "migrate"]),
     threadId: Schema.String,
     terminalId: Schema.String,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {
   override get message() {

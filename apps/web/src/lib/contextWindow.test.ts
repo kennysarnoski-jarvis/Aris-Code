@@ -3,13 +3,21 @@ import { EventId, type OrchestrationThreadActivity, TurnId } from "@t3tools/cont
 
 import { deriveLatestContextWindowSnapshot, formatContextWindowTokens } from "./contextWindow";
 
+// Slice J.1 / M3-11 — `OrchestrationThreadActivity.payload` tightened
+// from `Schema.Unknown` to `Record(SafeRecordKey, Unknown)`. Test
+// fixtures here build malformed values (numbers, nulls, arrays) on
+// purpose to exercise `deriveLatestContextWindowSnapshot`'s
+// validation; the assignment cast keeps the fixture builders ergonomic
+// while honoring the contract at the type-system boundary. Runtime
+// behavior is what's actually under test — the cast is purely a TS
+// affordance for the fixture authoring style.
 function makeActivity(id: string, kind: string, payload: unknown): OrchestrationThreadActivity {
   return {
     id: EventId.make(id),
     tone: "info",
     kind,
     summary: kind,
-    payload,
+    payload: payload as OrchestrationThreadActivity["payload"],
     turnId: TurnId.make("turn-1"),
     createdAt: "2026-03-23T00:00:00.000Z",
   };

@@ -183,19 +183,17 @@ const makeClaudeTextGeneration = Effect.gen(function* () {
           new TextGenerationError({
             operation,
             detail: "Claude CLI returned unexpected output format.",
-            cause,
           }),
         ),
       ),
     );
 
     return yield* Schema.decodeEffect(outputSchemaJson)(envelope.structured_output).pipe(
-      Effect.catchTag("SchemaError", (cause) =>
+      Effect.catchTag("SchemaError", (_cause) =>
         Effect.fail(
           new TextGenerationError({
             operation,
             detail: "Claude returned invalid structured output.",
-            cause,
           }),
         ),
       ),

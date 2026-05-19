@@ -100,22 +100,31 @@ import {
 import { DeepSeekAdapter, type DeepSeekAdapterShape } from "../Services/DeepSeekAdapter.ts";
 import { Agent, type RunToolApprovalItem, run } from "@openai/agents";
 import { OpenAIChatCompletionsModel } from "@openai/agents-openai";
+import { sanitizeProviderErrorForUi } from "./DeepSeekAgentRunner.ts";
 import { runDeepSeekAgentEffect } from "./DeepSeekAgentRunnerEffect.ts";
 import { createDeepSeekAgentTools } from "./DeepSeekAgentTools.ts";
+import { mapEffortToReasoningEffort } from "./DeepSeekEffortMapping.ts";
 import {
   createDeepSeekOpenAIClient,
   getRequestReasoningEffort,
   setRequestReasoningEffort,
 } from "./DeepSeekOpenAIClient.ts";
+import { loadAllAgentTemplates } from "./ArisAgentTemplatesLoader.ts";
 import { loadAllSkills } from "./ArisSkillsLoader.ts";
 import { createUseSkillTool, type ForkExecutor, rewriteSlashCommand } from "./ArisSkillsTool.ts";
 import {
   appendToActiveWindow,
+  makeRollingWindowConfig,
   readActiveWindow,
   RollingWindowIOError,
   toRollingWindowIOError,
   tryRollover,
 } from "./RollingWindowMemory.ts";
+import { makeHookBus } from "./HookBus.ts";
+import { makeSessionEndArchiveHook } from "./SessionEndArchiveHook.ts";
+import { makeSessionStartCrossThreadHook } from "./SessionStartCrossThreadHook.ts";
+import { makeStopActiveSummaryHook } from "./StopActiveSummaryHook.ts";
+import type OpenAI from "openai";
 import {
   findLatestSummaryPath,
   generateRolloverSummaryBackground,
@@ -123,7 +132,13 @@ import {
 } from "./DeepSeekRolloverSummary.ts";
 import { readScratchpad, ScratchpadIOError, toScratchpadIOError } from "./ScratchpadMemory.ts";
 import { readTodos, renderOpenTodos, TodosIOError, toTodosIOError } from "./TodosMemory.ts";
-import { FactsIOError, readFacts, renderFacts, toFactsIOError } from "./FactsMemory.ts";
+import {
+  FactsIOError,
+  makeFactsConfig,
+  readFacts,
+  renderFacts,
+  toFactsIOError,
+} from "./FactsMemory.ts";
 import type { AgentInputItem } from "@openai/agents";
 
 const PROVIDER = "deepseek" as const;
@@ -159,55 +174,11 @@ function buildApprovalSummary(
 }
 const DEFAULT_MODEL = "deepseek-v4-pro";
 
-/**
- * Map a skill's `effort:` frontmatter value to a DeepSeek reasoning
- * effort. Skill authors use the same string vocabulary across
- * providers (per `mapEffortToEnableThinking` in `ArisSkillsTool`),
- * we just translate to DeepSeek's 3-level scale instead of Aris's
- * binary `enable_thinking`.
- *
- *   max | maximum | ultra                          → "max"
- *   high | medium | thinking | on | yes | true     → "high"
- *   low | minimal | off | no | false | light       → "light"
- *   anything else (or undefined)                   → undefined (cloud default)
- *
- * Note: "off"/"no"/"false" map to "light" not "no thinking" — V4-Pro
- * always reasons, only depth is controllable. The skill-frontmatter
- * vocabulary stays loose so authors don't have to know that.
- *
- * `undefined` means "don't override" so the cloud picks the default
- * depth. Mirrors Aris's "unknown values silently no-op" pattern so a
- * typo in skill frontmatter doesn't crash the dispatch.
- */
-function mapEffortToReasoningEffort(
-  effort: string | undefined,
-): DeepSeekReasoningEffort | undefined {
-  if (!effort) return undefined;
-  const normalized = effort.trim().toLowerCase();
-  switch (normalized) {
-    case "max":
-    case "maximum":
-    case "ultra":
-      return "max";
-    case "high":
-    case "medium":
-    case "thinking":
-    case "on":
-    case "yes":
-    case "true":
-      return "high";
-    case "low":
-    case "minimal":
-    case "off":
-    case "no":
-    case "false":
-    case "light":
-    case "non-think": // legacy alias — kept so old frontmatter still maps cleanly
-      return "light";
-    default:
-      return undefined;
-  }
-}
+// Slice 4 (2026-05-16): `mapEffortToReasoningEffort` moved to
+// `./DeepSeekEffortMapping.ts` so `DeepSeekAgentTool` (spawn_worker
+// template lookup) can share the same coercion logic without creating
+// a circular dependency back through this adapter. Imported via the
+// import block at the top of this file.
 
 interface DeepSeekSessionContext {
   session: ProviderSession;
@@ -221,6 +192,17 @@ interface DeepSeekSessionContext {
    */
   readonly pendingApprovals: Map<ApprovalRequestId, Deferred.Deferred<ProviderApprovalDecision>>;
   readonly sessionApprovedTools: Set<string>;
+  /**
+   * Slice Z.2 — cross-thread briefing produced by the SessionStart
+   * hook, cached for the life of the thread. `undefined` when the
+   * session has no cwd, when this is the first thread in the
+   * project, when no other thread has rolled over yet, or when
+   * every other thread's most recent rollover is past the recency
+   * window. The hook owns rendering; the value here is the
+   * complete system-context block ready to slot into the turn
+   * input. See `SessionStartCrossThreadHook.ts`.
+   */
+  readonly priorThreadInject: string | undefined;
 }
 
 const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
@@ -229,6 +211,54 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
   // Needed by materializeUserContent below to resolve attachment ids
   // back to filesystem paths (mirrors CodexAdapter line 1349 pattern).
   const serverConfig = yield* Effect.service(ServerConfig);
+
+  // MEM-3 — Construct the facts config ONCE at adapter startup.
+  // `makeFactsConfig()` calls `homedir()` exactly once here — every
+  // IO function and tool execute closure below receives this config
+  // instead of calling homedir() implicitly at call time.
+  const factsConfig = makeFactsConfig();
+  // Slice L / M3-2 — same pattern for the rolling-window store.
+  // `makeRollingWindowConfig()` calls `homedir()` exactly once at
+  // adapter startup; every RW IO function below receives this
+  // config explicitly so test runs can't accidentally pollute the
+  // real ~/.aris/projects/.../active.jsonl.
+  const rollingWindowConfig = makeRollingWindowConfig();
+
+  // Slice Z.1/Z.2/Z.3 — hook bus instance lives for the life of the
+  // adapter. Built-in hooks register here at construction time;
+  // future user-authored hooks would register through a config
+  // loader (deferred to a later slice).
+  //
+  // Registered hooks:
+  //   - session-start-cross-thread (Slice Z.2): surfaces prior
+  //     thread's summary as turn-0 system context.
+  //   - stop-active-summary (Slice Z.3): after every assistant
+  //     turn, non-destructively writes active.summary.md for
+  //     cross-thread memory consumption by future threads.
+  //   - session-end-archive (Slice Z.3): on real session stop,
+  //     destructively archives active.jsonl → window_NNN.jsonl
+  //     and fires the rollover summary.
+  //
+  // The hook handlers run as plain Promises (not Effects) since
+  // they're called from event listener boundaries. They need
+  // settings to construct the OpenAI client — that lookup is
+  // wrapped here once and reused. Settings are re-fetched on each
+  // fire (not snapshotted) so runtime updates (user pastes new
+  // cloud token) take effect on the next Stop.
+  const lookupOpenAIClient = async (): Promise<OpenAI | null> => {
+    const allSettings = await Effect.runPromise(serverSettings.getSettings);
+    const ds = allSettings.providers.deepseek;
+    if (!ds.cloudBaseUrl || !ds.cloudToken) return null;
+    return createDeepSeekOpenAIClient({
+      cloudBaseUrl: ds.cloudBaseUrl,
+      cloudToken: ds.cloudToken,
+    });
+  };
+
+  const hookBus = makeHookBus();
+  hookBus.register(makeSessionStartCrossThreadHook(rollingWindowConfig));
+  hookBus.register(makeStopActiveSummaryHook({ rollingWindowConfig, lookupOpenAIClient }));
+  hookBus.register(makeSessionEndArchiveHook({ rollingWindowConfig, lookupOpenAIClient }));
 
   const sessions = new Map<ThreadId, DeepSeekSessionContext>();
 
@@ -284,12 +314,41 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
         updatedAt: startedAt,
       };
 
+      // Slice Z.2 — fire the SessionStart hook bus. The
+      // cross-thread cross-project briefing previously inlined here
+      // is now the `session-start-cross-thread` built-in hook; any
+      // future SessionStart hooks compose with it through the bus.
+      // The bus returns the concatenated inject string (or
+      // `undefined` if no hook produced anything). Same "don't
+      // block on errors" semantics as before: handler throws are
+      // caught at the bus level and logged without failing the
+      // session start.
+      const priorThreadInject: string | undefined = yield* Effect.tryPromise({
+        try: () =>
+          hookBus.dispatchSessionStart({
+            event: "SessionStart",
+            threadId: input.threadId,
+            cwd: input.cwd,
+          }),
+        catch: (err) => err as Error,
+      }).pipe(
+        Effect.catch((err) =>
+          Effect.sync(() => {
+            console.warn(
+              `[DeepSeekAdapter] SessionStart bus dispatch failed: ${(err as Error).message}`,
+            );
+            return undefined;
+          }),
+        ),
+      );
+
       const ctx: DeepSeekSessionContext = {
         session,
         activeFiber: undefined,
         stopped: false,
         pendingApprovals: new Map(),
         sessionApprovedTools: new Set(),
+        priorThreadInject,
       };
       sessions.set(input.threadId, ctx);
 
@@ -372,7 +431,24 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
         cloudToken: deepseekSettings.cloudToken,
       });
       const modelName = modelOverride ?? DEFAULT_MODEL;
+
+      // Slice 4 — Agent templates from `.aris/agents/`. Must load
+      // BEFORE the composer call because the spawn_worker tool's
+      // description is built per-call from `deps.templates` so the
+      // model sees the current template manifest. Skills load happens
+      // later (they feed `createUseSkillTool` not the composer).
+      const agentTemplatesResult = yield* Effect.promise(() =>
+        loadAllAgentTemplates({ workspaceRoot: ctx.session.cwd }),
+      );
+      if (agentTemplatesResult.errors.length > 0) {
+        yield* Effect.logWarning("Some DeepSeek agent templates failed to load", {
+          errors: agentTemplatesResult.errors.map((e) => `${e.path}: ${e.message}`),
+        });
+      }
+
       const baseTools = createDeepSeekAgentTools({
+        factsConfig,
+        rollingWindowConfig,
         cwd: ctx.session.cwd,
         threadId: ctx.session.threadId,
         // #22 — Approval gating. Tools' `needsApproval` flag is set
@@ -399,6 +475,10 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
         emitCoordinatorEvent: (event) => {
           void publishArisEvent(event).pipe(Effect.runPromise);
         },
+        // Slice 4 — agent templates threaded through so spawn_worker's
+        // tool description includes the manifest and its execute()
+        // can resolve `template: "<name>"` lookups.
+        templates: agentTemplatesResult.templates,
       });
 
       // Skills — load from `.aris/skills/` in the workspace. Same
@@ -573,7 +653,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
       // for that one turn (still graceful).
       if (archiveCwd) {
         const rolloverResult = yield* Effect.tryPromise({
-          try: () => tryRollover(archiveCwd, sessionThreadId),
+          try: () => tryRollover(rollingWindowConfig, archiveCwd, sessionThreadId),
           catch: toRollingWindowIOError("append"),
         }).pipe(
           Effect.catch((err: RollingWindowIOError) =>
@@ -591,6 +671,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
         );
         if (rolloverResult.rolledOver) {
           generateRolloverSummaryBackground({
+            rollingWindowConfig,
             cwd: archiveCwd,
             threadId: sessionThreadId,
             windowIndex: rolloverResult.windowIndex,
@@ -607,7 +688,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
         // no-history mode using Effect.catch rather than try/catch
         // (try/catch inside Effect.gen is forbidden in Effect v4).
         priorMessages = yield* Effect.tryPromise({
-          try: () => readActiveWindow(archiveCwd, sessionThreadId),
+          try: () => readActiveWindow(rollingWindowConfig, archiveCwd, sessionThreadId),
           catch: toRollingWindowIOError("read"),
         }).pipe(
           Effect.catch((err: RollingWindowIOError) =>
@@ -648,7 +729,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
             mimeType: a.mimeType,
             sizeBytes: a.sizeBytes,
           }));
-        void appendToActiveWindow(archiveCwd, sessionThreadId, {
+        void appendToActiveWindow(rollingWindowConfig, archiveCwd, sessionThreadId, {
           role: "user",
           content: effectiveUserText,
           timestamp: startedAt,
@@ -680,7 +761,11 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
       if (archiveCwd) {
         rolledUpSummaryText = yield* Effect.tryPromise({
           try: async () => {
-            const latest = await findLatestSummaryPath(archiveCwd, sessionThreadId);
+            const latest = await findLatestSummaryPath(
+              rollingWindowConfig,
+              archiveCwd,
+              sessionThreadId,
+            );
             if (!latest) return null;
             return await readSummary(latest.path);
           },
@@ -742,7 +827,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
       // placeholder tells the model the layer exists and how to
       // populate it.
       const factsText: string = yield* Effect.tryPromise({
-        try: async () => renderFacts(await readFacts()),
+        try: async () => renderFacts(await readFacts(factsConfig)),
         catch: toFactsIOError("read"),
       }).pipe(
         Effect.catch((err: FactsIOError) =>
@@ -856,11 +941,15 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
               "pull a specific message range to see conversation flow. Use " +
               "after `search_archives` finds a hit when you need surrounding " +
               "context.\n\n" +
-              "These tools are scoped to THIS thread's archives only. " +
+              "By default these tools query THIS thread's archives. " +
+              "Pass `thread_id` to any of them to query a DIFFERENT " +
+              "thread in the same project — useful when the " +
+              "`<thread_history>` block surfaces a prior thread you " +
+              "want to dig into.\n\n" +
               "Project-level state that survives across threads lives in " +
-              "the `<scratchpad>` and `<todos>` blocks below (when " +
-              "present); user-level state that survives across projects " +
-              "lives in `<facts>`.",
+              "the `<scratchpad>`, `<todos>`, and `<thread_history>` " +
+              "blocks below (when present); user-level state that " +
+              "survives across projects lives in `<facts>`.",
           } as AgentInputItem)
         : null;
 
@@ -1153,6 +1242,43 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
               } as AgentInputItem,
             ]
           : []),
+        // Slice Z.2 — cross-thread memory briefing produced by the
+        // SessionStart hook (`session-start-cross-thread`). The hook
+        // owns both the data fetch and the rendering; what arrives
+        // here is the final system-context string ready to inject.
+        // Sits AFTER the rolling-window rollup so the narrative
+        // order matches: "this thread's earlier turns ..." → "and
+        // here's what happened in your last thread on this project."
+        // Stable for the life of the thread (computed once at
+        // session-start, cached on ctx) so the prefix stays cache
+        // friendly.
+        ...(ctx.priorThreadInject
+          ? [
+              {
+                role: "system" as const,
+                content: ctx.priorThreadInject,
+              } as AgentInputItem,
+            ]
+          : []),
+        // Anti-fabrication nudge — small, late, separate system
+        // message for maximum recency bias. The persona block at
+        // index 0 has the longer version, but it gets buried as
+        // conversation context grows. This short reminder sits
+        // right before prior messages so the model sees it last
+        // among system context before generating its response.
+        // Targets the specific failure mode: writing fabricated
+        // search results / rankings / tables when no search tool
+        // was actually invoked this turn.
+        {
+          role: "system" as const,
+          content:
+            "REMINDER: If you didn't call a search tool (search_knowledge, " +
+            "search_cve, search_code) in this turn, do NOT write search " +
+            "results, scores, rankings, or data tables. No tool call = no data. " +
+            "Same rule for every other tool: don't write file contents, command " +
+            "output, or fact lookups unless the corresponding tool was actually " +
+            "invoked in this turn.",
+        } as AgentInputItem,
         ...priorMessages.map((m) =>
           m.role === "user"
             ? ({ role: "user", content: m.content } as AgentInputItem)
@@ -1162,6 +1288,36 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
                 content: [{ type: "output_text", text: m.content }],
               } as AgentInputItem),
         ),
+        // Current date/time — injected right before the user's new
+        // message for two reasons:
+        //   1. Maximum recency bias: the model just read this when
+        //      it starts generating, so any "what time is it" /
+        //      "is X recent" / time-math question has fresh ground
+        //      truth at the top of attention.
+        //   2. Cache efficiency: this is the ONLY per-turn-changing
+        //      piece in the system stack. Placing it at the end
+        //      means the persona, facts, scratchpad, todos, cross-
+        //      thread briefing, anti-fab nudge, AND all prior
+        //      messages stay prefix-cached across turns. Only
+        //      [this line + the new user message] is uncached per
+        //      turn.
+        //
+        // Server time == user time as long as the Electron app runs
+        // locally on the user's machine (current architecture). If
+        // we ever ship a hosted/browser deployment, the client
+        // needs to send its tz and we re-format with it here.
+        {
+          role: "system" as const,
+          content: `Current date and time (user's local): ${new Date().toLocaleString("en-US", {
+            weekday: "long",
+            year: "numeric",
+            month: "long",
+            day: "numeric",
+            hour: "numeric",
+            minute: "numeric",
+            timeZoneName: "short",
+          })}.`,
+        } as AgentInputItem,
         userMessageItem,
       ];
       console.error(
@@ -1201,7 +1357,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
           return Effect.gen(function* () {
             yield* Effect.tryPromise({
               try: () =>
-                appendToActiveWindow(archiveCwd, persistThreadId, {
+                appendToActiveWindow(rollingWindowConfig, archiveCwd, persistThreadId, {
                   role: "assistant",
                   content: finalText,
                   timestamp: createdAt,
@@ -1346,6 +1502,32 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
         payload: { messageCount: assistantMessageCount },
       });
 
+      // Slice Z.3 — fire the Stop hook after every assistant turn.
+      // Built-in handlers: stop-active-summary writes
+      // active.summary.md non-destructively for cross-thread memory
+      // consumption. Errors are caught at the bus level and never
+      // propagate up to the turn loop. The dispatch itself is
+      // awaited because the bus handlers internally fire-and-forget
+      // the expensive Pro call.
+      const stopThreadId = ctx.session.threadId;
+      const stopCwd = ctx.session.cwd;
+      yield* Effect.tryPromise({
+        try: () =>
+          hookBus.dispatchStop({
+            event: "Stop",
+            threadId: stopThreadId,
+            cwd: stopCwd,
+            turnIndex: assistantMessageCount,
+          }),
+        catch: (err) => err as Error,
+      }).pipe(
+        Effect.catch((err) =>
+          Effect.sync(() => {
+            console.warn(`[DeepSeekAdapter] Stop hook dispatch failed: ${(err as Error).message}`);
+          }),
+        ),
+      );
+
       const idleAt = yield* nowIso;
       ctx.session = {
         ...ctx.session,
@@ -1373,6 +1555,10 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
               `detail=${JSON.stringify(err.message ?? String(err)).slice(0, 300)}`,
           );
           const failedAt = yield* nowIso;
+          // Slice J.3 / M3-1 — sanitize before publishing to UI bus. See
+          // sanitizeProviderErrorForUi for the rationale (cap length,
+          // strip token/key-like substrings, single-line).
+          const safeMessage = sanitizeProviderErrorForUi(err.message);
           yield* publishArisEvent({
             type: "aris.error",
             threadId: ctx.session.threadId,
@@ -1380,7 +1566,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
             createdAt: failedAt,
             payload: {
               code: "provider_error",
-              message: err.message,
+              message: safeMessage,
               recoverable: false,
             },
           });
@@ -1389,7 +1575,7 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
             threadId: ctx.session.threadId,
             turnId,
             createdAt: failedAt,
-            payload: { errorMessage: err.message },
+            payload: { errorMessage: safeMessage },
           });
           const idleAt = yield* nowIso;
           ctx.session = {
@@ -1522,6 +1708,39 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
       if (fiber) {
         yield* Fiber.interrupt(fiber);
       }
+
+      // Slice Z.3 — fire the SessionEnd hook on real session close.
+      // Built-in `session-end-archive` hook runs the destructive
+      // Slice Y archive (active.jsonl → window_NNN.jsonl), fires
+      // the rollover summary in the background, and deletes the
+      // now-superseded active.summary.md sidecar.
+      //
+      // Rare in normal UX (Kenny opens new threads rather than
+      // explicitly closing) but the path exists for process
+      // shutdown, programmatic teardown, and the eventual explicit-
+      // stop UI. All failures are swallowed inside the bus + hook
+      // so the close path always completes cleanly.
+      const closingThreadId = ctx.session.threadId;
+      const closingCwd = ctx.session.cwd;
+      yield* Effect.tryPromise({
+        try: () =>
+          hookBus.dispatchSessionEnd({
+            event: "SessionEnd",
+            threadId: closingThreadId,
+            cwd: closingCwd,
+            reason: "user_closed",
+          }),
+        catch: (err) => err as Error,
+      }).pipe(
+        Effect.catch((err) =>
+          Effect.sync(() => {
+            console.warn(
+              `[DeepSeekAdapter] SessionEnd hook dispatch failed for ${closingThreadId}: ${(err as Error).message}`,
+            );
+          }),
+        ),
+      );
+
       const updatedAt = yield* nowIso;
       ctx.session = { ...ctx.session, status: "closed", updatedAt };
       sessions.delete(ctx.session.threadId);

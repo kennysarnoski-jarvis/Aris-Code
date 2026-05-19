@@ -13,6 +13,7 @@ import { DiffIcon, FileCode2Icon, TerminalSquareIcon } from "lucide-react";
 import { Badge } from "../ui/badge";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import ProjectScriptsControl, { type NewProjectScriptInput } from "../ProjectScriptsControl";
+import { Button } from "../ui/button";
 import { Toggle } from "../ui/toggle";
 import { SidebarTrigger } from "../ui/sidebar";
 import { OpenInPicker } from "./OpenInPicker";
@@ -94,6 +95,27 @@ export const ChatHeader = memo(function ChatHeader({
         )}
       </div>
       <div className="flex shrink-0 items-center justify-end gap-2 @3xl/header-actions:gap-3">
+        {/* V2 editor mode entry point — leftmost in the action cluster
+            so it reads as the prominent affordance for jumping into the
+            file editor. One-way: clicking navigates the main window to
+            the editor view, where ChatHeader is no longer rendered. */}
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                className="shrink-0"
+                onClick={() => onEnterEditor()}
+                aria-label="Open editor"
+                variant="outline"
+                size="sm"
+              >
+                <FileCode2Icon aria-hidden />
+                Editor
+              </Button>
+            }
+          />
+          <TooltipPopup side="bottom">Open editor</TooltipPopup>
+        </Tooltip>
         {activeProjectScripts && (
           <ProjectScriptsControl
             scripts={activeProjectScripts}
@@ -124,6 +146,8 @@ export const ChatHeader = memo(function ChatHeader({
             {...(draftId ? { draftId } : {})}
           />
         )}
+        {/* Terminal — labeled rather than icon-only so the affordance
+            is discoverable; users live in this panel. */}
         <Tooltip>
           <TooltipTrigger
             render={
@@ -133,10 +157,11 @@ export const ChatHeader = memo(function ChatHeader({
                 onPressedChange={onToggleTerminal}
                 aria-label="Toggle terminal drawer"
                 variant="outline"
-                size="xs"
+                size="sm"
                 disabled={!terminalAvailable}
               >
-                <TerminalSquareIcon className="size-3" />
+                <TerminalSquareIcon aria-hidden />
+                Terminal
               </Toggle>
             }
           />
@@ -157,10 +182,10 @@ export const ChatHeader = memo(function ChatHeader({
                 onPressedChange={onToggleDiff}
                 aria-label="Toggle diff panel"
                 variant="outline"
-                size="xs"
+                size="sm"
                 disabled={!isGitRepo}
               >
-                <DiffIcon className="size-3" />
+                <DiffIcon aria-hidden />
               </Toggle>
             }
           />
@@ -171,28 +196,6 @@ export const ChatHeader = memo(function ChatHeader({
                 ? `Toggle diff panel (${diffToggleShortcutLabel})`
                 : "Toggle diff panel"}
           </TooltipPopup>
-        </Tooltip>
-        {/* V2 editor mode entry point. One-way: clicking navigates the main
-            window to the editor view, where ChatHeader is no longer
-            rendered — so this stays a plain (never-pressed) Toggle for
-            visual consistency with the terminal/diff cluster rather than a
-            true two-state toggle. */}
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Toggle
-                className="shrink-0"
-                pressed={false}
-                onPressedChange={() => onEnterEditor()}
-                aria-label="Open editor"
-                variant="outline"
-                size="xs"
-              >
-                <FileCode2Icon className="size-3" />
-              </Toggle>
-            }
-          />
-          <TooltipPopup side="bottom">Open editor</TooltipPopup>
         </Tooltip>
       </div>
     </div>

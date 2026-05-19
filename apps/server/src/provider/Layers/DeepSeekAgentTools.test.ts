@@ -26,6 +26,8 @@
 import { describe, expect, it } from "vitest";
 
 import { createDeepSeekAgentTools } from "./DeepSeekAgentTools.ts";
+import { makeFactsConfig } from "./FactsMemory.ts";
+import { makeRollingWindowConfig } from "./RollingWindowMemory.ts";
 
 const BASE_TOOL_NAMES = [
   "read_file",
@@ -42,6 +44,16 @@ const ARCHIVE_TOOL_NAMES = ["list_archives", "search_archives", "read_archive_ra
 const SCRATCHPAD_TOOL_NAMES = ["update_scratchpad"] as const;
 const TODOS_TOOL_NAMES = ["manage_todos"] as const;
 const FACTS_TOOL_NAMES = ["upsert_memory_node", "delete_memory_node"] as const;
+// Search tools (3) and web_search tool (1) are included in the composer
+// result whenever `cloudBaseUrl + cloudToken` are present — they hit the
+// cloud's `/api/local/search/*` and `/api/local/web_search` routes for
+// the KG + GAT pipeline and Anthropic-backed web search. Listed here
+// alongside the other tool families so the parentTools-order assertion
+// in the first test matches the composer's actual emit order:
+//   base, archive, scratchpad, todos, facts, search, web_search,
+//   session_scratchpad, spawn_worker.
+const SEARCH_TOOL_NAMES = ["search_knowledge", "search_cve", "search_code"] as const;
+const WEB_SEARCH_TOOL_NAMES = ["web_search"] as const;
 const SESSION_SCRATCHPAD_TOOL_NAMES = [
   "read_session_scratchpad",
   "append_session_scratchpad",
@@ -55,9 +67,14 @@ const COORD_DEPS = {
   parentTurnId: "turn_test_xyz",
 } as const;
 
+const factsConfig = makeFactsConfig("/tmp");
+const rollingWindowConfig = makeRollingWindowConfig("/tmp");
+
 describe("createDeepSeekAgentTools", () => {
   it("returns base, archive, scratchpad, todos, facts, session-scratchpad, then spawn_worker when all deps present", () => {
     const tools = createDeepSeekAgentTools({
+      factsConfig,
+      rollingWindowConfig,
       cwd: "/tmp",
       threadId: "thread_test_001",
       ...COORD_DEPS,
@@ -69,13 +86,23 @@ describe("createDeepSeekAgentTools", () => {
       ...SCRATCHPAD_TOOL_NAMES,
       ...TODOS_TOOL_NAMES,
       ...FACTS_TOOL_NAMES,
+      ...SEARCH_TOOL_NAMES,
+      ...WEB_SEARCH_TOOL_NAMES,
       ...SESSION_SCRATCHPAD_TOOL_NAMES,
       ...COORD_TOOL_NAMES,
     ]);
   });
 
-  it("omits spawn_worker AND session-scratchpad tools when cloud creds + parentTurnId are absent", () => {
+  it("omits spawn_worker, session-scratchpad, search, AND web_search tools when cloud creds + parentTurnId are absent", () => {
+    // Search + web_search both require cloudBaseUrl + cloudToken to
+    // construct (they hit cloud routes with bearer auth). Session-
+    // scratchpad requires parentTurnId. spawn_worker requires all of the
+    // above plus defaultModelName via the AgentTool composer gate. So
+    // when COORD_DEPS is omitted entirely, the result is just base +
+    // archive + scratchpad + todos + facts.
     const tools = createDeepSeekAgentTools({
+      factsConfig,
+      rollingWindowConfig,
       cwd: "/tmp",
       threadId: "thread_test_002",
     });
@@ -83,6 +110,8 @@ describe("createDeepSeekAgentTools", () => {
     expect(names).not.toContain("spawn_worker");
     expect(names).not.toContain("read_session_scratchpad");
     expect(names).not.toContain("append_session_scratchpad");
+    expect(names).not.toContain("search_knowledge");
+    expect(names).not.toContain("web_search");
     expect(names).toEqual([
       ...BASE_TOOL_NAMES,
       ...ARCHIVE_TOOL_NAMES,
@@ -95,6 +124,8 @@ describe("createDeepSeekAgentTools", () => {
   it("accepts an optional AbortSignal alongside cwd + threadId + creds", () => {
     const ac = new AbortController();
     const tools = createDeepSeekAgentTools({
+      factsConfig,
+      rollingWindowConfig,
       cwd: "/tmp",
       threadId: "thread_test_003",
       signal: ac.signal,
@@ -106,6 +137,8 @@ describe("createDeepSeekAgentTools", () => {
         SCRATCHPAD_TOOL_NAMES.length +
         TODOS_TOOL_NAMES.length +
         FACTS_TOOL_NAMES.length +
+        SEARCH_TOOL_NAMES.length +
+        WEB_SEARCH_TOOL_NAMES.length +
         SESSION_SCRATCHPAD_TOOL_NAMES.length +
         COORD_TOOL_NAMES.length,
     );
@@ -113,6 +146,8 @@ describe("createDeepSeekAgentTools", () => {
 
   it("skips cwd-gated tools (archive, scratchpad, todos, facts, spawn_worker) when cwd is undefined", () => {
     const tools = createDeepSeekAgentTools({
+      factsConfig,
+      rollingWindowConfig,
       cwd: undefined,
       threadId: "thread_test_004",
       ...COORD_DEPS,

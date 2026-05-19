@@ -52,6 +52,13 @@ import { type Agent, type AgentInputItem, run } from "@openai/agents";
 
 import type { ArisEvent, MessageId, RuntimeMode, ThreadId, TurnId } from "@t3tools/contracts";
 
+// Slice M.1 / H-4A — error sanitizer is shared with the DeepSeek path
+// so both providers agree on what's safe to ship to the renderer. See
+// `sanitizeProviderErrorForUi` for the rationale (cap length, strip
+// token/key-like substrings, single-line). The Aris path was missed
+// when Slice J.3 (M3-1) landed sanitization on the DeepSeek path;
+// Slice M closes that parity gap.
+import { sanitizeProviderErrorForUi } from "./DeepSeekAgentRunner.ts";
 import { setArisEnvelopeHandler, setRequestThinkingMode } from "./ArisStreamInterceptor.ts";
 
 // ── Emitter contract ────────────────────────────────────────────────
@@ -661,13 +668,19 @@ export async function runArisAgent(opts: RunArisAgentOptions): Promise<RunArisAg
     // Not a cap-hit — real error. Original handling: emit
     // aris.turn.failed if owning lifecycle, then re-throw so
     // outer catch (ArisAdapter) can classify and publish.
+    //
+    // Slice M.1 / H-4A — errMsg here can carry SDK-thrown content
+    // that includes auth headers, raw prompt fragments echoed back, or
+    // provider-side stack traces. Run through the same sanitizer the
+    // DeepSeek path uses (caps 512 chars, strips bearer/sk-/long hex
+    // and base64 blobs, single-line) before publishing to the UI bus.
     if (manageTurnLifecycle) {
       await publish({
         type: "aris.turn.failed",
         threadId,
         turnId,
         createdAt: nowIso(),
-        payload: { errorMessage: errMsg },
+        payload: { errorMessage: sanitizeProviderErrorForUi(errMsg) },
       });
     }
     throw err;

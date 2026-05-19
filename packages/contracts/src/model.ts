@@ -24,6 +24,21 @@ export type ClaudeCodeEffort = (typeof CLAUDE_CODE_EFFORT_OPTIONS)[number];
  */
 export const DEEPSEEK_REASONING_EFFORT_OPTIONS = ["light", "high", "max"] as const;
 export type DeepSeekReasoningEffort = (typeof DEEPSEEK_REASONING_EFFORT_OPTIONS)[number];
+
+/**
+ * Canonical DeepSeek model slugs exposed to provider-side code. Drives
+ * Zod-enum validation in tools that accept a per-call model override
+ * (e.g. `spawn_worker`'s `model` parameter — see DeepSeekAgentTool).
+ *
+ * Kept in sync with `DEFAULT_MODEL_BY_PROVIDER.deepseek`,
+ * `DEFAULT_GIT_TEXT_GENERATION_MODEL_BY_PROVIDER.deepseek`, and the
+ * canonical targets in `MODEL_SLUG_ALIASES_BY_PROVIDER.deepseek`. When
+ * DeepSeek adds a new model tier (e.g. a future V4-Mini), append it
+ * here so the provider-side Zod validation accepts it without an
+ * unsafe `z.string()` widening.
+ */
+export const DEEPSEEK_MODEL_SLUGS = ["deepseek-v4-pro", "deepseek-v4-flash"] as const;
+export type DeepSeekModelSlug = (typeof DEEPSEEK_MODEL_SLUGS)[number];
 export type ProviderReasoningEffort =
   | CodexReasoningEffort
   | ClaudeCodeEffort

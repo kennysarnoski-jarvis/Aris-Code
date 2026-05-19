@@ -116,6 +116,54 @@ export interface WorkerUsage {
 export const DEFAULT_WORKER_MAX_TURNS = 50;
 
 /**
+ * Slice F.1 / M-2F fix (2026-05-16) — hard upper bound on `max_turns`
+ * for any spawned worker.
+ *
+ * Pre-Slice-F.1, the `max_turns` parameter on `spawn_worker` was
+ * `z.number().int()` with no upper bound. A coordinator (running an
+ * LLM that is itself model-controlled) could request
+ * `max_turns: 1_000_000` and the server would happily run a million
+ * inference rounds, burning paying-user credit on a runaway loop.
+ *
+ * 200 is 4× the default and 2× the soft-recommended limit ("decompose
+ * tasks that don't fit in ~100 turns"). It gives legitimate big
+ * tasks (a sprawling refactor over a large codebase) all the room
+ * they need, while stopping the runaway-loop credit burn cold. If a
+ * future workflow genuinely needs more, the right move is to raise
+ * this constant deliberately with cost data — not to slip a fresh
+ * bypass past the schema.
+ *
+ * Enforced at two layers:
+ *   1. The zod `spawn_worker.max_turns` parameter — model-emitted
+ *      values are rejected at the tool-input boundary.
+ *   2. The server's `turnCap` computation (`Math.min(...)`) — even
+ *      if a future refactor loosens the schema, the runtime clamp
+ *      still bounds the loop.
+ */
+export const MAX_WORKER_MAX_TURNS = 200;
+
+/**
+ * Slice F.1 / M-2F — clamp a `layeredMaxTurns` value (collapsed from
+ * the precedence ladder: explicit arg > template frontmatter >
+ * undefined) into the safe runtime range:
+ *
+ *   - Non-positive / non-finite / undefined → `DEFAULT_WORKER_MAX_TURNS`
+ *   - Positive finite → `Math.floor(value)`, then capped at
+ *     `MAX_WORKER_MAX_TURNS`
+ *
+ * Exported for direct unit-testing so the runtime ceiling stays
+ * pinned even as the precedence-collapse logic in `DeepSeekAgentTool`
+ * evolves.
+ */
+export function clampWorkerMaxTurns(layeredMaxTurns: number | undefined): number {
+  const rawTurnCap =
+    typeof layeredMaxTurns === "number" && Number.isFinite(layeredMaxTurns) && layeredMaxTurns > 0
+      ? Math.floor(layeredMaxTurns)
+      : DEFAULT_WORKER_MAX_TURNS;
+  return Math.min(rawTurnCap, MAX_WORKER_MAX_TURNS);
+}
+
+/**
  * Tool names that are ALWAYS available to every spawned worker, even
  * when the coordinator passes an explicit `tools: [...]` allowlist
  * that omits them. These are the baseline file/shell operations that

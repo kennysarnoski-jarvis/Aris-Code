@@ -5,9 +5,15 @@
  * TodosMemory.test.ts:
  *   1. Pure replay rules (no fs, fast, deterministic).
  *   2. Render output format (grouping, separator handling).
- *   3. IO round-trip with a temp HOME so the real ~/.aris/ is never
- *      touched.
+ *   3. IO round-trip with a temp-dir FactsConfig so the real
+ *      ~/.aris/ is never touched.
  *   4. Concurrency — concurrent upserts under withFactsWriteLock.
+ *
+ * Slice F.3 — No more HOME swapping. Each IO `describe` block
+ * constructs a `FactsConfig` from a temp dir via `makeFactsConfig`
+ * and passes it explicitly. If a test runner skips `beforeEach`, the
+ * only consequence is an unused temp dir — the real facts file is
+ * never resolved.
  */
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,7 +23,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   appendFactsRecord,
-  getFactsPath,
+  makeFactsConfig,
   newFactsRecord,
   readFacts,
   readFactsRecords,
@@ -25,6 +31,7 @@ import {
   replayFacts,
   withFactsWriteLock,
   type Fact,
+  type FactsConfig,
   type FactsRecord,
 } from "./FactsMemory.ts";
 
@@ -323,37 +330,44 @@ describe("newFactsRecord", () => {
   });
 });
 
-describe("getFactsPath", () => {
+describe("makeFactsConfig", () => {
   it("derives a stable user-global path under ~/.aris/ (NOT under projects/)", () => {
-    const p = getFactsPath();
-    expect(p).toMatch(/\.aris\/facts\.jsonl$/);
-    expect(p).not.toContain("projects/");
+    const cfg = makeFactsConfig("/home/testuser");
+    expect(cfg.factsPath).toMatch(/\.aris\/facts\.jsonl$/);
+    expect(cfg.factsPath).not.toContain("projects/");
+    expect(cfg.arisHomeDir).toMatch(/\.aris$/);
+  });
+
+  it("falls back to real homedir() when no override is passed", () => {
+    const cfg = makeFactsConfig();
+    // The path should exist and contain .aris/ — even if the dir
+    // doesn't exist yet, the path string should be well-formed.
+    expect(cfg.factsPath).toContain(".aris");
+    expect(cfg.arisHomeDir).toContain(".aris");
   });
 });
 
 describe("FactsMemory IO (round-trip)", () => {
-  let originalHome: string | undefined;
   let tempHome: string;
+  let config: FactsConfig;
 
   beforeEach(async () => {
-    originalHome = process.env["HOME"];
     tempHome = await fs.mkdtemp(join(tmpdir(), "facts-test-"));
-    process.env["HOME"] = tempHome;
+    config = makeFactsConfig(tempHome);
   });
 
   afterEach(async () => {
-    if (originalHome === undefined) delete process.env["HOME"];
-    else process.env["HOME"] = originalHome;
     await fs.rm(tempHome, { recursive: true, force: true });
   });
 
   it("readFacts returns empty array when no file exists yet", async () => {
-    expect(await readFacts()).toEqual([]);
-    expect(await readFactsRecords()).toEqual([]);
+    expect(await readFacts(config)).toEqual([]);
+    expect(await readFactsRecords(config)).toEqual([]);
   });
 
   it("upsert then read round-trips a single fact", async () => {
     await appendFactsRecord(
+      config,
       newFactsRecord({
         action: "upsert",
         factType: "user",
@@ -362,13 +376,14 @@ describe("FactsMemory IO (round-trip)", () => {
         content: "Kenny",
       }),
     );
-    expect(await readFacts()).toEqual([
+    expect(await readFacts(config)).toEqual([
       { factType: "user", label: "name", description: "preferred name", content: "Kenny" },
     ]);
   });
 
   it("upsert overwrites earlier upsert at the same key (round-trip)", async () => {
     await appendFactsRecord(
+      config,
       newFactsRecord({
         action: "upsert",
         factType: "user",
@@ -378,6 +393,7 @@ describe("FactsMemory IO (round-trip)", () => {
       }),
     );
     await appendFactsRecord(
+      config,
       newFactsRecord({
         action: "upsert",
         factType: "user",
@@ -386,13 +402,14 @@ describe("FactsMemory IO (round-trip)", () => {
         content: "new",
       }),
     );
-    expect(await readFacts()).toEqual([
+    expect(await readFacts(config)).toEqual([
       { factType: "user", label: "name", description: "new", content: "new" },
     ]);
   });
 
   it("delete written to disk removes the fact on next read", async () => {
     await appendFactsRecord(
+      config,
       newFactsRecord({
         action: "upsert",
         factType: "user",
@@ -401,12 +418,16 @@ describe("FactsMemory IO (round-trip)", () => {
         content: "c",
       }),
     );
-    await appendFactsRecord(newFactsRecord({ action: "delete", factType: "user", label: "x" }));
-    expect(await readFacts()).toEqual([]);
+    await appendFactsRecord(
+      config,
+      newFactsRecord({ action: "delete", factType: "user", label: "x" }),
+    );
+    expect(await readFacts(config)).toEqual([]);
   });
 
   it("corrupt lines are dropped, valid lines around them survive", async () => {
     await appendFactsRecord(
+      config,
       newFactsRecord({
         action: "upsert",
         factType: "user",
@@ -415,9 +436,9 @@ describe("FactsMemory IO (round-trip)", () => {
         content: "c",
       }),
     );
-    const path = getFactsPath();
-    await fs.appendFile(path, "garbage not json\n");
+    await fs.appendFile(config.factsPath, "garbage not json\n");
     await appendFactsRecord(
+      config,
       newFactsRecord({
         action: "upsert",
         factType: "user",
@@ -426,15 +447,14 @@ describe("FactsMemory IO (round-trip)", () => {
         content: "c",
       }),
     );
-    const facts = await readFacts();
+    const facts = await readFacts(config);
     expect(facts.map((f) => f.label).sort()).toEqual(["ok1", "ok2"]);
   });
 
   it("rejects invalid factType values during parse (`type=project` is dropped)", async () => {
-    const path = getFactsPath();
-    await fs.mkdir(join(tempHome, ".aris"), { recursive: true });
+    await fs.mkdir(config.arisHomeDir, { recursive: true });
     await fs.writeFile(
-      path,
+      config.factsPath,
       JSON.stringify({
         id: "r1",
         ts: "t1",
@@ -456,7 +476,7 @@ describe("FactsMemory IO (round-trip)", () => {
         }) +
         "\n",
     );
-    const facts = await readFacts();
+    const facts = await readFacts(config);
     // The "project" record is dropped (invalid factType), only the
     // "user" record survives.
     expect(facts).toEqual([
@@ -466,18 +486,15 @@ describe("FactsMemory IO (round-trip)", () => {
 });
 
 describe("withFactsWriteLock — concurrent upsert path", () => {
-  let originalHome: string | undefined;
   let tempHome: string;
+  let config: FactsConfig;
 
   beforeEach(async () => {
-    originalHome = process.env["HOME"];
     tempHome = await fs.mkdtemp(join(tmpdir(), "facts-lock-test-"));
-    process.env["HOME"] = tempHome;
+    config = makeFactsConfig(tempHome);
   });
 
   afterEach(async () => {
-    if (originalHome === undefined) delete process.env["HOME"];
-    else process.env["HOME"] = originalHome;
     await fs.rm(tempHome, { recursive: true, force: true });
   });
 
@@ -485,8 +502,9 @@ describe("withFactsWriteLock — concurrent upsert path", () => {
     const labels = ["a", "b", "c", "d", "e"];
     await Promise.all(
       labels.map((label) =>
-        withFactsWriteLock(async () => {
+        withFactsWriteLock(config, async () => {
           await appendFactsRecord(
+            config,
             newFactsRecord({
               action: "upsert",
               factType: "user",
@@ -498,17 +516,18 @@ describe("withFactsWriteLock — concurrent upsert path", () => {
         }),
       ),
     );
-    const facts = await readFacts();
+    const facts = await readFacts(config);
     expect(facts.map((f) => f.label).sort()).toEqual(labels);
   });
 
   it("a rejected write doesn't poison subsequent locked writes", async () => {
-    const failing = withFactsWriteLock(async () => {
+    const failing = withFactsWriteLock(config, async () => {
       throw new Error("boom");
     }).catch((e) => e);
     await failing;
-    await withFactsWriteLock(async () => {
+    await withFactsWriteLock(config, async () => {
       await appendFactsRecord(
+        config,
         newFactsRecord({
           action: "upsert",
           factType: "user",
@@ -518,7 +537,7 @@ describe("withFactsWriteLock — concurrent upsert path", () => {
         }),
       );
     });
-    const facts = await readFacts();
+    const facts = await readFacts(config);
     expect(facts).toEqual([{ factType: "user", label: "after", description: "d", content: "c" }]);
   });
 });

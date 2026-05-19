@@ -16,6 +16,7 @@ import {
   NonNegativeInt,
   ProjectId,
   ProviderItemId,
+  SafeRecordKey,
   ThreadId,
   TrimmedNonEmptyString,
   TurnId,
@@ -93,7 +94,29 @@ export const RuntimeMode = Schema.Literals([
   "full-access",
 ]);
 export type RuntimeMode = typeof RuntimeMode.Type;
-export const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
+
+// Slice C / H8 fix (2026-05-16) — `approval-required` is the safe default.
+//
+// Pre-Slice-C this was `"full-access"`. Four schemas inherit this value
+// via `Schema.withDecodingDefault(...)` — the `OrchestrationSession`
+// state, the `ThreadTurnStartCommand` (the client-facing turn-start
+// wire), and two server-emitted payloads (`ThreadCreatedPayload`,
+// `ThreadTurnStartRequestedPayload`).
+//
+// The audit (Aris W4) flagged this as privilege-escalation-via-omission:
+// any caller — client OR server-internal dispatcher — that omits the
+// runtimeMode field silently gets unrestricted filesystem + network +
+// shell access. The defense-in-depth fix is to default to the MOST
+// restrictive mode (`"approval-required"`, where every tool call needs
+// explicit user OK) so an omission fails closed, not open. Callers that
+// genuinely want elevated privileges must set the field explicitly.
+//
+// Wire compatibility: the constant value changes but the schema shape
+// does not — any client already setting runtimeMode explicitly is
+// unaffected. Server-internal flows that previously relied on the
+// `"full-access"` fallback will see operations gated through the
+// approval system; tighten or set explicitly as needed.
+export const DEFAULT_RUNTIME_MODE: RuntimeMode = "approval-required";
 export const ProviderInteractionMode = Schema.Literals(["default", "plan"]);
 export type ProviderInteractionMode = typeof ProviderInteractionMode.Type;
 export const DEFAULT_PROVIDER_INTERACTION_MODE: ProviderInteractionMode = "default";
@@ -108,12 +131,58 @@ export const ProviderApprovalDecision = Schema.Literals([
   "cancel",
 ]);
 export type ProviderApprovalDecision = typeof ProviderApprovalDecision.Type;
-export const ProviderUserInputAnswers = Schema.Record(Schema.String, Schema.Unknown);
+// Slice E.1 / H-2C — `SafeRecordKey` blocks `__proto__`, `constructor`, and
+// `prototype` from appearing as keys. Without this, a maliciously crafted
+// answers payload like `{"__proto__": {"isAdmin": true}}` decodes
+// successfully and pollutes Object.prototype the moment any downstream
+// consumer spreads it (`{ ...defaults, ...answers }`).
+export const ProviderUserInputAnswers = Schema.Record(SafeRecordKey, Schema.Unknown);
 export type ProviderUserInputAnswers = typeof ProviderUserInputAnswers.Type;
 
 export const PROVIDER_SEND_TURN_MAX_INPUT_CHARS = 120_000;
 export const PROVIDER_SEND_TURN_MAX_ATTACHMENTS = 8;
 export const PROVIDER_SEND_TURN_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Slice I / H3-7 fix (2026-05-16) — caps on assistant-generated text
+ * payloads at the wire.
+ *
+ * Aris's round-3 audit flagged the asymmetry: H-2B (Slice E.1) capped
+ * user message text at 120K chars, but every assistant-generated text
+ * field stayed unbounded. A buggy or compromised provider adapter that
+ * synthesizes a multi-GB delta exhausts server memory during JSON
+ * parse, bloats the orchestration projection store, and crashes the
+ * WebSocket client trying to render it.
+ *
+ * Two caps because the legitimate sizes differ:
+ *
+ *   - `PROVIDER_ASSISTANT_DELTA_MAX_CHARS = 1_000_000` (~2 MB UTF-16).
+ *     Streaming chunks. Real-world chunks are tens-to-hundreds of
+ *     tokens (sub-KB); 1M chars per chunk is generous headroom for
+ *     bulky reasoning passes, paste-heavy responses, etc.
+ *
+ *   - `PROVIDER_ASSISTANT_TEXT_MAX_CHARS = 10_000_000` (~20 MB UTF-16).
+ *     Assembled / final-state fields: full messages, complete reasoning
+ *     blocks, unified diffs. Matches `PROJECT_WRITE_FILE_MAX_CHARS` so
+ *     "max realistic content payload" stays one number across the
+ *     codebase. A 10 MB diff is enormous but possible for sweeping
+ *     refactors; multi-GB outputs are pathological.
+ *
+ * Applied to:
+ *   - `OrchestrationMessage.text` (assembled)
+ *   - `ThreadMessageAssistantDeltaCommand.delta` (streaming)
+ *   - `ThreadMessageSentPayload.text` (assembled)
+ *   - `ArisAssistantDeltaPayload.text` (streaming)
+ *   - `ArisReasoningDeltaPayload.text` (streaming)
+ *   - `ArisAssistantMessageCompletedPayload.finalText` (assembled)
+ *   - `TurnProposedDeltaPayload.delta` (streaming)
+ *   - `TurnDiffUpdatedPayload.unifiedDiff` (assembled)
+ *   - `ContentDeltaPayload.delta` (streaming)
+ *   - `EphemeralReasoningDelta.delta` (streaming) — bonus consistency
+ *   - `EphemeralAssistantDelta.delta` (streaming) — bonus consistency
+ */
+export const PROVIDER_ASSISTANT_DELTA_MAX_CHARS = 1_000_000;
+export const PROVIDER_ASSISTANT_TEXT_MAX_CHARS = 10_000_000;
 const PROVIDER_SEND_TURN_MAX_IMAGE_DATA_URL_CHARS = 14_000_000;
 const CHAT_ATTACHMENT_ID_MAX_CHARS = 128;
 // Correlation id is command id by design in this model.
@@ -189,7 +258,9 @@ export type OrchestrationMessageRole = typeof OrchestrationMessageRole.Type;
 export const OrchestrationMessage = Schema.Struct({
   id: MessageId,
   role: OrchestrationMessageRole,
-  text: Schema.String,
+  // Slice I / H3-7 — cap on assembled message text. See
+  // PROVIDER_ASSISTANT_TEXT_MAX_CHARS rationale above.
+  text: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_TEXT_MAX_CHARS)),
   attachments: Schema.optional(Schema.Array(ChatAttachment)),
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
@@ -204,7 +275,15 @@ export type OrchestrationProposedPlanId = typeof OrchestrationProposedPlanId.Typ
 export const OrchestrationProposedPlan = Schema.Struct({
   id: OrchestrationProposedPlanId,
   turnId: Schema.NullOr(TurnId),
-  planMarkdown: TrimmedNonEmptyString,
+  // Slice N.2 / M4-12 — cap plan markdown at the same ceiling used
+  // for one streaming delta of assistant text
+  // (`PROVIDER_ASSISTANT_DELTA_MAX_CHARS`, 1M). A proposed plan is
+  // one coherent document produced by the planner — typically 10-50k
+  // chars in practice. 1M is generous for the legitimate worst case
+  // while bounding the abuse vector: a malicious or malformed plan
+  // event can't ship a multi-hundred-MB markdown blob through the
+  // projection cache, activity sequence, and renderer state.
+  planMarkdown: TrimmedNonEmptyString.check(Schema.isMaxLength(PROVIDER_ASSISTANT_DELTA_MAX_CHARS)),
   implementedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   implementationThreadId: Schema.NullOr(ThreadId).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
@@ -276,7 +355,16 @@ export const OrchestrationThreadActivity = Schema.Struct({
   tone: OrchestrationThreadActivityTone,
   kind: TrimmedNonEmptyString,
   summary: TrimmedNonEmptyString,
-  payload: Schema.Unknown,
+  // Slice J.1 / M3-11 — `payload` is forwarded verbatim to the
+  // renderer for arbitrary kind-specific event data (setup-script
+  // progress, approval requests, etc.). Pre-Slice-J this was raw
+  // `Schema.Unknown`, accepting any JSON value including arrays,
+  // primitives, and objects with prototype-magic keys. Constrain to
+  // a `Record(SafeRecordKey, Unknown)` — payload must be a plain
+  // object, keys can't be `__proto__` / `constructor` / `prototype`,
+  // and values at each key are still free-form (different activity
+  // kinds carry different shapes; the discriminator is `kind`).
+  payload: Schema.Record(SafeRecordKey, Schema.Unknown),
   turnId: Schema.NullOr(TurnId),
   sequence: Schema.optional(NonNegativeInt),
   createdAt: IsoDateTime,
@@ -542,8 +630,21 @@ export const ThreadTurnStartCommand = Schema.Struct({
   message: Schema.Struct({
     messageId: MessageId,
     role: Schema.Literal("user"),
-    text: Schema.String,
-    attachments: Schema.Array(ChatAttachment),
+    // Slice E.1 / H-2B — char cap on user-supplied turn text. Pre-Slice-E,
+    // `ProviderSendTurnInput.text` was already capped at this size, but the
+    // orchestrator-side schemas (this command + ClientThreadTurnStartCommand
+    // below) accepted unbounded `Schema.String`, opening an OOM path during
+    // JSON parse on multi-GB payloads. Same cap as the provider path so the
+    // limit is consistent everywhere a user message enters the system.
+    text: Schema.String.check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)),
+    // Slice F.1 / M-2G — same attachment-count cap as the provider
+    // path (`ProviderSendTurnInput.attachments`). Pre-Slice-F.1 the
+    // orchestrator-side schemas accepted unbounded arrays; a turn
+    // command with hundreds of multi-MB image attachments would
+    // exhaust memory before the provider's own cap could fire.
+    attachments: Schema.Array(ChatAttachment).check(
+      Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_ATTACHMENTS),
+    ),
   }),
   modelSelection: Schema.optional(ModelSelection),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
@@ -570,8 +671,13 @@ const ClientThreadTurnStartCommand = Schema.Struct({
   message: Schema.Struct({
     messageId: MessageId,
     role: Schema.Literal("user"),
-    text: Schema.String,
-    attachments: Schema.Array(UploadChatAttachment),
+    // Slice E.1 / H-2B — same cap as ThreadTurnStartCommand above.
+    text: Schema.String.check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)),
+    // Slice F.1 / M-2G — same attachment-count cap as the sibling
+    // command above. See ThreadTurnStartCommand for rationale.
+    attachments: Schema.Array(UploadChatAttachment).check(
+      Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_ATTACHMENTS),
+    ),
   }),
   modelSelection: Schema.optional(ModelSelection),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
@@ -679,7 +785,9 @@ const ThreadMessageAssistantDeltaCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   messageId: MessageId,
-  delta: Schema.String,
+  // Slice I / H3-7 — cap on streaming delta chunks. See
+  // PROVIDER_ASSISTANT_DELTA_MAX_CHARS rationale above.
+  delta: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_DELTA_MAX_CHARS)),
   turnId: Schema.optional(TurnId),
   createdAt: IsoDateTime,
 });
@@ -862,7 +970,8 @@ export const ThreadMessageSentPayload = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
   role: OrchestrationMessageRole,
-  text: Schema.String,
+  // Slice I / H3-7 — same assembled-message cap as OrchestrationMessage.
+  text: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_TEXT_MAX_CHARS)),
   attachments: Schema.optional(Schema.Array(ChatAttachment)),
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
@@ -1215,7 +1324,6 @@ export class OrchestrationGetSnapshotError extends Schema.TaggedErrorClass<Orche
   "OrchestrationGetSnapshotError",
   {
     message: TrimmedNonEmptyString,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {}
 
@@ -1223,7 +1331,6 @@ export class OrchestrationDispatchCommandError extends Schema.TaggedErrorClass<O
   "OrchestrationDispatchCommandError",
   {
     message: TrimmedNonEmptyString,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {}
 
@@ -1231,7 +1338,6 @@ export class OrchestrationGetTurnDiffError extends Schema.TaggedErrorClass<Orche
   "OrchestrationGetTurnDiffError",
   {
     message: TrimmedNonEmptyString,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {}
 
@@ -1239,7 +1345,6 @@ export class OrchestrationGetFullThreadDiffError extends Schema.TaggedErrorClass
   "OrchestrationGetFullThreadDiffError",
   {
     message: TrimmedNonEmptyString,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {}
 
@@ -1247,6 +1352,5 @@ export class OrchestrationReplayEventsError extends Schema.TaggedErrorClass<Orch
   "OrchestrationReplayEventsError",
   {
     message: TrimmedNonEmptyString,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {}

@@ -42,6 +42,42 @@ const PROJECTS_SUBDIR = "projects";
 const SESSIONS_SUBDIR = "sessions";
 const ACTIVE_WINDOW_FILENAME = "active.jsonl";
 
+// ---------------------------------------------------------------------------
+// Slice L / M3-2 — RollingWindowConfig (2026-05-18)
+//
+// Mirrors the FactsConfig pattern from Slice G. Pre-Slice-L every IO
+// function reached for `homedir()` implicitly at call time, so any test
+// run that didn't swap `process.env.HOME` would write into the real
+// `~/.aris/projects/<key>/sessions/<thread>/active.jsonl` — same class
+// of bug that polluted facts.jsonl back in March.
+//
+// The fix: `RollingWindowConfig` is a value object carrying the
+// resolved `arisHomeDir`. `makeRollingWindowConfig()` is the ONE
+// place `homedir()` is called — at the composition root. Every IO
+// function takes `config` explicitly. Tests build their own pointed
+// at a temp dir; no HOME swapping needed.
+// ---------------------------------------------------------------------------
+
+/** Resolved filesystem paths for the rolling-window store. */
+export interface RollingWindowConfig {
+  readonly arisHomeDir: string;
+}
+
+/**
+ * Construct a `RollingWindowConfig` from a home directory. This is
+ * the ONLY call site for `homedir()` in the rolling-window subsystem
+ * — every IO function below receives an explicit config instead of
+ * reaching for HOME implicitly.
+ *
+ * `homeOverride` exists for tests; production callers omit it.
+ */
+export function makeRollingWindowConfig(homeOverride?: string): RollingWindowConfig {
+  const home = homeOverride ?? homedir();
+  return {
+    arisHomeDir: join(home, ARIS_HOME_DIR),
+  };
+}
+
 /**
  * Default token-budget threshold at which the active rolling window
  * gets frozen and a new one starts. 920K leaves ~80K headroom inside
@@ -153,13 +189,57 @@ export function projectKeyFromCwd(cwd: string): string {
 }
 
 /**
+ * Slice H.3 / H3-3 fix (2026-05-16) — `threadId` is a branded
+ * `TrimmedNonEmptyString` at the contract layer with NO path-safety
+ * validation. Pre-Slice-H, the WS RPC `readArchive` handler accepted a
+ * `threadId` like `"../../../../../etc"` and `path.join` happily
+ * normalized the traversal — the resulting path escaped the
+ * `sessions/` directory and let an attacker read any file the server
+ * process could access.
+ *
+ * The fix is a single point of enforcement: every function that uses
+ * `threadId` to build an on-disk path routes through `assertSafeThreadId`
+ * first. A `threadId` must be a non-empty slug of letters / digits /
+ * dash / underscore — no path separators, no traversal sequences, no
+ * NUL bytes. The canonical thread-id shape (UUIDs or `thread_<uuid>`)
+ * satisfies this; nothing legitimate ever needs `/` or `..` in a
+ * threadId.
+ *
+ * Throws synchronously rather than returning a result so callers
+ * (which all currently treat the path build as infallible) fail loudly
+ * if a bad id ever reaches them. The Effect-side callers wrap this in
+ * `Effect.tryPromise` already, so the throw becomes a tagged error.
+ */
+const THREAD_ID_SAFE_RE = /^[A-Za-z0-9_-]+$/;
+function assertSafeThreadId(threadId: string): void {
+  if (threadId.length === 0) {
+    throw new Error("RollingWindowMemory: threadId is empty");
+  }
+  if (threadId.length > 256) {
+    throw new Error("RollingWindowMemory: threadId exceeds 256 chars");
+  }
+  if (!THREAD_ID_SAFE_RE.test(threadId)) {
+    throw new Error(
+      `RollingWindowMemory: threadId contains unsafe characters (must match [A-Za-z0-9_-]+)`,
+    );
+  }
+}
+
+/**
  * Full path to the per-thread archive directory. No filesystem touch —
  * pure path math. Use `ensureThreadArchiveDir` to mkdir -p.
+ *
+ * Slice H.3 / H3-3 — guards the `threadId` segment against path
+ * traversal; see `assertSafeThreadId` above.
  */
-export function getThreadArchiveDir(cwd: string, threadId: string): string {
+export function getThreadArchiveDir(
+  config: RollingWindowConfig,
+  cwd: string,
+  threadId: string,
+): string {
+  assertSafeThreadId(threadId);
   return join(
-    homedir(),
-    ARIS_HOME_DIR,
+    config.arisHomeDir,
     PROJECTS_SUBDIR,
     projectKeyFromCwd(cwd),
     SESSIONS_SUBDIR,
@@ -168,8 +248,12 @@ export function getThreadArchiveDir(cwd: string, threadId: string): string {
 }
 
 /** Path to the active (in-progress) rolling window file for this thread. */
-export function getActiveWindowPath(cwd: string, threadId: string): string {
-  return join(getThreadArchiveDir(cwd, threadId), ACTIVE_WINDOW_FILENAME);
+export function getActiveWindowPath(
+  config: RollingWindowConfig,
+  cwd: string,
+  threadId: string,
+): string {
+  return join(getThreadArchiveDir(config, cwd, threadId), ACTIVE_WINDOW_FILENAME);
 }
 
 /**
@@ -177,8 +261,12 @@ export function getActiveWindowPath(cwd: string, threadId: string): string {
  * before every append; fs.mkdir with recursive:true no-ops if the dir
  * already exists.
  */
-export async function ensureThreadArchiveDir(cwd: string, threadId: string): Promise<void> {
-  await fs.mkdir(getThreadArchiveDir(cwd, threadId), { recursive: true });
+export async function ensureThreadArchiveDir(
+  config: RollingWindowConfig,
+  cwd: string,
+  threadId: string,
+): Promise<void> {
+  await fs.mkdir(getThreadArchiveDir(config, cwd, threadId), { recursive: true });
 }
 
 /**
@@ -189,13 +277,17 @@ export async function ensureThreadArchiveDir(cwd: string, threadId: string): Pro
  * unflushed message rather than corrupting the whole file.
  */
 export async function appendToActiveWindow(
+  config: RollingWindowConfig,
   cwd: string,
   threadId: string,
   message: PersistedMessage,
 ): Promise<void> {
-  await ensureThreadArchiveDir(cwd, threadId);
+  await ensureThreadArchiveDir(config, cwd, threadId);
   const line = JSON.stringify(message) + "\n";
-  await fs.appendFile(getActiveWindowPath(cwd, threadId), line, { encoding: "utf8", flush: true });
+  await fs.appendFile(getActiveWindowPath(config, cwd, threadId), line, {
+    encoding: "utf8",
+    flush: true,
+  });
 }
 
 /**
@@ -209,10 +301,11 @@ export async function appendToActiveWindow(
  * but defensive parsing costs nothing.)
  */
 export async function readActiveWindow(
+  config: RollingWindowConfig,
   cwd: string,
   threadId: string,
 ): Promise<ReadonlyArray<PersistedMessage>> {
-  const path = getActiveWindowPath(cwd, threadId);
+  const path = getActiveWindowPath(config, cwd, threadId);
   let raw: string;
   try {
     raw = await fs.readFile(path, "utf8");
@@ -325,8 +418,12 @@ function sanitizePersistedAttachments(
  * leaves comfortable margin before we'd actually overflow the model
  * context. We don't need a real tokenizer here.
  */
-export async function estimateActiveWindowTokens(cwd: string, threadId: string): Promise<number> {
-  const path = getActiveWindowPath(cwd, threadId);
+export async function estimateActiveWindowTokens(
+  config: RollingWindowConfig,
+  cwd: string,
+  threadId: string,
+): Promise<number> {
+  const path = getActiveWindowPath(config, cwd, threadId);
   try {
     const stat = await fs.stat(path);
     return Math.ceil(stat.size / 4);
@@ -368,8 +465,12 @@ export function getRolloverThreshold(): number {
  * in a single thread), but the format is fixed-width so directory
  * listings stay alphabetically ordered.
  */
-async function nextWindowIndex(cwd: string, threadId: string): Promise<number> {
-  const dir = getThreadArchiveDir(cwd, threadId);
+async function nextWindowIndex(
+  config: RollingWindowConfig,
+  cwd: string,
+  threadId: string,
+): Promise<number> {
+  const dir = getThreadArchiveDir(config, cwd, threadId);
   let entries: string[];
   try {
     entries = await fs.readdir(dir);
@@ -393,10 +494,15 @@ async function nextWindowIndex(cwd: string, threadId: string): Promise<number> {
 }
 
 /** Path to a specific archived window file. Pure path math. */
-export function getArchivedWindowPath(cwd: string, threadId: string, windowIndex: number): string {
+export function getArchivedWindowPath(
+  config: RollingWindowConfig,
+  cwd: string,
+  threadId: string,
+  windowIndex: number,
+): string {
   const padded = String(windowIndex).padStart(3, "0");
   return join(
-    getThreadArchiveDir(cwd, threadId),
+    getThreadArchiveDir(config, cwd, threadId),
     `${WINDOW_FILENAME_PREFIX}${padded}${WINDOW_FILENAME_SUFFIX}`,
   );
 }
@@ -438,17 +544,120 @@ export type RolloverResult =
  * the rest of the rolling-window module's assumptions). Concurrent
  * calls from multiple processes could collide on the rename.
  */
-export async function tryRollover(cwd: string, threadId: string): Promise<RolloverResult> {
+/**
+ * Slice Y / Cross-thread V2 — minimum size of `active.jsonl` before
+ * a thread-close summary is worth generating. Threads under this
+ * threshold are typically one-shot exchanges ("hi" / "what's the
+ * time?" / single-question lookups) that don't carry forward useful
+ * project context. Generating a summary for them burns a DeepSeek
+ * Pro call to produce noise that pollutes the next thread's
+ * cross-thread briefing.
+ *
+ * 2048 bytes ≈ 500 tokens of conversation — roughly the smallest
+ * threshold below which a rollup wouldn't have anything meaningful
+ * to capture. Substantive but short threads (a quick code review
+ * exchange, a focused bug investigation) clear this easily.
+ */
+export const THREAD_CLOSE_MIN_ACTIVE_BYTES = 2048;
+
+/**
+ * Result of a thread-close archive attempt. Same shape pattern as
+ * `RolloverResult`: `archived: false` when the thread had nothing
+ * meaningful to summarize (no active.jsonl, or below the size
+ * threshold); `archived: true` when we performed the rename and the
+ * caller should fire `generateRolloverSummaryBackground` against
+ * the returned `archivedPath`.
+ */
+export type ThreadCloseArchiveResult =
+  | {
+      readonly archived: false;
+      readonly reason: "no-active-file" | "below-threshold";
+      readonly currentBytes: number;
+    }
+  | {
+      readonly archived: true;
+      readonly windowIndex: number;
+      readonly archivedPath: string;
+      readonly archivedBytes: number;
+    };
+
+/**
+ * Slice Y / Cross-thread V2 — finalize a thread's `active.jsonl`
+ * into a window archive when the thread is being closed. Used by
+ * `DeepSeekAdapter.stopSessionInternal` to close the cross-thread
+ * memory gap that Slice X (`CrossThreadMemory.ts`) left open:
+ * threads that never rolled over have no `window_NNN.summary.md`
+ * file, so a fresh thread's cross-thread scan can't see them.
+ *
+ * This function reuses the existing rollover machinery — rename
+ * `active.jsonl` to the next `window_NNN.jsonl`, then return the
+ * info needed for the caller to fire `generateRolloverSummaryBackground`.
+ * No new file format; no parallel code path; future scans (Slice X)
+ * find the resulting summary identically to one produced by
+ * `tryRollover`.
+ *
+ * Threshold rationale: see `THREAD_CLOSE_MIN_ACTIVE_BYTES`. Threads
+ * under the threshold get `archived: false` so the adapter skips the
+ * Pro call entirely. Empty / missing `active.jsonl` is the no-op
+ * case (`reason: "no-active-file"`).
+ *
+ * Atomicity + idempotency match `tryRollover` — fs.rename is atomic
+ * on same-filesystem, and `archived: false` returns don't mutate
+ * disk.
+ */
+export async function archiveActiveWindowOnClose(
+  config: RollingWindowConfig,
+  cwd: string,
+  threadId: string,
+): Promise<ThreadCloseArchiveResult> {
+  const activePath = getActiveWindowPath(config, cwd, threadId);
+  let currentBytes = 0;
+  try {
+    const stat = await fs.stat(activePath);
+    currentBytes = stat.size;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { archived: false, reason: "no-active-file", currentBytes: 0 };
+    }
+    throw err;
+  }
+
+  if (currentBytes < THREAD_CLOSE_MIN_ACTIVE_BYTES) {
+    return { archived: false, reason: "below-threshold", currentBytes };
+  }
+
+  await ensureThreadArchiveDir(config, cwd, threadId);
+  const windowIndex = await nextWindowIndex(config, cwd, threadId);
+  const archivedPath = getArchivedWindowPath(config, cwd, threadId, windowIndex);
+
+  await fs.rename(activePath, archivedPath);
+  console.error(
+    `[RollingWindowMemory] THREAD-CLOSE ARCHIVE threadId=${threadId} ` +
+      `bytes=${currentBytes} archived=${archivedPath}`,
+  );
+  return {
+    archived: true,
+    windowIndex,
+    archivedPath,
+    archivedBytes: currentBytes,
+  };
+}
+
+export async function tryRollover(
+  config: RollingWindowConfig,
+  cwd: string,
+  threadId: string,
+): Promise<RolloverResult> {
   const threshold = getRolloverThreshold();
-  const currentTokens = await estimateActiveWindowTokens(cwd, threadId);
+  const currentTokens = await estimateActiveWindowTokens(config, cwd, threadId);
   if (currentTokens < threshold) {
     return { rolledOver: false, currentTokens, threshold };
   }
 
-  await ensureThreadArchiveDir(cwd, threadId);
-  const windowIndex = await nextWindowIndex(cwd, threadId);
-  const activePath = getActiveWindowPath(cwd, threadId);
-  const archivedPath = getArchivedWindowPath(cwd, threadId, windowIndex);
+  await ensureThreadArchiveDir(config, cwd, threadId);
+  const windowIndex = await nextWindowIndex(config, cwd, threadId);
+  const activePath = getActiveWindowPath(config, cwd, threadId);
+  const archivedPath = getArchivedWindowPath(config, cwd, threadId, windowIndex);
 
   await fs.rename(activePath, archivedPath);
   console.error(

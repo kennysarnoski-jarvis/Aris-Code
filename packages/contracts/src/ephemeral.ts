@@ -2,6 +2,7 @@ import { Schema } from "effect";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 
 import { ThreadId, TurnId } from "./baseSchemas";
+import { PROVIDER_ASSISTANT_DELTA_MAX_CHARS } from "./orchestration";
 
 /**
  * Ephemeral WebSocket methods — side-channel streams that are NOT persisted
@@ -21,7 +22,9 @@ export const EphemeralReasoningDelta = Schema.Struct({
   version: Schema.Literal(1),
   threadId: ThreadId,
   turnId: Schema.NullOr(TurnId),
-  delta: Schema.String,
+  // Slice I / H3-7 — streaming delta cap. Reasoning streams flow at
+  // high churn and shouldn't grow unbounded per chunk.
+  delta: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_DELTA_MAX_CHARS)),
   emittedAt: Schema.String,
 });
 export type EphemeralReasoningDelta = typeof EphemeralReasoningDelta.Type;
@@ -43,7 +46,9 @@ export const EphemeralContentDelta = Schema.Struct({
   version: Schema.Literal(1),
   threadId: ThreadId,
   turnId: Schema.NullOr(TurnId),
-  delta: Schema.String,
+  // Slice I / H3-7 — streaming delta cap. Same rationale as
+  // EphemeralReasoningDelta above.
+  delta: Schema.String.check(Schema.isMaxLength(PROVIDER_ASSISTANT_DELTA_MAX_CHARS)),
   emittedAt: Schema.String,
 });
 export type EphemeralContentDelta = typeof EphemeralContentDelta.Type;

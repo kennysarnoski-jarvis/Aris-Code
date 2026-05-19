@@ -360,5 +360,118 @@ it.layer(TestLayer)("WorkspaceEntriesLive", (it) => {
         expect(error.detail).toBe("Relative filesystem browse paths require a current project.");
       }),
     );
+
+    // ────────────────────────────────────────────────────────────────
+    // Slice B (2026-05-16) — browse hardening
+    //
+    // Two new rejection paths landed in `resolveBrowseTarget`:
+    //   1. Null-byte rejection (universal — applies to BOTH the
+    //      absolute-path and relative-path branches).
+    //   2. Explicit-relative `..` traversal rejection (only when cwd
+    //      is provided and partialPath uses `./` / `../` syntax).
+    //
+    // The absolute-path branch deliberately STAYS wide-open for the
+    // file picker UI. H6's full lockdown is deferred to the remote-
+    // reachable hardening slice (alongside H1, H3, H4, H10, H11).
+    // ────────────────────────────────────────────────────────────────
+
+    it.effect("rejects paths containing a null byte", () =>
+      Effect.gen(function* () {
+        const workspaceEntries = yield* WorkspaceEntries;
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-browse-nul-" });
+
+        // The kernel truncates path strings at the first NUL byte
+        // during open(2), so validation reasoning on `"foo\0evil"`
+        // would differ from the syscall acting on `"foo"`. Reject
+        // up-front. Using `String.fromCharCode(0)` instead of an
+        // inline `"\0"` escape sequence so the source-level
+        // representation of this fixture is unambiguous to readers and
+        // immune to editor / format-tool munging.
+        const NUL = String.fromCharCode(0);
+        const error = yield* workspaceEntries
+          .browse({
+            cwd,
+            partialPath: `./foo${NUL}evil`,
+          })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toBe("Filesystem browse paths cannot contain null bytes.");
+      }),
+    );
+
+    it.effect("rejects explicit-relative paths that traverse out of cwd", () =>
+      Effect.gen(function* () {
+        const workspaceEntries = yield* WorkspaceEntries;
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-browse-traversal-" });
+
+        // When the user provided cwd AND used `./` / `../` syntax,
+        // the intent is project-scoped. A `../../etc` partialPath
+        // should be rejected — traversal out of the project from
+        // explicit-relative form is a bug or attack.
+        const error = yield* workspaceEntries
+          .browse({
+            cwd,
+            partialPath: "../../etc",
+          })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toBe(
+          "Relative filesystem browse paths cannot escape the project root.",
+        );
+      }),
+    );
+
+    it.effect("accepts explicit-relative paths that stay inside cwd (regression check)", () =>
+      Effect.gen(function* () {
+        const workspaceEntries = yield* WorkspaceEntries;
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-browse-rel-ok-" });
+        yield* writeTextFile(cwd, "src/index.ts", "export {};\n");
+
+        // The traversal-reject must NOT regress the legitimate case of
+        // `./<inside>` paths. This is what the "supports relative paths
+        // when cwd is provided" test (line 331) exercises; this is a
+        // narrower regression check focused on the rejection logic's
+        // path-relative computation.
+        const result = yield* workspaceEntries.browse({
+          cwd,
+          partialPath: "./src",
+        });
+
+        expect(result.entries.length).toBeGreaterThanOrEqual(0);
+      }),
+    );
+
+    // ────────────────────────────────────────────────────────────────
+    // Slice B (2026-05-16) — H7 walker symlink rejection
+    //
+    // Both the workspace indexer (search) and the browse picker now
+    // skip symlinks explicitly. Below verifies that a symlink placed
+    // inside a workspace does NOT surface in either surface.
+    // ────────────────────────────────────────────────────────────────
+
+    it.effect("does NOT include symlinks in the browse picker output", () =>
+      Effect.gen(function* () {
+        const workspaceEntries = yield* WorkspaceEntries;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-browse-symlink-" });
+        const outside = yield* makeTempDir({ prefix: "t3code-workspace-browse-outside-" });
+
+        // Create a real directory inside cwd (should appear) AND a
+        // symlink inside cwd pointing to an outside directory (should
+        // NOT appear).
+        yield* writeTextFile(cwd, "real-dir/keep.ts", "");
+        yield* fileSystem.symlink(outside, path.join(cwd, "linked-dir")).pipe(Effect.orDie);
+
+        const result = yield* workspaceEntries.browse({
+          cwd,
+          partialPath: appendSeparator(cwd),
+        });
+
+        const names = result.entries.map((entry) => entry.name);
+        expect(names).toContain("real-dir");
+        expect(names).not.toContain("linked-dir");
+      }),
+    );
   });
 });

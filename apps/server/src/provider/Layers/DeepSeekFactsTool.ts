@@ -24,6 +24,7 @@ import { z } from "zod";
 
 import {
   appendFactsRecord,
+  type FactsConfig,
   newFactsRecord,
   readFacts,
   renderFacts,
@@ -40,7 +41,7 @@ import {
  * persisted record uses `factType` to avoid the overloaded `type`
  * keyword in code. The mapping is just rename-on-write.
  */
-export function createDeepSeekFactsTools() {
+export function createDeepSeekFactsTools(config: FactsConfig) {
   const upsertMemoryNode = tool({
     name: "upsert_memory_node",
     description:
@@ -96,8 +97,9 @@ export function createDeepSeekFactsTools() {
         ),
     }),
     async execute({ type, label, description, content }) {
-      return await withFactsWriteLock(async () => {
+      return await withFactsWriteLock(config, async () => {
         await appendFactsRecord(
+          config,
           newFactsRecord({
             action: "upsert",
             factType: type,
@@ -106,7 +108,7 @@ export function createDeepSeekFactsTools() {
             content,
           }),
         );
-        const next = await readFacts();
+        const next = await readFacts(config);
         const block = renderFacts(next);
         return `Fact saved (type=${type}, label=${label}).\n\nCurrent facts:\n\n${block || "(none)"}`;
       });
@@ -136,15 +138,18 @@ export function createDeepSeekFactsTools() {
         ),
     }),
     async execute({ type, label }) {
-      return await withFactsWriteLock(async () => {
+      return await withFactsWriteLock(config, async () => {
         // Probe before deleting so the model gets a useful error
         // rather than a silent no-op when the label is wrong.
-        const before = await readFacts();
+        const before = await readFacts(config);
         if (!before.some((f) => f.factType === type && f.label === label)) {
           return `No fact with (type=${type}, label=${label}) found. Check the <facts> block in the system prompt for exact labels.`;
         }
-        await appendFactsRecord(newFactsRecord({ action: "delete", factType: type, label }));
-        const next = await readFacts();
+        await appendFactsRecord(
+          config,
+          newFactsRecord({ action: "delete", factType: type, label }),
+        );
+        const next = await readFacts(config);
         const block = renderFacts(next);
         return `Fact deleted (type=${type}, label=${label}).\n\nCurrent facts:\n\n${block || "(none)"}`;
       });

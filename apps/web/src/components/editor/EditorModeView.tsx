@@ -242,8 +242,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   // Editor word wrap — header toggle, persisted across reloads.
   const [wordWrap, setWordWrap] = useState<boolean>(
     () =>
-      typeof window !== "undefined" &&
-      window.localStorage.getItem(WORD_WRAP_STORAGE_KEY) === "on",
+      typeof window !== "undefined" && window.localStorage.getItem(WORD_WRAP_STORAGE_KEY) === "on",
   );
   // Inline path input above the file tree (New File / Save As).
   // `null` = not in-flight; the discriminator on `NewFileState` picks
@@ -470,8 +469,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     // Read state first so the confirm uses the tab's label (works for
     // untitled buffers too, where there's no path to fall back to).
     const closingState = tabStatesRef.current.get(tabId);
-    const closingLabel =
-      closingState?.status === "ready" ? closingState.label : basenameOf(tabId);
+    const closingLabel = closingState?.status === "ready" ? closingState.label : basenameOf(tabId);
     // Closing a dirty tab drops its buffer — confirm first so an
     // unsaved file isn't lost to a stray click on the ×.
     if (
@@ -665,11 +663,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     const dirtyCount = dirtyTabIdsRef.current.size;
     if (dirtyCount > 0) {
       const subject = dirtyCount === 1 ? "file has" : "files have";
-      if (
-        !window.confirm(
-          `${dirtyCount} ${subject} unsaved changes. Leave the editor anyway?`,
-        )
-      ) {
+      if (!window.confirm(`${dirtyCount} ${subject} unsaved changes. Leave the editor anyway?`)) {
         return;
       }
     }
@@ -695,9 +689,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     // clicked-folder ("" = project root) onto the typed name; "saveAs"
     // takes the typed path as project-relative directly.
     const relativePath =
-      newFile.kind === "create" && newFile.folderPath
-        ? `${newFile.folderPath}/${base}`
-        : base;
+      newFile.kind === "create" && newFile.folderPath ? `${newFile.folderPath}/${base}` : base;
     if (treeState.status === "ready" && treeState.filePaths.has(relativePath)) {
       setNewFileError(`"${relativePath}" already exists`);
       return;
@@ -712,7 +704,8 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     // can update the right tab even if the user clicked another in the
     // meantime. (`commitNewFile`'s deps include `newFile`, so this
     // closure always sees the in-flight save-as target.)
-    const failureMessage = newFile.kind === "saveAs" ? "Failed to save file." : "Failed to create file.";
+    const failureMessage =
+      newFile.kind === "saveAs" ? "Failed to save file." : "Failed to create file.";
     let contents: string;
     let saveAsContext: { sourceTabId: string; versionId: number } | null = null;
     if (newFile.kind === "create") {
@@ -769,10 +762,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
           onSelectFile(result.relativePath);
           return;
         }
-        monaco.editor.setModelLanguage(
-          latest.model,
-          languageFromPath(result.relativePath),
-        );
+        monaco.editor.setModelLanguage(latest.model, languageFromPath(result.relativePath));
         setTabStates((prev) => {
           const entry = prev.get(sourceTabId);
           if (entry?.status !== "ready") {
@@ -816,10 +806,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
       if (!api) {
         return;
       }
-      const clicked = await api.contextMenu.show(
-        [{ id: "new-file", label: "New File" }],
-        position,
-      );
+      const clicked = await api.contextMenu.show([{ id: "new-file", label: "New File" }], position);
       if (clicked === "new-file") {
         setNewFileError(null);
         setNewFile({ kind: "create", folderPath, draft: "" });
@@ -1103,11 +1090,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
             ) : null}
           </div>
           {activeTabState?.status === "ready" ? (
-            <EditorStatusBar
-              cursor={cursorPos}
-              language={activeLanguage}
-              wordWrap={wordWrap}
-            />
+            <EditorStatusBar cursor={cursorPos} language={activeLanguage} wordWrap={wordWrap} />
           ) : null}
         </div>
       </div>

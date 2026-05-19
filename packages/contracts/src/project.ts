@@ -16,6 +16,30 @@ const PROJECT_READ_FILE_PATH_MAX_LENGTH = 512;
  */
 export const PROJECT_READ_FILE_MAX_CHARS = 2_000_000;
 
+/**
+ * Slice C / H9 fix (2026-05-16) — character cap on `projects.writeFile`
+ * payloads. Pre-Slice-C, `ProjectWriteFileInput.contents` was unbounded
+ * `Schema.String`. Every other write-shaped input in the codebase has a
+ * cap: terminal write 65 KB, provider turn input 120 K chars, filesystem
+ * read 2 M chars. Without one, a malicious client could send a
+ * multi-gigabyte string and exhaust server memory during JSON parse or
+ * fill the disk during the write.
+ *
+ * The cap is set to 5× the read cap (10 M chars, ~20 MB UTF-16) to:
+ *   - accommodate legitimate large files the Editor surfaces (the Editor
+ *     reads up to PROJECT_READ_FILE_MAX_CHARS; round-trip saves naturally
+ *     stay near that, but paste / generated-content / multi-file copy
+ *     operations can briefly exceed it),
+ *   - reject the obvious DoS payloads (multi-GB strings) at the wire,
+ *   - leave headroom for legitimate workflows without becoming a
+ *     "this user hits the cap every day" friction point.
+ *
+ * Server-side `WorkspaceFileSystem.writeFile` is the consumer; that path
+ * also goes through the workspace jail (Slice B) before any byte hits
+ * disk, so this is a defense-in-depth pre-filter at the schema boundary.
+ */
+export const PROJECT_WRITE_FILE_MAX_CHARS = 10_000_000;
+
 export const ProjectSearchEntriesInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   query: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
@@ -42,14 +66,15 @@ export class ProjectSearchEntriesError extends Schema.TaggedErrorClass<ProjectSe
   "ProjectSearchEntriesError",
   {
     message: TrimmedNonEmptyString,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {}
 
 export const ProjectWriteFileInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   relativePath: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_WRITE_FILE_PATH_MAX_LENGTH)),
-  contents: Schema.String,
+  // Slice C / H9 — char cap on the contents payload. See
+  // PROJECT_WRITE_FILE_MAX_CHARS for rationale on the value choice.
+  contents: Schema.String.check(Schema.isMaxLength(PROJECT_WRITE_FILE_MAX_CHARS)),
 });
 export type ProjectWriteFileInput = typeof ProjectWriteFileInput.Type;
 
@@ -62,7 +87,6 @@ export class ProjectWriteFileError extends Schema.TaggedErrorClass<ProjectWriteF
   "ProjectWriteFileError",
   {
     message: TrimmedNonEmptyString,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {}
 
@@ -90,7 +114,6 @@ export class ProjectReadFileError extends Schema.TaggedErrorClass<ProjectReadFil
   "ProjectReadFileError",
   {
     message: TrimmedNonEmptyString,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {}
 
@@ -119,6 +142,5 @@ export class ProjectListTreeError extends Schema.TaggedErrorClass<ProjectListTre
   "ProjectListTreeError",
   {
     message: TrimmedNonEmptyString,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {}

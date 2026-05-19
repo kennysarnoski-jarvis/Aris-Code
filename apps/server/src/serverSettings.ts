@@ -178,7 +178,6 @@ const makeServerSettings = Effect.gen(function* () {
         new ServerSettingsError({
           settingsPath,
           detail: "failed to check settings file existence",
-          cause,
         }),
     ),
   );
@@ -189,7 +188,6 @@ const makeServerSettings = Effect.gen(function* () {
         new ServerSettingsError({
           settingsPath,
           detail: "failed to read settings file",
-          cause,
         }),
     ),
   );
@@ -232,7 +230,6 @@ const makeServerSettings = Effect.gen(function* () {
           new ServerSettingsError({
             settingsPath,
             detail: "failed to write settings file",
-            cause,
           }),
       ),
     );
@@ -253,11 +250,10 @@ const makeServerSettings = Effect.gen(function* () {
 
     yield* fs.makeDirectory(settingsDir, { recursive: true }).pipe(
       Effect.mapError(
-        (cause) =>
+        (_cause) =>
           new ServerSettingsError({
             settingsPath,
             detail: "failed to prepare settings directory",
-            cause,
           }),
       ),
     );
@@ -320,7 +316,6 @@ const makeServerSettings = Effect.gen(function* () {
                 new ServerSettingsError({
                   settingsPath: "<memory>",
                   detail: `failed to normalize server settings: ${SchemaIssue.makeFormatterDefault()(cause.issue)}`,
-                  cause,
                 }),
             ),
           );

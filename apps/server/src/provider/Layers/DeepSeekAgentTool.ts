@@ -44,16 +44,172 @@ import { OpenAIChatCompletionsModel } from "@openai/agents-openai";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 
-import { ArisToolCallId, type ArisEvent, type TurnId } from "@t3tools/contracts";
-
-import { createDeepSeekOpenAIClient } from "./DeepSeekOpenAIClient.ts";
 import {
+  ArisToolCallId,
+  DEEPSEEK_MODEL_SLUGS,
+  DEEPSEEK_REASONING_EFFORT_OPTIONS,
+  type ArisEvent,
+  type DeepSeekModelSlug,
+  type DeepSeekReasoningEffort,
+  type TurnId,
+} from "@t3tools/contracts";
+
+import type { AgentTemplate } from "./ArisAgentTemplatesLoader.ts";
+import {
+  createDeepSeekOpenAIClient,
+  getRequestReasoningEffort,
+  setRequestReasoningEffort,
+} from "./DeepSeekOpenAIClient.ts";
+import { mapEffortToReasoningEffort } from "./DeepSeekEffortMapping.ts";
+import { formatWorkerToolCallLog } from "./DeepSeekToolCallLog.ts";
+import {
+  clampWorkerMaxTurns,
   DEFAULT_WORKER_MAX_TURNS,
+  MAX_WORKER_MAX_TURNS,
   WORKER_BASELINE_TOOL_NAMES,
   WORKER_EXCLUDED_TOOL_NAMES,
   type WorkerUsage,
 } from "./CoordinatorTypes.ts";
 import { createDeepSeekSessionScratchpadTools } from "./DeepSeekSessionScratchpadTools.ts";
+import type { RollingWindowConfig } from "./RollingWindowMemory.ts";
+
+/**
+ * Default system instructions handed to every spawned worker that doesn't
+ * pass a `system_prompt` override (and to template-based workers as the
+ * baseline that template-body content augments).
+ *
+ * Extracted to module scope (was inline in `execute` before Slice 1) so:
+ *   1. The text is testable without invoking `execute` — schema tests can
+ *      assert the confidence paragraph is present without spinning up an
+ *      Agent / Runner.
+ *   2. Future agent-template Slices can reference it as the canonical
+ *      baseline that AGENT.md bodies extend rather than replace.
+ *
+ * The scope-aware confidence filter (Slice 1) lives here because it must
+ * apply to direct-spawn workers, not just template-based ones. Without
+ * it, every audit / review worker dumps low-signal findings — see Aris's
+ * Gap 3 analysis. The filter is intentionally scoped to REPORTING work
+ * only; implementation workers (refactors, edits, scaffolding) must not
+ * hedge on 70%-confidence code changes.
+ */
+export const DEFAULT_WORKER_INSTRUCTIONS =
+  "You are a sub-agent spawned by a coordinator. Focus on " +
+  "the task in the user message, use your tools as needed, " +
+  "and return a clear final output. You have no visibility " +
+  "into the coordinator's conversation history — the prompt " +
+  "you received contains all the context you have.\n\n" +
+  "**Trust your tools and finish quickly.** If a search " +
+  "tool (grep / glob) returns no matches, that IS the answer " +
+  "— emit your final answer immediately stating 'no matches " +
+  "found in <scope>'. Do NOT retry with variants of the same " +
+  "search unless the prompt explicitly asks you to. Spinning " +
+  "on tool variants burns your turn budget and produces " +
+  "nothing. When you have enough information to answer the " +
+  "task, STOP and emit a final response — don't gather more " +
+  "than you need.\n\n" +
+  "**Confidence filter for reports.** When your task is to " +
+  "REPORT FINDINGS back to the coordinator (audits, reviews, " +
+  "scans, research, observations), only include items you are " +
+  ">80% confident are real and actionable. Consolidate similar " +
+  "issues. Skip stylistic nitpicks. Three high-signal findings " +
+  "beat thirty noisy ones. This filter does NOT apply to " +
+  "implementation work — when asked to write, edit, or refactor " +
+  "code, just do the work cleanly without hedging on 70%-" +
+  "confidence changes.";
+
+/**
+ * Base description for the `spawn_worker` tool — invariant across
+ * factory calls. The dynamic "## Available agent templates" section
+ * (Slice 4) is appended by `buildSpawnWorkerDescription` when the
+ * deps include a non-empty templates list. Keeping the base text as
+ * a const means the description-rebuild cost per factory call is just
+ * string concat + a few map/joins, not re-emitting the whole prose.
+ */
+const BASE_SPAWN_WORKER_DESCRIPTION =
+  "Delegate a self-contained subtask to a sub-agent worker and " +
+  "get its final output back. Use this whenever a task can be " +
+  "decomposed into independent pieces that don't need to share " +
+  "in-flight context — research across multiple subdirectories, " +
+  "auditing N independent files, drafting M variants of the same " +
+  "thing, etc.\n\n" +
+  "Each spawn_worker call is a fresh sub-agent: it has NO " +
+  "visibility into your conversation history, scratchpad, todos, " +
+  "or facts. The `prompt` you pass is the worker's entire " +
+  "context — include any background it needs.\n\n" +
+  "Workers are themselves full agentic sub-agents — they have the " +
+  "SAME tool surface you do (file/shell/scratchpad/todos/facts/" +
+  "archives), the SAME reasoning mode, and report back to you " +
+  "with their final output. The only thing they can't do is " +
+  "spawn their own workers (no recursion). Pass `tools: ['bash', " +
+  "'read_file']` to restrict a worker to a narrow subset; omit " +
+  "`tools` to give the worker your full tool set.\n\n" +
+  "When to reach for this tool:\n" +
+  "  - 'audit X across each of these N folders' → spawn N workers " +
+  "in parallel, each scoped to one folder.\n" +
+  "  - 'research these 5 topics and synthesize' → spawn 5 research " +
+  "workers, then synthesize their outputs in your own response.\n" +
+  "  - 'try 3 different approaches to this refactor' → spawn 3 " +
+  "workers, each with one approach, compare results.\n\n" +
+  "When NOT to reach for it: tasks that need shared in-flight " +
+  "state (the worker can't see your scratchpad), single-step " +
+  "tasks (overhead isn't worth it), or anything where you'd just " +
+  "do the work yourself in 1-2 tool calls.";
+
+/**
+ * Build the spawn_worker tool description, optionally appending a
+ * manifest of available agent templates so the coordinator can see
+ * which template names are valid for the `template` param and what
+ * each one is tuned for.
+ *
+ * When `templates` is empty (e.g. a host with no `.aris/agents/`
+ * library, or a test fixture), the manifest section is omitted
+ * entirely — the description reads identically to the pre-Slice-4
+ * shape. When templates exist, a section listing each is appended:
+ *
+ *   ## Available agent templates
+ *
+ *   Pass `template: "<name>"` to spawn one of these pre-baked agents.
+ *   The template's frontmatter (model, effort, allowed-tools,
+ *   max-turns) and body (system prompt) become defaults; your
+ *   explicit args still override.
+ *
+ *     - code-reviewer (model: deepseek-v4-pro, effort: high) —
+ *       Reviews code for quality, security, maintainability.
+ *     - doc-updater (model: deepseek-v4-flash, effort: light) —
+ *       Cheap doc sync, codemap updates.
+ *     - planner (effort: max) — Implementation plans, ADRs.
+ *
+ * The format mirrors `ArisSkillsTool.buildDescription` — same compact
+ * indent, same `-` bullet, same "name — description" cadence. Easy
+ * for the model to scan at low token cost.
+ */
+function buildSpawnWorkerDescription(templates: ReadonlyArray<AgentTemplate>): string {
+  if (templates.length === 0) return BASE_SPAWN_WORKER_DESCRIPTION;
+
+  const manifestLines: string[] = [];
+  for (const t of templates) {
+    const fm = t.frontmatter;
+    const tags: string[] = [];
+    if (fm.model !== undefined) tags.push(`model: ${fm.model}`);
+    if (fm.effort !== undefined) tags.push(`effort: ${fm.effort}`);
+    if (fm.maxTurns !== undefined) tags.push(`max-turns: ${fm.maxTurns}`);
+    const tagSegment = tags.length > 0 ? ` (${tags.join(", ")})` : "";
+    const summary = fm.description ?? "(no description)";
+    manifestLines.push(`  - ${t.name}${tagSegment} — ${summary}`);
+  }
+
+  return (
+    BASE_SPAWN_WORKER_DESCRIPTION +
+    "\n\n" +
+    "## Available agent templates\n\n" +
+    'Pass `template: "<name>"` to spawn one of these pre-baked agents. ' +
+    "The template's frontmatter (model, effort, allowed-tools, max-turns) " +
+    "and body (system prompt) become defaults; your explicit args still " +
+    "override. Prefer a template when one fits the task — it saves you " +
+    "from re-specifying the same routing knobs for every spawn.\n\n" +
+    manifestLines.join("\n")
+  );
+}
 
 /**
  * Dependencies the AgentTool factory needs from its caller. Most of
@@ -92,6 +248,7 @@ export interface DeepSeekAgentToolDeps {
    * still use the AgentTool factory.
    */
   readonly sessionScratchpadCtx?: {
+    readonly rollingWindowConfig: RollingWindowConfig;
     readonly cwd: string;
     readonly threadId: string;
     readonly parentTurnId: string;
@@ -106,7 +263,149 @@ export interface DeepSeekAgentToolDeps {
    * skip the event channel.
    */
   readonly emitCoordinatorEvent?: (event: ArisEvent) => void;
+  /**
+   * Slice 4 — pre-baked agent templates discovered from
+   * `.aris/agents/<name>/AGENT.md`. When the coordinator invokes
+   * `spawn_worker({ template: "<name>", prompt: "..." })`, the
+   * tool looks up the template by name and applies its frontmatter
+   * (model, effort, allowed-tools, max-turns) as defaults that the
+   * coordinator's explicit args can still override. Tool description
+   * carries a dynamic manifest of available template names so the
+   * model knows what's on the menu.
+   *
+   * Optional + defaults to empty so tests and non-adapter callers can
+   * compose this factory without a templates store. When empty/absent,
+   * `spawn_worker` works exactly like the pre-Slice-4 behavior — the
+   * `template` parameter still validates, but a non-null value resolves
+   * to an unknown-template error returned to the coordinator (which can
+   * then retry with the all-params-explicit shape).
+   */
+  readonly templates?: ReadonlyArray<AgentTemplate>;
 }
+
+/**
+ * Zod schema for the `spawn_worker` tool's parameters. Hoisted to
+ * module scope so the schema is directly testable via `safeParse` —
+ * the OpenAI Agents SDK's `tool({ parameters })` wrapper converts Zod
+ * into JSON Schema internally and the resulting `Tool.parameters` no
+ * longer exposes the Zod methods. Exporting the schema as a const lets
+ * tests assert the surface (valid/invalid model + effort, nullable +
+ * optional shape) without spinning up an Agent / Runner.
+ *
+ * Single source of truth: the SDK construction below references this
+ * via `parameters: SPAWN_WORKER_PARAMETERS`, and tests `safeParse`
+ * against the same object. No drift possible between the schema the
+ * model sees and the schema we validate.
+ */
+export const SPAWN_WORKER_PARAMETERS = z.object({
+  description: z
+    .string()
+    .describe(
+      "Short 3-5 word label for what this worker is doing. Used in " +
+        "logs and (eventually) UI tree views. 'research auth flow' good, " +
+        "'do the thing' bad.",
+    ),
+  prompt: z
+    .string()
+    .describe(
+      "Fully self-contained task prompt for the worker. Include all " +
+        "background context — the worker has zero visibility into your " +
+        "conversation history.",
+    ),
+  tools: z
+    .array(z.string())
+    .nullable()
+    .optional()
+    .describe(
+      "Optional allowlist of SPECIALTY tools for the worker, ADDITIVE " +
+        "over the always-on baseline. Every worker automatically gets " +
+        "bash, read_file, write_file, edit_file, grep, glob, " +
+        "list_directory — you don't need to (and shouldn't) list those. " +
+        "Pass e.g. ['search_knowledge', 'search_cve'] to ALSO give the " +
+        "worker the KG search tools. Omit/null gives the worker your " +
+        "full catalog minus spawn_worker. Cannot narrow below baseline.",
+    ),
+  system_prompt: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      "Optional override for worker's instructions. Default is a minimal " +
+        "'you are a sub-agent, focus on the task, return a clear final " +
+        "output' framing. Override for domain-specific worker personas.",
+    ),
+  max_turns: z
+    .number()
+    .int()
+    .positive()
+    .max(MAX_WORKER_MAX_TURNS)
+    .nullable()
+    .optional()
+    .describe(
+      `Optional cap on worker LLM turns (each turn can emit multiple ` +
+        `parallel tool calls). Default ${DEFAULT_WORKER_MAX_TURNS}, ` +
+        `hard ceiling ${MAX_WORKER_MAX_TURNS}. ` +
+        `Bump higher for deep research or sprawling refactors. If a task ` +
+        `wouldn't fit in ~100 turns even with room to spare, decompose it ` +
+        `into multiple narrower workers instead of raising this cap further.`,
+    ),
+  // Slice 1 — per-worker model routing. Strict enum from contracts so
+  // a bad slug fails at parse time with a clear "expected one of: ..."
+  // rather than at the cloud API boundary (which surfaces as a generic
+  // worker_failed). Adding a new tier (e.g. V4-Mini) is a contracts-
+  // package edit; the Zod enum picks it up automatically.
+  model: z
+    .enum(DEEPSEEK_MODEL_SLUGS)
+    .nullable()
+    .optional()
+    .describe(
+      "Override the worker's model. Default is the thread's model " +
+        "(typically `deepseek-v4-pro`). Use `deepseek-v4-flash` for cheap " +
+        "one-shot work — doc updates, simple greps, mechanical refactors, " +
+        "summarization. Same architecture, much cheaper per token. Use " +
+        "`deepseek-v4-pro` for hard problems — planning, multi-file " +
+        "refactors, audits, deep research.",
+    ),
+  // Slice 1 — per-worker reasoning effort. Same name `effort` as the
+  // skill / agent-template frontmatter for vocabulary consistency
+  // (Aris's audit point #3). Internal type is `DeepSeekReasoningEffort`
+  // but the surface stays `effort` so coordinators and template authors
+  // use one word.
+  effort: z
+    .enum(DEEPSEEK_REASONING_EFFORT_OPTIONS)
+    .nullable()
+    .optional()
+    .describe(
+      "Override the worker's reasoning depth. Default inherits the " +
+        "parent turn's effort. `light` = fastest, baseline reasoning " +
+        "(still emits reasoning_content — V4-Pro always reasons, only " +
+        "depth is controllable). `high` = standard thinking, default for " +
+        "most agentic work. `max` = deepest reasoning (use sparingly — " +
+        "expensive). Pick `light` for mechanical workers (rename, lint " +
+        "fix, doc sync), `high` for review/research, `max` for planning " +
+        "or hard audits.",
+    ),
+  // Slice 4 — pre-baked agent template lookup. When set, the worker
+  // inherits the template's `model`, `effort`, `allowed-tools`, and
+  // `max-turns` frontmatter plus its body as the system prompt.
+  // Explicit args on this same call still win — layering is
+  // explicit > template > built-in defaults. Free-form string at the
+  // Zod level because the manifest is dynamic per turn (hot-reloaded
+  // from `.aris/agents/`); unknown names return a clear error string
+  // from execute() rather than a Zod parse failure.
+  template: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      "Optional name of a pre-baked agent template from `.aris/agents/`. " +
+        "When set, the template's frontmatter (model, effort, allowed-tools, " +
+        "max-turns) and body (system prompt) apply as defaults; explicit args " +
+        "on this call override them. See this tool's description for the " +
+        "manifest of available templates and what each does. Pass null/omit " +
+        "to spawn a one-off worker with the params you provide directly.",
+    ),
+});
 
 /**
  * Build the `spawn_worker` tool. Single-element array to match the
@@ -122,89 +421,100 @@ export interface DeepSeekAgentToolDeps {
 export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
   if (deps.parentTools.length === 0) return [];
 
+  // Slice 4 — Build the description outside the `tool({})` call so we
+  // can log its rebuild stats. The description rebuilds per turn (the
+  // composer is called from `runTurnStreaming`), so this fires once
+  // per turn — same cadence as the skills-loader log line. Provides
+  // visibility if DS V4's prompt cache hit rate ever degrades: a
+  // sudden description-length spike would correlate.
+  const templates = deps.templates ?? [];
+  const spawnWorkerDescription = buildSpawnWorkerDescription(templates);
+  console.error(
+    `[DeepSeekAgentTool] description rebuilt templates=${templates.length} descLen=${spawnWorkerDescription.length}`,
+  );
+
   const spawnWorker = tool({
     name: "spawn_worker",
-    description:
-      "Delegate a self-contained subtask to a sub-agent worker and " +
-      "get its final output back. Use this whenever a task can be " +
-      "decomposed into independent pieces that don't need to share " +
-      "in-flight context — research across multiple subdirectories, " +
-      "auditing N independent files, drafting M variants of the same " +
-      "thing, etc.\n\n" +
-      "Each spawn_worker call is a fresh sub-agent: it has NO " +
-      "visibility into your conversation history, scratchpad, todos, " +
-      "or facts. The `prompt` you pass is the worker's entire " +
-      "context — include any background it needs.\n\n" +
-      "Workers are themselves full agentic sub-agents — they have the " +
-      "SAME tool surface you do (file/shell/scratchpad/todos/facts/" +
-      "archives), the SAME reasoning mode, and report back to you " +
-      "with their final output. The only thing they can't do is " +
-      "spawn their own workers (no recursion). Pass `tools: ['bash', " +
-      "'read_file']` to restrict a worker to a narrow subset; omit " +
-      "`tools` to give the worker your full tool set.\n\n" +
-      "When to reach for this tool:\n" +
-      "  - 'audit X across each of these N folders' → spawn N workers " +
-      "in parallel, each scoped to one folder.\n" +
-      "  - 'research these 5 topics and synthesize' → spawn 5 research " +
-      "workers, then synthesize their outputs in your own response.\n" +
-      "  - 'try 3 different approaches to this refactor' → spawn 3 " +
-      "workers, each with one approach, compare results.\n\n" +
-      "When NOT to reach for it: tasks that need shared in-flight " +
-      "state (the worker can't see your scratchpad), single-step " +
-      "tasks (overhead isn't worth it), or anything where you'd just " +
-      "do the work yourself in 1-2 tool calls.",
-    parameters: z.object({
-      description: z
-        .string()
-        .describe(
-          "Short 3-5 word label for what this worker is doing. Used in " +
-            "logs and (eventually) UI tree views. 'research auth flow' good, " +
-            "'do the thing' bad.",
-        ),
-      prompt: z
-        .string()
-        .describe(
-          "Fully self-contained task prompt for the worker. Include all " +
-            "background context — the worker has zero visibility into your " +
-            "conversation history.",
-        ),
-      tools: z
-        .array(z.string())
-        .nullable()
-        .optional()
-        .describe(
-          "Optional allowlist of SPECIALTY tools for the worker, ADDITIVE " +
-            "over the always-on baseline. Every worker automatically gets " +
-            "bash, read_file, write_file, edit_file, grep, glob, " +
-            "list_directory — you don't need to (and shouldn't) list those. " +
-            "Pass e.g. ['search_knowledge', 'search_cve'] to ALSO give the " +
-            "worker the KG search tools. Omit/null gives the worker your " +
-            "full catalog minus spawn_worker. Cannot narrow below baseline.",
-        ),
-      system_prompt: z
-        .string()
-        .nullable()
-        .optional()
-        .describe(
-          "Optional override for worker's instructions. Default is a minimal " +
-            "'you are a sub-agent, focus on the task, return a clear final " +
-            "output' framing. Override for domain-specific worker personas.",
-        ),
-      max_turns: z
-        .number()
-        .int()
-        .nullable()
-        .optional()
-        .describe(
-          `Optional cap on worker LLM turns (each turn can emit multiple ` +
-            `parallel tool calls). Default ${DEFAULT_WORKER_MAX_TURNS}. ` +
-            `Bump higher for deep research or sprawling refactors. If a task ` +
-            `wouldn't fit in ~100 turns even with room to spare, decompose it ` +
-            `into multiple narrower workers instead of raising this cap further.`,
-        ),
-    }),
-    async execute({ description, prompt, tools, system_prompt, max_turns }) {
-      // Tool resolution layers (2026-05-12, refined from earlier):
+    description: spawnWorkerDescription,
+    parameters: SPAWN_WORKER_PARAMETERS,
+    async execute({
+      description,
+      prompt,
+      tools,
+      system_prompt,
+      max_turns,
+      model,
+      effort,
+      template,
+    }) {
+      // Slice 4 — Template lookup. When the coordinator names a template,
+      // resolve it from the deps store. Unknown names fail loud with a
+      // clear error string (returned, not thrown — same pattern as the
+      // other failure paths so the coordinator's run continues and it
+      // can retry with a known name or all-params-explicit).
+      const templateName =
+        typeof template === "string" && template.length > 0 ? template : undefined;
+      let resolvedTemplate: AgentTemplate | undefined;
+      if (templateName !== undefined) {
+        resolvedTemplate = (deps.templates ?? []).find((t) => t.name === templateName);
+        if (resolvedTemplate === undefined) {
+          const available = (deps.templates ?? []).map((t) => t.name).join(", ");
+          return (
+            `Worker spawn aborted: unknown template '${templateName}'. ` +
+            `Available templates: ${available.length > 0 ? available : "(none configured)"}. ` +
+            `Either retry with one of those names, or omit the \`template\` param ` +
+            `and provide system_prompt / model / effort / tools directly.`
+          );
+        }
+      }
+
+      // Slice 4 — Layered defaults: explicit arg > template > built-in.
+      // Each "layered" var is the effective value the rest of execute()
+      // uses; they collapse the precedence ladder into a single name so
+      // the downstream code doesn't have to know whether a value came from
+      // the coordinator's call or the template's frontmatter.
+      const layeredTools: ReadonlyArray<string> | undefined =
+        Array.isArray(tools) && tools.length > 0
+          ? tools
+          : resolvedTemplate?.frontmatter.allowedTools;
+      const layeredSystemPrompt: string | undefined =
+        typeof system_prompt === "string" && system_prompt.length > 0
+          ? system_prompt
+          : resolvedTemplate?.body && resolvedTemplate.body.length > 0
+            ? resolvedTemplate.body
+            : undefined;
+      const layeredModelRaw: string | undefined =
+        (typeof model === "string" && model.length > 0 ? model : undefined) ??
+        resolvedTemplate?.frontmatter.model;
+      const layeredEffort: DeepSeekReasoningEffort | undefined =
+        effort ?? mapEffortToReasoningEffort(resolvedTemplate?.frontmatter.effort);
+      const layeredMaxTurns: number | undefined =
+        typeof max_turns === "number" && Number.isFinite(max_turns) && max_turns > 0
+          ? max_turns
+          : resolvedTemplate?.frontmatter.maxTurns;
+
+      // Slice 4 — Validate the template-supplied model against the canonical
+      // slug set. The explicit `model` arg goes through the Zod enum at
+      // parse time, but a template's frontmatter is loose-string so a typo
+      // in AGENT.md would otherwise reach the API and surface as a generic
+      // worker_failed. Check here so the error message points at the
+      // template, not at "the model didn't accept the request."
+      if (
+        layeredModelRaw !== undefined &&
+        !(DEEPSEEK_MODEL_SLUGS as ReadonlyArray<string>).includes(layeredModelRaw)
+      ) {
+        const available = DEEPSEEK_MODEL_SLUGS.join(", ");
+        return (
+          `Worker spawn aborted: template '${templateName ?? "?"}' specifies invalid ` +
+          `model '${layeredModelRaw}'. Available models: ${available}. ` +
+          `Fix the template's frontmatter or override with an explicit \`model\` param.`
+        );
+      }
+      const layeredModel: DeepSeekModelSlug | undefined = layeredModelRaw as
+        | DeepSeekModelSlug
+        | undefined;
+
+      // Tool resolution layers (2026-05-12, refined for Slice 4):
       //   1. WORKER_EXCLUDED_TOOL_NAMES — security boundary, NEVER given to
       //      workers regardless of what the coordinator asks for.
       //   2. WORKER_BASELINE_TOOL_NAMES — file/shell baseline, ALWAYS given
@@ -212,11 +522,15 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
       //      Prevents the "Tool bash not found in agent DeepSeek.Worker"
       //      failure when the coordinator narrows too aggressively and the
       //      worker legitimately needs a baseline tool mid-task.
-      //   3. requestedSet (coordinator's `tools` arg) — ADDITIVE over the
-      //      baseline. When present, specialty tools (search_*, scratchpad,
-      //      todos, facts, etc.) are only included if explicitly listed.
-      //      When absent, all non-excluded parent tools are included.
-      const requestedSet = Array.isArray(tools) && tools.length > 0 ? new Set(tools) : null;
+      //   3. requestedSet — ADDITIVE over the baseline. When present,
+      //      specialty tools (search_*, scratchpad, todos, facts, etc.) are
+      //      only included if explicitly listed. When absent, all non-
+      //      excluded parent tools are included. Slice 4: the source of
+      //      this set is `layeredTools` so a template's `allowed-tools`
+      //      frontmatter pre-populates it when the coordinator doesn't
+      //      pass `tools` explicitly.
+      const requestedSet =
+        layeredTools !== undefined && layeredTools.length > 0 ? new Set(layeredTools) : null;
       const workerTools = deps.parentTools.filter((t) => {
         const name = t.name;
         if (WORKER_EXCLUDED_TOOL_NAMES.has(name)) return false;
@@ -243,23 +557,26 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
         cloudToken: deps.cloudToken,
       });
 
-      const workerInstructions =
-        typeof system_prompt === "string" && system_prompt.length > 0
-          ? system_prompt
-          : "You are a sub-agent spawned by a coordinator. Focus on " +
-            "the task in the user message, use your tools as needed, " +
-            "and return a clear final output. You have no visibility " +
-            "into the coordinator's conversation history — the prompt " +
-            "you received contains all the context you have.\n\n" +
-            "**Trust your tools and finish quickly.** If a search " +
-            "tool (grep / glob) returns no matches, that IS the answer " +
-            "— emit your final answer immediately stating 'no matches " +
-            "found in <scope>'. Do NOT retry with variants of the same " +
-            "search unless the prompt explicitly asks you to. Spinning " +
-            "on tool variants burns your turn budget and produces " +
-            "nothing. When you have enough information to answer the " +
-            "task, STOP and emit a final response — don't gather more " +
-            "than you need.";
+      // Slice 4 — `layeredSystemPrompt` already collapsed
+      // (explicit system_prompt → template body → undefined). Final
+      // fall-through to DEFAULT_WORKER_INSTRUCTIONS happens here so a
+      // template that intentionally ships no body (rare, but valid)
+      // still gets the baseline file/shell + confidence-filter
+      // guidance from Slice 1.
+      const workerInstructions = layeredSystemPrompt ?? DEFAULT_WORKER_INSTRUCTIONS;
+
+      // Slice 4 — Effective model. `layeredModel` is the explicit arg
+      // (Zod-validated slug) OR the template's frontmatter model
+      // (validated above against DEEPSEEK_MODEL_SLUGS). Fall through
+      // to the thread's default when neither layer provided one.
+      const effectiveModel: string = layeredModel ?? deps.defaultModelName;
+      // Slice 4 — `requestedEffort` is `layeredEffort` (already the
+      // explicit arg, or the coerced template effort via
+      // mapEffortToReasoningEffort, or `undefined` meaning "don't
+      // touch the module-level holder"). Same save-and-restore
+      // semantics as Slice 1 — undefined here means parent's effort
+      // applies unchanged.
+      const requestedEffort: DeepSeekReasoningEffort | undefined = layeredEffort;
 
       // COORD-4 — escalate tool. Worker-only; not in the parent's
       // catalog. When the worker calls this, we throw a tagged
@@ -319,6 +636,7 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
       ]);
       const workerSessionScratchpadTools = deps.sessionScratchpadCtx
         ? createDeepSeekSessionScratchpadTools({
+            rollingWindowConfig: deps.sessionScratchpadCtx.rollingWindowConfig,
             cwd: deps.sessionScratchpadCtx.cwd,
             threadId: deps.sessionScratchpadCtx.threadId,
             parentTurnId: deps.sessionScratchpadCtx.parentTurnId,
@@ -357,7 +675,11 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
       const workerAgent = new Agent({
         name: `DeepSeek.Worker.${description.replaceAll(/\s+/g, "_")}`,
         instructions: workerInstructionsWithToolList,
-        model: new OpenAIChatCompletionsModel(workerClient, deps.defaultModelName),
+        // Slice 1 — `effectiveModel` plumbs the per-spawn `model` override
+        // through; falls back to `deps.defaultModelName` (thread model)
+        // when the coordinator doesn't specify. Same OpenAI client either
+        // way — the model slug is the only thing that changes.
+        model: new OpenAIChatCompletionsModel(workerClient, effectiveModel),
         // Workers get the parent's tool catalog (filtered, with the
         // parent-tagged session-scratchpad tools stripped), plus
         // worker-tagged session-scratchpad tools, plus the worker-only
@@ -365,10 +687,16 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
         tools: finalWorkerTools,
       });
 
-      const turnCap =
-        typeof max_turns === "number" && Number.isFinite(max_turns) && max_turns > 0
-          ? Math.floor(max_turns)
-          : DEFAULT_WORKER_MAX_TURNS;
+      // Slice 4 — `layeredMaxTurns` already collapsed the precedence
+      // ladder (explicit max_turns > template maxTurns > undefined).
+      // Slice F.1 / M-2F — runtime clamp against MAX_WORKER_MAX_TURNS
+      // is defense-in-depth alongside the zod parameter cap. The
+      // template's `maxTurns` frontmatter is author-controlled (lives
+      // in `~/.aris/agents/<id>/AGENT.md`) and bypasses the zod gate;
+      // clamping here ensures no path lets a worker exceed the
+      // documented ceiling, even if a template authored elsewhere
+      // sets `maxTurns: 999999`.
+      const turnCap = clampWorkerMaxTurns(layeredMaxTurns);
 
       // COORD-1.1 — observability. Workers run in their own
       // Runner.run() so their tool calls don't appear in the parent's
@@ -380,8 +708,15 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
       // the dev electron output.
       const startedAtMs = Date.now();
       const workerToolNames = workerTools.map((t) => t.name).join(",");
+      // Slice 1 + 4 — model + effort + template surface in the START
+      // line so cost-tracing (Flash vs Pro), depth-tracing (light vs
+      // max thinking), and template usage are all greppable. Slice 4:
+      // `template=<name>` when the coordinator named one; omitted
+      // entirely when this was an ad-hoc spawn so the line stays
+      // narrow for the common case.
+      const templateLogSegment = templateName !== undefined ? ` template=${templateName}` : "";
       console.error(
-        `[spawn_worker] START '${description}' tools=[${workerToolNames}] turnCap=${turnCap} promptLen=${prompt.length}`,
+        `[spawn_worker] START '${description}'${templateLogSegment} model=${effectiveModel} effort=${requestedEffort ?? "inherited"} tools=[${workerToolNames}] turnCap=${turnCap} promptLen=${prompt.length}`,
       );
 
       // COORD-6.1 — Emit aris.worker.spawn.started so the frontend
@@ -435,6 +770,18 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
       let toolCallCount = 0;
       let textChunks = 0;
       const finalTextParts: string[] = [];
+
+      // Slice 1 — Save the parent's current reasoning effort holder and
+      // install our requested effort (if set) for the worker's run. The
+      // module-level holder is read by the fetch interceptor inside
+      // `createDeepSeekOpenAIClient`, so per-spawn effort only takes
+      // effect during the worker's run() call. The `finally` at the end
+      // of this try/catch restores the parent's value so the coordinator's
+      // subsequent iterations aren't silently stomped.
+      const previousEffort = getRequestReasoningEffort();
+      if (requestedEffort !== undefined) {
+        setRequestReasoningEffort(requestedEffort);
+      }
       try {
         const stream = await run(workerAgent, prompt, {
           stream: true,
@@ -462,10 +809,22 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
                 typeof raw.callId === "string"
               ) {
                 const argsRaw = typeof raw.arguments === "string" ? raw.arguments : "";
-                const argsPreview = argsRaw.length > 200 ? argsRaw.slice(0, 200) + "…" : argsRaw;
+                // Slice A (H12 fix) — args content stripped from stderr.
+                // The formatter signature structurally rejects args content:
+                // it accepts argsBytes (a number) only. Secrets in args
+                // (e.g. .env writes, bash with inline credentials) can no
+                // longer reach the log channel. The `describeWorkerToolCall`
+                // helper below still derives UI labels from KNOWN safe args
+                // fields (path, pattern, command) for the
+                // CoordinatorActivityPanel — those flow through UI
+                // truncation, not stderr.
                 console.error(
-                  `${tag} tool_call: name=${raw.name} callId=${raw.callId} ` +
-                    `argsBytes=${argsRaw.length} args=${JSON.stringify(argsPreview)}`,
+                  formatWorkerToolCallLog({
+                    tag,
+                    toolName: raw.name,
+                    callId: raw.callId,
+                    argsBytes: argsRaw.length,
+                  }),
                 );
                 // 2026-05-12 — Emit aris.worker.context.changed so the
                 // CoordinatorActivityPanel can render a Cowork-style
@@ -641,6 +1000,16 @@ export function createDeepSeekAgentTool(deps: DeepSeekAgentToolDeps): Tool[] {
         const ret = `Worker '${description}' failed: ${message}`;
         emitCompleted("failed", ret, message.slice(0, 500));
         return ret;
+      } finally {
+        // Slice 1 — Restore the parent's reasoning effort regardless of
+        // how the worker resolved (ok / escalated / budget / failed).
+        // Without this the parent's subsequent iterations would silently
+        // run under the worker's effort, which would be a quiet bug:
+        // every coordinator turn after a `effort: max` worker would
+        // accidentally keep `max` until the next turn-level reset.
+        if (requestedEffort !== undefined) {
+          setRequestReasoningEffort(previousEffort);
+        }
       }
     },
   });

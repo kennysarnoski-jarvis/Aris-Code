@@ -63,7 +63,9 @@ function FileTreeRow(props: {
   onSelectFile: (path: string) => void;
   // Always threaded through the recursion (may be `undefined`) — not
   // optional, so it satisfies `exactOptionalPropertyTypes`.
-  onFolderContextMenu: ((folderPath: string, position: { x: number; y: number }) => void) | undefined;
+  onFolderContextMenu:
+    | ((folderPath: string, position: { x: number; y: number }) => void)
+    | undefined;
 }) {
   const { node, depth, theme, activePath, onSelectFile, onFolderContextMenu } = props;
   const [expanded, setExpanded] = useState(depth === 0);

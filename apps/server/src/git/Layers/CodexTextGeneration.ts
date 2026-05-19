@@ -72,11 +72,10 @@ const makeCodexTextGeneration = Effect.gen(function* () {
       .pipe(
         Effect.tap((filePath) => fileSystem.writeFileString(filePath, content)),
         Effect.mapError(
-          (cause) =>
+          (_cause) =>
             new TextGenerationError({
               operation,
               detail: `Failed to write temp file`,
-              cause,
             }),
         ),
       );
@@ -256,16 +255,14 @@ const makeCodexTextGeneration = Effect.gen(function* () {
             new TextGenerationError({
               operation,
               detail: "Failed to read Codex output file.",
-              cause,
             }),
         ),
         Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(outputSchemaJson))),
-        Effect.catchTag("SchemaError", (cause) =>
+        Effect.catchTag("SchemaError", (_cause) =>
           Effect.fail(
             new TextGenerationError({
               operation,
               detail: "Codex returned invalid structured output.",
-              cause,
             }),
           ),
         ),

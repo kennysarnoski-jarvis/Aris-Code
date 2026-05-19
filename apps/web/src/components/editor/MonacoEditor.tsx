@@ -182,12 +182,7 @@ export function MonacoEditor(props: {
             if (!pos) {
               return;
             }
-            insertRange = new monaco.Range(
-              pos.lineNumber,
-              pos.column,
-              pos.lineNumber,
-              pos.column,
-            );
+            insertRange = new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column);
           }
           editor.executeEdits("editor-context-menu", [
             { range: insertRange, text, forceMoveMarkers: true },

@@ -46,6 +46,7 @@ import {
 } from "./desktopSettings";
 import {
   readClientSettings,
+  isPersistedSavedEnvironmentRecord,
   readSavedEnvironmentRegistry,
   readSavedEnvironmentSecret,
   removeSavedEnvironmentSecret,
@@ -266,6 +267,8 @@ function backendChildEnv(): NodeJS.ProcessEnv {
   delete env.T3CODE_DESKTOP_WS_URL;
   delete env.T3CODE_DESKTOP_LAN_ACCESS;
   delete env.T3CODE_DESKTOP_LAN_HOST;
+  delete env.GH_TOKEN;
+  delete env.T3CODE_DESKTOP_UPDATE_GITHUB_TOKEN;
   return env;
 }
 
@@ -1592,6 +1595,21 @@ function registerIpcHandlers(): void {
     if (!Array.isArray(rawRecords)) {
       throw new Error("Invalid saved environment registry payload.");
     }
+    // Slice V / H11 — per-entry validation before persisting. The
+    // type guard catches any missing/wrong-typed field at the IPC
+    // boundary so a corrupt payload can't reach the on-disk store
+    // (where it would brick the renderer on next launch when the
+    // read-side parser fails). If ANY entry is invalid we reject
+    // the whole write — partial-good payloads probably mean the
+    // renderer state is itself corrupt, and a partial write would
+    // silently drop records and confuse the user.
+    for (const candidate of rawRecords) {
+      if (!isPersistedSavedEnvironmentRecord(candidate)) {
+        throw new Error(
+          "Invalid saved environment registry payload: one or more entries failed validation.",
+        );
+      }
+    }
 
     writeSavedEnvironmentRegistry(
       SAVED_ENVIRONMENT_REGISTRY_PATH,
@@ -1664,10 +1682,65 @@ function registerIpcHandlers(): void {
       return getDesktopServerExposureState();
     }
 
-    const nextState = await applyDesktopServerExposureMode(nextMode, {
-      persist: true,
-      rejectIfUnavailable: true,
-    });
+    // Slice V / H10 — gate the destructive flip (relaunch the app
+    // with the server bound to 0.0.0.0) behind a native confirm
+    // dialog. Pre-Slice-V a single renderer-side toggle could flip
+    // exposure silently and trigger relaunch with no user consent
+    // — bad UX in single-owner and a real escalation surface if a
+    // renderer is ever compromised. The dialog runs in the Electron
+    // main process so the renderer can't bypass it. Only the
+    // network-accessible direction needs confirmation; going back
+    // to local-only is always safe.
+    if (nextMode === "network-accessible") {
+      const owner = BrowserWindow.getFocusedWindow() ?? mainWindow;
+      // Slice W / H10-M1 — wrap the dialog call in try/catch so a
+      // renderer-triggered window teardown (or any Electron-internal
+      // error inside dialog.showMessageBox) can't propagate as an
+      // uncaught IPC rejection. Errors here are rare but treating
+      // them as "not confirmed" is the safe fallback: the user
+      // never explicitly said yes, so we don't flip exposure.
+      //
+      // H10-L1 (same fix) — `applyDesktopServerExposureMode` can
+      // also throw after the user confirms (e.g. no network address
+      // available). Wrapping the apply+relaunch in the same try
+      // means an after-yes failure returns the current state
+      // instead of bubbling an opaque IPC rejection to the
+      // renderer.
+      let confirmed = false;
+      try {
+        confirmed = await showDesktopConfirmDialog(
+          "Expose Aris Code's local server to other devices on your network?\n\n" +
+            "This binds the WebSocket and HTTP listeners to 0.0.0.0 so other " +
+            "machines can connect. The app will relaunch to apply the change. " +
+            "Only enable this when you intend to access Aris Code from another device.",
+          owner,
+        );
+      } catch (err) {
+        console.error("[desktop] server-exposure confirm dialog failed", err);
+        return getDesktopServerExposureState();
+      }
+      if (!confirmed) {
+        return getDesktopServerExposureState();
+      }
+    }
+
+    // Slice W / H10-L1 — apply can throw after user confirms (e.g.
+    // `rejectIfUnavailable: true` + no usable network address). Catch
+    // here so the renderer sees the current state with a logged
+    // failure rather than an opaque IPC rejection AFTER the user
+    // already said "yes." UX polish: the dialog said "the app will
+    // relaunch" — if that doesn't happen, the user shouldn't be
+    // left wondering whether the toggle took effect.
+    let nextState;
+    try {
+      nextState = await applyDesktopServerExposureMode(nextMode, {
+        persist: true,
+        rejectIfUnavailable: true,
+      });
+    } catch (err) {
+      console.error("[desktop] applyDesktopServerExposureMode failed", err);
+      return getDesktopServerExposureState();
+    }
     relaunchDesktopApp(`serverExposureMode=${nextMode}`);
     return nextState;
   });
@@ -1974,9 +2047,18 @@ function createWindow(): BrowserWindow {
     }
 
     menuTemplate.push(
-      { role: "cut", enabled: params.editFlags.canCut },
-      { role: "copy", enabled: params.editFlags.canCopy },
-      { role: "paste", enabled: params.editFlags.canPaste },
+      // Cut/Copy/Paste stay always-enabled — same reasoning for all
+      // three. Chromium's `editFlags.can*` are keyed off the right-click
+      // *target's* DOM type, so they're `false` over Monaco's rendered
+      // text spans even when Monaco's hidden textarea has focus and
+      // selection. The corresponding `webContents.cut/copy/paste()`
+      // routes to whatever element is focused, so the action lands
+      // correctly — leaving the items greyed out would just block the
+      // user from doing something that demonstrably works (the
+      // Cmd-X/C/V keyboard equivalents already work fine).
+      { role: "cut" },
+      { role: "copy" },
+      { role: "paste" },
       { role: "selectAll", enabled: params.editFlags.canSelectAll },
     );
 

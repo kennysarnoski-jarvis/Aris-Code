@@ -1064,12 +1064,16 @@ it.layer(TestLayer)("git integration", (it) => {
         const status = yield* core.statusDetails(source);
         expect(status.branch).toBe("upstream/feature");
         expect(status.upstreamRef).toBe(`${remoteName}/${featureBranch}`);
+        // Slice R / M4-9.3 — `--` before remoteName so a config-
+        // injected remote name like `--upload-pack=evil` can't be
+        // parsed as a flag. Test asserts the new shape.
         expect(fetchArgs).toEqual([
           "--git-dir",
           path.join(source, ".git"),
           "fetch",
           "--quiet",
           "--no-tags",
+          "--",
           remoteName,
         ]);
       }),
@@ -1521,6 +1525,331 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(wtBranch).toBe("feature-wt");
 
         yield* (yield* GitCore).removeWorktree({ cwd: tmp, path: wtPath });
+      }),
+    );
+
+    // ──────────────────────────────────────────────────────────────────
+    // Slice B (2026-05-16) — H5 fix: createWorktree path validation
+    //
+    // The `input.path` field is user-controlled (UI + model). Without
+    // validation, `~/.ssh/foo` or `/etc/evil` would let git populate
+    // arbitrary locations with repo content. The validation accepts
+    // paths inside `worktreesDir` OR inside `input.cwd`; rejects
+    // everything else. Production callers always pass `path: null`,
+    // so the validation only fires on explicit-path callers (tests
+    // and future UI).
+    //
+    // The validation fails BEFORE git is invoked, so no actual write
+    // attempt to the malicious target ever happens — the GitCommandError
+    // surfaces directly.
+    // ──────────────────────────────────────────────────────────────────
+
+    it.effect("rejects worktree paths that escape both worktreesDir and cwd", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+
+        // /etc/aris-attack is outside the test tmpdir AND outside
+        // worktreesDir. The validation should reject without ever
+        // invoking git, so no actual write attempt happens.
+        const evilPath = "/etc/aris-attack";
+        const currentBranch = (yield* (yield* GitCore).listBranches({ cwd: tmp })).branches.find(
+          (b) => b.current,
+        )!.name;
+
+        const error = yield* (yield* GitCore)
+          .createWorktree({
+            cwd: tmp,
+            branch: currentBranch,
+            newBranch: "evil-branch",
+            path: evilPath,
+          })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toContain("Worktree path must be inside");
+        // Confirm git was never invoked — the worktree path doesn't
+        // exist (and we're not writing to /etc/aris-attack).
+        expect(existsSync(evilPath)).toBe(false);
+      }),
+    );
+
+    it.effect("rejects worktree paths containing a null byte", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+
+        const currentBranch = (yield* (yield* GitCore).listBranches({ cwd: tmp })).branches.find(
+          (b) => b.current,
+        )!.name;
+
+        // String.fromCharCode(0) so the source-level fixture is
+        // unambiguous and immune to editor / formatter munging.
+        const NUL = String.fromCharCode(0);
+        const error = yield* (yield* GitCore)
+          .createWorktree({
+            cwd: tmp,
+            branch: currentBranch,
+            newBranch: "nul-branch",
+            path: `${tmp}/wt${NUL}evil`,
+          })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toBe("Worktree path cannot contain null bytes.");
+      }),
+    );
+
+    it.effect("rejects worktree paths that traverse out of cwd via ..", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+
+        const currentBranch = (yield* (yield* GitCore).listBranches({ cwd: tmp })).branches.find(
+          (b) => b.current,
+        )!.name;
+
+        // path.resolve normalizes "../escape" to an absolute path
+        // outside cwd. The containment check on the resolved form
+        // catches it.
+        const error = yield* (yield* GitCore)
+          .createWorktree({
+            cwd: tmp,
+            branch: currentBranch,
+            newBranch: "traverse-branch",
+            path: path.join(tmp, "../../etc/aris-attack"),
+          })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toContain("Worktree path must be inside");
+      }),
+    );
+
+    it.effect("accepts worktree paths that ARE inside cwd (regression check)", () =>
+      Effect.gen(function* () {
+        // Belt-and-suspenders — the existing happy-path tests above
+        // already pass `tmp/wt-foo` as the worktree path and would
+        // have caught a regression here. This test exists to
+        // explicitly pin the "under cwd is accepted" invariant
+        // separate from the broader git-behavior tests, so a future
+        // change to the validation logic that breaks this case fails
+        // here first (cleaner diagnosis than via the integration
+        // tests).
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+
+        const currentBranch = (yield* (yield* GitCore).listBranches({ cwd: tmp })).branches.find(
+          (b) => b.current,
+        )!.name;
+
+        const wtPath = path.join(tmp, "regression-wt");
+        const result = yield* (yield* GitCore).createWorktree({
+          cwd: tmp,
+          branch: currentBranch,
+          newBranch: "regression-branch",
+          path: wtPath,
+        });
+
+        expect(result.worktree.path).toBe(wtPath);
+        yield* (yield* GitCore).removeWorktree({ cwd: tmp, path: wtPath });
+      }),
+    );
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Slice F.3 / M-2B — `removeWorktree` path containment validation.
+  //
+  // Mirrors the createWorktree path-validation suite above. The same
+  // shared `validateWorktreePath` helper drives both, so any
+  // regression in the helper trips here AND in the create-side tests
+  // at the same time — making diagnosis quick. We keep both suites
+  // explicit (not one parameterized over both ops) because the error
+  // messages reference their respective git command labels and a
+  // future refactor that broke just one side would otherwise have
+  // only one test catch it.
+  // ─────────────────────────────────────────────────────────────────────
+  describe("removeWorktree path validation", () => {
+    it.effect("rejects worktree paths that escape both worktreesDir and cwd", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+
+        // Pre-Slice-F.3 the path went straight to `git worktree
+        // remove` with `--force`, which would happily attempt to
+        // unwind a worktree registration whose path pointed at a
+        // sensitive directory. The validation gate must reject
+        // before git is invoked.
+        const evilPath = "/etc/aris-attack";
+        const error = yield* (yield* GitCore)
+          .removeWorktree({
+            cwd: tmp,
+            path: evilPath,
+            force: true,
+          })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toContain("Worktree path must be inside");
+        // Confirm git was never invoked — the path doesn't exist.
+        expect(existsSync(evilPath)).toBe(false);
+      }),
+    );
+
+    it.effect("rejects worktree paths containing a null byte", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+
+        // `String.fromCharCode(0)` so the source-level fixture is
+        // unambiguous and immune to editor / formatter munging — same
+        // pattern as the createWorktree null-byte test.
+        const NUL = String.fromCharCode(0);
+        const error = yield* (yield* GitCore)
+          .removeWorktree({
+            cwd: tmp,
+            path: `${tmp}/wt${NUL}evil`,
+            force: false,
+          })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toBe("Worktree path cannot contain null bytes.");
+      }),
+    );
+
+    it.effect("rejects worktree paths that traverse out of cwd via ..", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+
+        const error = yield* (yield* GitCore)
+          .removeWorktree({
+            cwd: tmp,
+            path: path.join(tmp, "../../etc/aris-attack"),
+            force: false,
+          })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toContain("Worktree path must be inside");
+      }),
+    );
+
+    it.effect("accepts worktree paths that ARE inside cwd (regression check)", () =>
+      Effect.gen(function* () {
+        // Belt-and-suspenders — the cwd-internal create-then-remove
+        // round-trip in the createWorktree suite already exercises
+        // this happy path. We re-pin it here so a future change that
+        // breaks the "under cwd is accepted" branch fails in BOTH
+        // suites (sharper diagnosis: validator broke, not a git-op
+        // regression).
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+
+        const currentBranch = (yield* (yield* GitCore).listBranches({ cwd: tmp })).branches.find(
+          (b) => b.current,
+        )!.name;
+
+        const wtPath = path.join(tmp, "remove-regression-wt");
+        yield* (yield* GitCore).createWorktree({
+          cwd: tmp,
+          branch: currentBranch,
+          newBranch: "remove-regression-branch",
+          path: wtPath,
+        });
+
+        // The remove call here passes validation and reaches git;
+        // git then succeeds because the worktree was just created.
+        // If validation rejected `wtPath`, this would throw before
+        // git ran — and the assertion below would never be reached.
+        yield* (yield* GitCore).removeWorktree({ cwd: tmp, path: wtPath });
+        expect(existsSync(wtPath)).toBe(false);
+      }),
+    );
+
+    // ─────────────────────────────────────────────────────────────────
+    // Slice H.4 / H3-4 — symlink-escape coverage.
+    //
+    // Pre-Slice-H, `validateWorktreePath` used pure string arithmetic
+    // and accepted a symlink inside the worktree containment root that
+    // pointed outside. Aris's round-3 audit flagged the gap: an
+    // attacker who could land a symlink under `worktreesDir/` could
+    // then ask `removeWorktree --force` to follow it and unwind the
+    // outside target. The new realpath walker closes that — these
+    // tests pin the closure.
+    // ─────────────────────────────────────────────────────────────────
+    it.effect("rejects removeWorktree when the path is a symlink escaping cwd", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        const outside = yield* makeTmpDir("git-outside-");
+        yield* initRepoWithCommit(tmp);
+
+        // Construct the attack shape: a symlink INSIDE the project cwd
+        // pointing at an outside directory. The pre-Slice-H validator
+        // saw `tmp/evil-link` (string-contained) and accepted; the new
+        // walker lstats `evil-link`, sees the symlink, realpath's it,
+        // checks containment against the real cwd, and rejects.
+        const fileSystem = yield* FileSystem.FileSystem;
+        const linkPath = path.join(tmp, "evil-link");
+        yield* fileSystem.symlink(outside, linkPath).pipe(Effect.orDie);
+
+        const error = yield* (yield* GitCore)
+          .removeWorktree({ cwd: tmp, path: linkPath, force: true })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toMatch(/symlink/i);
+        // Confirm the outside dir is still there — git was never
+        // invoked because validation rejected before exec.
+        expect(existsSync(outside)).toBe(true);
+      }),
+    );
+
+    it.effect("rejects createWorktree when the path traverses through a symlink to outside", () =>
+      Effect.gen(function* () {
+        // Same attack via createWorktree's path argument. The walker
+        // catches it at the intermediate-component lstat, not the
+        // leaf — that's why the symlink targets a directory and the
+        // worktree path drills INTO it.
+        const tmp = yield* makeTmpDir();
+        const outside = yield* makeTmpDir("git-outside-create-");
+        yield* initRepoWithCommit(tmp);
+
+        const fileSystem = yield* FileSystem.FileSystem;
+        const linkDir = path.join(tmp, "via-link");
+        yield* fileSystem.symlink(outside, linkDir).pipe(Effect.orDie);
+
+        const currentBranch = (yield* (yield* GitCore).listBranches({ cwd: tmp })).branches.find(
+          (b) => b.current,
+        )!.name;
+
+        const error = yield* (yield* GitCore)
+          .createWorktree({
+            cwd: tmp,
+            branch: currentBranch,
+            newBranch: "evil-create",
+            path: path.join(linkDir, "wt-foo"),
+          })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toMatch(/symlink/i);
+      }),
+    );
+
+    it.effect("rejects a broken symlink in the worktree path", () =>
+      Effect.gen(function* () {
+        // Broken symlinks can't be realpath'd — we can't verify where
+        // they point, so the validator rejects rather than trusting
+        // them. Mirror of the same defense in
+        // WorkspacePaths.validateContainment.
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+
+        const fileSystem = yield* FileSystem.FileSystem;
+        const brokenLink = path.join(tmp, "broken-link");
+        yield* fileSystem
+          .symlink("/this/path/does/not/exist/anywhere", brokenLink)
+          .pipe(Effect.orDie);
+
+        const error = yield* (yield* GitCore)
+          .removeWorktree({ cwd: tmp, path: brokenLink, force: false })
+          .pipe(Effect.flip);
+
+        expect(error.detail).toMatch(/broken symlink/i);
       }),
     );
   });
@@ -2329,5 +2658,78 @@ it.layer(TestLayer)("git integration", (it) => {
         expect(didFailRemoteNames).toBe(true);
       }),
     );
+  });
+
+  // ── Slice R / M4-9 — `--` separator regression tests ──
+  //
+  // Pins the 8 fixes from Slice R (5 HIGH + 2 MEDIUM + 1 LOW). Each
+  // test captures the argv array dispatched to git and asserts `--`
+  // appears at the right position so a future refactor that drops
+  // the separator trips at the specific site. Same pattern as the
+  // Slice J.2 `uses '--' separator for branch rename arguments` test
+  // above, just expanded to every site Aris's Round 5 audit caught.
+  describe("Slice R / M4-9 — `--` separator on positional argv (source-grep pins)", () => {
+    // Source-grep is the right shape for this kind of fix:
+    //
+    //   1. Many of these operations are network-dependent (`git fetch`,
+    //      `git remote add`) and a hermetic integration test would
+    //      have to fake the network — at which point the test no
+    //      longer proves the production argv shape, just the fake's.
+    //
+    //   2. The fix IS a structural property of the source. Asserting
+    //      it directly is more honest than asserting an observed
+    //      dispatch — if a future refactor moves the dispatch site
+    //      but keeps the `--`, the integration test would still pass
+    //      while the grep tracks the actual landmark.
+    //
+    // The Slice J.2 `branch -m` integration test above uses a
+    // captured-args shape because rename is purely local + cheap to
+    // set up. For the 8 Slice R sites — network ops, multi-branch
+    // ternaries, private helpers — source-grep is the cleaner
+    // contract.
+    // ── Source-grep regression pins ──
+    //
+    // For sites that are hard to exercise hermetically (network ops,
+    // private functions), we assert against the source on disk that
+    // the `--` separator appears at the patched location. If a
+    // future refactor drops it, these trip immediately. Same
+    // discipline as the Slice M structural-parity tests.
+    it("source-grep — every Slice R fix is present in GitCore.ts", async () => {
+      const fs = await import("node:fs/promises");
+      const here = path.dirname(new URL(import.meta.url).pathname);
+      const src = await fs.readFile(path.join(here, "GitCore.ts"), "utf-8");
+
+      // M4-9.3 fetchRemoteForStatus
+      expect(src).toMatch(/"fetch",\s*"--quiet",\s*"--no-tags",\s*"--",\s*remoteName/);
+      // M4-9.4 ensureRemote.add — uses input.url, multi-line so we
+      // grep across newlines with a tolerant pattern.
+      expect(src).toMatch(/"remote",\s*"add",\s*remoteName,\s*"--",\s*input\.url/);
+      // M4-9.5 computeAheadCountAgainstBase — `--` NOT applicable.
+      // git rev-list uses `--` to separate revisions from pathspecs;
+      // putting it before the range makes the range parse as a
+      // pathspec (count returns 0). Defense moved to the baseBranch
+      // resolver layer (deferred). Source comment must mention the
+      // revert rationale.
+      expect(src).toMatch(/computeAheadCountAgainstBase[\s\S]*`--` separator NOT applicable here/);
+      // M4-9.6 removeWorktree
+      expect(src).toMatch(/args\.push\("--",\s*input\.path\)/);
+      // M4-9.7 checkoutBranch — `--` NOT applicable to git checkout.
+      // The branch-vs-pathspec overload means `git checkout -- <name>`
+      // restores a FILE rather than switching to the branch. The
+      // long-form fix is a safe-name validator on the branch input;
+      // deferred to a future slice. Source must mention the revert
+      // rationale so a future contributor doesn't re-add `--` here.
+      expect(src).toMatch(/`--` separator NOT applicable here/);
+      // M4-9.8 createBranch
+      expect(src).toMatch(
+        /"GitCore\.createBranch",\s*input\.cwd,\s*\["branch",\s*"--",\s*input\.branch\]/,
+      );
+      // M4-9.9 fetchPullRequestBranch — multi-line
+      expect(src).toMatch(/"fetch",\s*"--quiet",\s*"--no-tags",\s*"--",\s*remoteName/);
+      // runGit wrappers — fetch + materialize
+      expect(src).toMatch(/"fetch",\s*"--quiet",\s*"--no-tags",\s*"--",\s*input\.remoteName/);
+      expect(src).toMatch(/\["branch",\s*"--force",\s*"--",\s*input\.localBranch,\s*targetRef\]/);
+      expect(src).toMatch(/\["branch",\s*"--",\s*input\.localBranch,\s*targetRef\]/);
+    });
   });
 });

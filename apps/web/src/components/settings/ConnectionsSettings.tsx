@@ -274,17 +274,26 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
   );
   const [isRevealDialogOpen, setIsRevealDialogOpen] = useState(false);
 
+  // Slice F.2 / M-2E — `pairingLink.credential` is only present in the
+  // one-shot issue path (POST response + `pairingLinkUpserted` WS event).
+  // A re-fetched listing (HTTP GET / WS snapshot) has no credential, so
+  // the share-URL / copy-token UI must degrade gracefully — render the
+  // row's metadata, hide the share+copy affordances. The owner already
+  // saw the credential once at issue time; the one-shot-secret pattern
+  // is intentional. Reissue if a fresh share URL is needed.
+  const credential = pairingLink.credential;
   const currentOriginPairingUrl = useMemo(
-    () => resolveCurrentOriginPairingUrl(pairingLink.credential),
-    [pairingLink.credential],
+    () => (credential ? resolveCurrentOriginPairingUrl(credential) : null),
+    [credential],
   );
-  const shareablePairingUrl =
-    endpointUrl != null && endpointUrl !== ""
-      ? resolveDesktopPairingUrl(endpointUrl, pairingLink.credential)
+  const shareablePairingUrl = credential
+    ? endpointUrl != null && endpointUrl !== ""
+      ? resolveDesktopPairingUrl(endpointUrl, credential)
       : isLoopbackHostname(window.location.hostname)
         ? null
-        : currentOriginPairingUrl;
-  const copyValue = shareablePairingUrl ?? pairingLink.credential;
+        : currentOriginPairingUrl
+    : null;
+  const copyValue: string | null = shareablePairingUrl ?? credential ?? null;
   const canCopyToClipboard =
     typeof window !== "undefined" &&
     window.isSecureContext &&
@@ -311,7 +320,10 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
   });
 
   const handleCopy = useCallback(() => {
-    copyToClipboard(copyValue, undefined);
+    // Slice F.2 / M-2E — copyValue is null when the credential is not
+    // present in the current listing (re-fetch scenario). No-op rather
+    // than copy an empty/undefined value.
+    if (copyValue !== null) copyToClipboard(copyValue, undefined);
   }, [copyToClipboard, copyValue]);
 
   const expiresAbsolute = formatAccessTimestamp(pairingLink.expiresAt);
@@ -366,65 +378,74 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
           <p className="text-xs text-muted-foreground" title={expiresAbsolute}>
             {[roleLabel, formatExpiresInLabel(pairingLink.expiresAt, nowMs)].join(" · ")}
           </p>
-          {shareablePairingUrl === null ? (
+          {copyValue === null ? (
+            <p className="text-[11px] text-muted-foreground/70">
+              Token already issued — only shown once at creation. Revoke and reissue if you need a
+              fresh share link.
+            </p>
+          ) : shareablePairingUrl === null ? (
             <p className="text-[11px] text-muted-foreground/70">
               Copy the token and pair from another client using this backend&apos;s reachable host.
             </p>
           ) : null}
         </div>
         <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
-          <Dialog open={isRevealDialogOpen} onOpenChange={setIsRevealDialogOpen}>
-            {canCopyToClipboard ? (
-              <Button size="xs" variant="outline" onClick={handleCopy}>
-                {isCopied ? "Copied" : shareablePairingUrl ? "Copy" : "Copy token"}
-              </Button>
-            ) : (
-              <DialogTrigger render={<Button size="xs" variant="outline" />}>
-                {shareablePairingUrl ? "Show link" : "Show token"}
-              </DialogTrigger>
-            )}
-            <DialogPopup className="max-w-md">
-              <DialogHeader>
-                <DialogTitle>{shareablePairingUrl ? "Pairing link" : "Pairing token"}</DialogTitle>
-                <DialogDescription>
-                  {shareablePairingUrl
-                    ? "Clipboard copy is unavailable here. Open or manually copy this full pairing URL on the device you want to connect."
-                    : "Clipboard copy is unavailable here. Manually copy this token and pair from another client using this backend's reachable host."}
-                </DialogDescription>
-              </DialogHeader>
-              <DialogPanel className="space-y-4">
-                <Textarea
-                  readOnly
-                  value={copyValue}
-                  rows={shareablePairingUrl ? 4 : 3}
-                  className="text-xs leading-relaxed"
-                  onFocus={(event) => event.currentTarget.select()}
-                  onClick={(event) => event.currentTarget.select()}
-                />
-                {shareablePairingUrl ? (
-                  <div className="flex justify-center rounded-xl border border-border/60 bg-muted/30 p-4">
-                    <QRCodeSvg
-                      value={shareablePairingUrl}
-                      size={132}
-                      level="M"
-                      marginSize={2}
-                      title="Pairing link — scan to open on another device"
-                    />
-                  </div>
-                ) : null}
-              </DialogPanel>
-              <DialogFooter variant="bare">
-                <Button variant="outline" onClick={() => setIsRevealDialogOpen(false)}>
-                  Done
+          {copyValue !== null ? (
+            <Dialog open={isRevealDialogOpen} onOpenChange={setIsRevealDialogOpen}>
+              {canCopyToClipboard ? (
+                <Button size="xs" variant="outline" onClick={handleCopy}>
+                  {isCopied ? "Copied" : shareablePairingUrl ? "Copy" : "Copy token"}
                 </Button>
-                {canCopyToClipboard ? (
-                  <Button variant="outline" size="xs" onClick={handleCopy}>
-                    {isCopied ? "Copied" : "Copy again"}
+              ) : (
+                <DialogTrigger render={<Button size="xs" variant="outline" />}>
+                  {shareablePairingUrl ? "Show link" : "Show token"}
+                </DialogTrigger>
+              )}
+              <DialogPopup className="max-w-md">
+                <DialogHeader>
+                  <DialogTitle>
+                    {shareablePairingUrl ? "Pairing link" : "Pairing token"}
+                  </DialogTitle>
+                  <DialogDescription>
+                    {shareablePairingUrl
+                      ? "Clipboard copy is unavailable here. Open or manually copy this full pairing URL on the device you want to connect."
+                      : "Clipboard copy is unavailable here. Manually copy this token and pair from another client using this backend's reachable host."}
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogPanel className="space-y-4">
+                  <Textarea
+                    readOnly
+                    value={copyValue}
+                    rows={shareablePairingUrl ? 4 : 3}
+                    className="text-xs leading-relaxed"
+                    onFocus={(event) => event.currentTarget.select()}
+                    onClick={(event) => event.currentTarget.select()}
+                  />
+                  {shareablePairingUrl ? (
+                    <div className="flex justify-center rounded-xl border border-border/60 bg-muted/30 p-4">
+                      <QRCodeSvg
+                        value={shareablePairingUrl}
+                        size={132}
+                        level="M"
+                        marginSize={2}
+                        title="Pairing link — scan to open on another device"
+                      />
+                    </div>
+                  ) : null}
+                </DialogPanel>
+                <DialogFooter variant="bare">
+                  <Button variant="outline" onClick={() => setIsRevealDialogOpen(false)}>
+                    Done
                   </Button>
-                ) : null}
-              </DialogFooter>
-            </DialogPopup>
-          </Dialog>
+                  {canCopyToClipboard ? (
+                    <Button variant="outline" size="xs" onClick={handleCopy}>
+                      {isCopied ? "Copied" : "Copy again"}
+                    </Button>
+                  ) : null}
+                </DialogFooter>
+              </DialogPopup>
+            </Dialog>
+          ) : null}
           <Button
             size="xs"
             variant="destructive-outline"

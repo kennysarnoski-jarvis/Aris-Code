@@ -77,6 +77,31 @@ const ProjectionThreadActivityDbRowSchema = ProjectionThreadActivity.mapFields(
     sequence: Schema.NullOr(NonNegativeInt),
   }),
 );
+
+/**
+ * Slice J.1 / M3-11 — `OrchestrationThreadActivity.payload` now
+ * requires `Record(SafeRecordKey, Unknown)` at the contract layer.
+ * The DB row schema above keeps `Schema.Unknown` for read tolerance
+ * (legacy rows may have stored non-record payloads — arrays,
+ * primitives, etc.). This helper coerces the read result into the
+ * contract shape: pass-through for plain objects with safe keys,
+ * empty object for everything else.
+ *
+ * The prototype-magic keys (`__proto__`, `constructor`, `prototype`)
+ * are dropped here too — even if a legacy row managed to persist
+ * one, we strip it on read so the encoded snapshot stays clean.
+ */
+function coerceActivityPayload(raw: unknown): { readonly [key: string]: unknown } {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
+    out[key] = value;
+  }
+  return out;
+}
 const ProjectionThreadSessionDbRowSchema = ProjectionThreadSession;
 const ProjectionCheckpointDbRowSchema = ProjectionCheckpoint.mapFields(
   Struct.assign({
@@ -814,7 +839,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   tone: row.tone,
                   kind: row.kind,
                   summary: row.summary,
-                  payload: row.payload,
+                  payload: coerceActivityPayload(row.payload),
                   turnId: row.turnId,
                   ...(row.sequence !== null ? { sequence: row.sequence } : {}),
                   createdAt: row.createdAt,
@@ -1385,7 +1410,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             tone: row.tone,
             kind: row.kind,
             summary: row.summary,
-            payload: row.payload,
+            payload: coerceActivityPayload(row.payload),
             turnId: row.turnId,
             createdAt: row.createdAt,
           };

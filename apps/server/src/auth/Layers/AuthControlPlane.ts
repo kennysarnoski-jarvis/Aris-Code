@@ -65,10 +65,14 @@ export const makeAuthControlPlane = Effect.gen(function* () {
           .filter((pairingLink) => (input?.role ? pairingLink.role === input.role : true))
           .filter((pairingLink) => !input?.excludeSubjects?.includes(pairingLink.subject))
           .map((pairingLink) =>
+            // Slice F.2 / M-2E — `credential` is deliberately OMITTED.
+            // The upstream `bootstrapCredentials.listActive()` already
+            // strips it; we keep the omission explicit here so future
+            // refactors of this projection don't reintroduce the field
+            // by copying every property from the upstream object.
             pairingLink.label
               ? ({
                   id: pairingLink.id,
-                  credential: pairingLink.credential,
                   role: pairingLink.role,
                   subject: pairingLink.subject,
                   label: pairingLink.label,
@@ -77,7 +81,6 @@ export const makeAuthControlPlane = Effect.gen(function* () {
                 } satisfies AuthPairingLink)
               : ({
                   id: pairingLink.id,
-                  credential: pairingLink.credential,
                   role: pairingLink.role,
                   subject: pairingLink.subject,
                   createdAt: pairingLink.createdAt,

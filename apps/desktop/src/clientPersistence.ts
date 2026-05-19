@@ -56,6 +56,34 @@ function isPersistedSavedEnvironmentStorageRecord(
   );
 }
 
+/**
+ * Slice V / H11 — per-entry validator for the wire shape used by the
+ * `SET_SAVED_ENVIRONMENT_REGISTRY_CHANNEL` IPC handler. Pre-Slice-V
+ * the handler accepted any array and cast it straight to
+ * `PersistedSavedEnvironmentRecord[]` before writing to disk — a
+ * malformed payload (missing fields, wrong types) corrupted the
+ * on-disk registry, which then bricked the renderer on next launch
+ * when `readJsonFile` returned shapes the rest of the app didn't
+ * expect.
+ *
+ * The wire shape is a strict subset of the storage shape (no
+ * `encryptedBearerToken`), so the field-level checks are the same
+ * minus that one optional field.
+ */
+export function isPersistedSavedEnvironmentRecord(
+  value: unknown,
+): value is PersistedSavedEnvironmentRecord {
+  return (
+    Predicate.isObject(value) &&
+    typeof value.environmentId === "string" &&
+    typeof value.label === "string" &&
+    typeof value.httpBaseUrl === "string" &&
+    typeof value.wsBaseUrl === "string" &&
+    typeof value.createdAt === "string" &&
+    (value.lastConnectedAt === null || typeof value.lastConnectedAt === "string")
+  );
+}
+
 function readSavedEnvironmentRegistryDocument(filePath: string): SavedEnvironmentRegistryDocument {
   const parsed = readJsonFile<SavedEnvironmentRegistryDocument>(filePath);
   if (!Predicate.isObject(parsed)) {
@@ -111,19 +139,27 @@ export function writeSavedEnvironmentRegistry(
     ),
   );
   writeJsonFile(registryPath, {
+    // Slice W / H11-L2 — explicit field-by-field construction in both
+    // branches. The pre-Slice-W shape returned the raw `record`
+    // verbatim when no encryptedBearerToken existed, which would
+    // smuggle any extra fields a hostile/malformed payload smuggled
+    // past `isPersistedSavedEnvironmentRecord` (the type guard only
+    // checks the required fields are present and well-typed — it
+    // doesn't reject extras). Explicit picking here gives us the
+    // same defense-in-depth that `toPersistedSavedEnvironmentRecord`
+    // provides on the read side: only fields we know about ever
+    // land on disk.
     records: records.map((record) => {
       const encryptedBearerToken = encryptedBearerTokenById.get(record.environmentId);
-      return encryptedBearerToken
-        ? {
-            environmentId: record.environmentId,
-            label: record.label,
-            httpBaseUrl: record.httpBaseUrl,
-            wsBaseUrl: record.wsBaseUrl,
-            createdAt: record.createdAt,
-            lastConnectedAt: record.lastConnectedAt,
-            encryptedBearerToken,
-          }
-        : record;
+      const base: PersistedSavedEnvironmentStorageRecord = {
+        environmentId: record.environmentId,
+        label: record.label,
+        httpBaseUrl: record.httpBaseUrl,
+        wsBaseUrl: record.wsBaseUrl,
+        createdAt: record.createdAt,
+        lastConnectedAt: record.lastConnectedAt,
+      };
+      return encryptedBearerToken ? { ...base, encryptedBearerToken } : base;
     }),
   } satisfies SavedEnvironmentRegistryDocument);
 }

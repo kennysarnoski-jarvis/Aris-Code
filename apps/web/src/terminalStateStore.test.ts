@@ -289,6 +289,7 @@ describe("terminalStateStore actions", () => {
     store.applyTerminalEvent(
       THREAD_REF,
       makeTerminalEvent("started", {
+        threadId: THREAD_ID,
         terminalId: "setup-bootstrap",
         snapshot: {
           threadId: THREAD_ID,
@@ -337,6 +338,7 @@ describe("terminalStateStore actions", () => {
     store.applyTerminalEvent(
       THREAD_REF,
       makeTerminalEvent("activity", {
+        threadId: THREAD_ID,
         terminalId: "terminal-2",
         hasRunningSubprocess: true,
       }),
@@ -351,6 +353,7 @@ describe("terminalStateStore actions", () => {
     store.applyTerminalEvent(
       THREAD_REF,
       makeTerminalEvent("exited", {
+        threadId: THREAD_ID,
         terminalId: "terminal-2",
         exitCode: 0,
         exitSignal: null,

@@ -25,6 +25,5 @@ export class FilesystemBrowseError extends Schema.TaggedErrorClass<FilesystemBro
   "FilesystemBrowseError",
   {
     message: TrimmedNonEmptyString,
-    cause: Schema.optional(Schema.Defect),
   },
 ) {}

@@ -50,7 +50,6 @@ export const orchestrationSnapshotRouteLayer = HttpRouter.add(
         (cause) =>
           new OrchestrationGetSnapshotError({
             message: "Failed to load orchestration snapshot.",
-            cause,
           }),
       ),
     );
@@ -74,17 +73,15 @@ export const orchestrationDispatchRouteLayer = HttpRouter.add(
         (cause) =>
           new OrchestrationDispatchCommandError({
             message: "Invalid orchestration command payload.",
-            cause,
           }),
       ),
     );
     const normalizedCommand = yield* normalizeDispatchCommand(command);
     const result = yield* orchestrationEngine.dispatch(normalizedCommand).pipe(
       Effect.mapError(
-        (cause) =>
+        (_cause) =>
           new OrchestrationDispatchCommandError({
             message: "Failed to dispatch orchestration command.",
-            cause,
           }),
       ),
     );
