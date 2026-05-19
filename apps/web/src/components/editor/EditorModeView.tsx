@@ -85,6 +85,14 @@ import { resolveThreadRouteRef } from "../../threadRoutes";
  * `onCursorChange`; language is read live off the model so save-as
  * language re-detection reflects immediately.
  *
+ * Agent-edit reflection (Slice 4P-ii): with the editor as an inline
+ * pane (4P-i) it stays mounted while Aris edits — so we subscribe to
+ * `git.onStatus` for the cwd and on each event re-read every open
+ * file-backed tab. Clean tabs get silently reflected (`applyEdits`
+ * full-range, savedVersionId bumped). Dirty tabs surface a conflict
+ * banner above the editor with Reload-from-disk / Keep-mine — we
+ * never stomp unsaved work without explicit user choice.
+ *
  * Two independent async state machines: `treeState` (the listTree fetch
  * + built tree) and the per-tab `tabStates` cache (a `readFile` fetch
  * per distinct file the user has opened). They're separate because the
@@ -256,6 +264,13 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   // Cursor position fed to the status bar by `MonacoEditor`. `null`
   // when no tab is active.
   const [cursorPos, setCursorPos] = useState<{ line: number; column: number } | null>(null);
+  // Tabs whose on-disk file changed (e.g. Aris edited it) while the
+  // tab held unsaved local edits — surfaces a conflict banner instead
+  // of stomping the user's edits. Clean tabs get silently reflected;
+  // they don't end up in this set.
+  const [conflictTabIds, setConflictTabIds] = useState<ReadonlySet<string>>(new Set());
+  const conflictTabIdsRef = useRef(conflictTabIds);
+  conflictTabIdsRef.current = conflictTabIds;
   const openTabsRef = useRef(openTabs);
   openTabsRef.current = openTabs;
   const activeTabIdRef = useRef(activeTabId);
@@ -285,6 +300,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     setSaveError(null);
     setNewFile(null);
     setNewFileError(null);
+    setConflictTabIds(new Set());
     untitledCounterRef.current = 0;
     if (!environmentId || !activeCwd) {
       setTreeState({ status: "idle" });
@@ -502,6 +518,14 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
       return next;
     });
     setSaveError((prev) => (prev?.tabId === tabId ? null : prev));
+    setConflictTabIds((prev) => {
+      if (!prev.has(tabId)) {
+        return prev;
+      }
+      const next = new Set(prev);
+      next.delete(tabId);
+      return next;
+    });
     setActiveTabId((prevActive) => {
       if (prevActive !== tabId) {
         return prevActive;
@@ -528,6 +552,177 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
       }
     };
   }, []);
+
+  // Agent-edit reflection. With the editor as an inline pane (Slice
+  // 4P-i) it stays mounted while Aris edits files — so disk content
+  // can diverge from what's on screen. `git.onStatus` fires after every
+  // provider turn (the `ProviderCommandReactor` calls `refreshStatus`),
+  // which is our provider-agnostic "files may have changed" signal. On
+  // each event we re-read every open file-backed tab; clean tabs get
+  // silently reflected with the disk content, dirty tabs surface a
+  // conflict banner instead of stomping unsaved edits. Untitled tabs
+  // and non-git projects fall through (no on-disk file / no signal).
+  useEffect(() => {
+    if (!environmentId || !activeCwd) {
+      return;
+    }
+    const api = readEnvironmentApi(environmentId);
+    if (!api) {
+      return;
+    }
+    const unsubscribe = api.git.onStatus({ cwd: activeCwd }, (status) => {
+      if (!status.isRepo) {
+        return;
+      }
+      for (const [tabId, state] of tabStatesRef.current) {
+        if (state.status !== "ready") {
+          continue;
+        }
+        const filePath = state.path;
+        if (filePath === null) {
+          continue;
+        }
+        void (async () => {
+          try {
+            const result = await api.projects.readFile({
+              cwd: activeCwd,
+              relativePath: filePath,
+            });
+            // Re-read the tab state — the user may have closed the tab
+            // (model disposed) or started typing (now dirty) during the
+            // async readFile.
+            const latest = tabStatesRef.current.get(tabId);
+            if (latest?.status !== "ready") {
+              return;
+            }
+            const newContent = result.contents;
+            if (newContent === latest.model.getValue()) {
+              return; // no actual change
+            }
+            if (dirtyTabIdsRef.current.has(tabId)) {
+              // Conflict: don't stomp the user's unsaved edits. The
+              // banner lets them choose Reload from disk or Keep mine.
+              setConflictTabIds((prev) =>
+                prev.has(tabId) ? prev : new Set(prev).add(tabId),
+              );
+              return;
+            }
+            // Clean tab → silently reflect. `applyEdits` over the full
+            // range preserves Monaco view state (cursor / scroll) more
+            // gracefully than `setValue`. Update `savedVersionId` so
+            // the tab stays clean against the new content.
+            const fullRange = latest.model.getFullModelRange();
+            latest.model.applyEdits([{ range: fullRange, text: newContent }]);
+            const newSavedVersionId = latest.model.getAlternativeVersionId();
+            setTabStates((prev) => {
+              const entry = prev.get(tabId);
+              if (entry?.status !== "ready") {
+                return prev;
+              }
+              return new Map(prev).set(tabId, {
+                ...entry,
+                savedVersionId: newSavedVersionId,
+              });
+            });
+            // The dirty listener fires during applyEdits using the OLD
+            // savedVersionId and queues an add — this remove is the
+            // last write in the same commit, so the end state is clean.
+            setDirtyTabIds((prev) => {
+              if (!prev.has(tabId)) {
+                return prev;
+              }
+              const next = new Set(prev);
+              next.delete(tabId);
+              return next;
+            });
+          } catch {
+            // File may have been deleted or become unreadable — leave
+            // the tab as-is. Closing/reopening is the user's escape.
+          }
+        })();
+      }
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, [environmentId, activeCwd]);
+
+  // Resolve a per-tab conflict: "reload" stomps the user's edits with
+  // disk content; "keep" just clears the marker, leaving the tab dirty
+  // so the next Cmd-S overwrites disk with the user's version.
+  const resolveConflict = useCallback(
+    (tabId: string, choice: "reload" | "keep") => {
+      const state = tabStatesRef.current.get(tabId);
+      if (state?.status !== "ready") {
+        return;
+      }
+      if (choice === "keep") {
+        setConflictTabIds((prev) => {
+          if (!prev.has(tabId)) {
+            return prev;
+          }
+          const next = new Set(prev);
+          next.delete(tabId);
+          return next;
+        });
+        return;
+      }
+      // reload — re-fetch disk and replace the model content.
+      const filePath = state.path;
+      if (filePath === null || !environmentId || !activeCwd) {
+        return;
+      }
+      const api = readEnvironmentApi(environmentId);
+      if (!api) {
+        return;
+      }
+      void (async () => {
+        try {
+          const result = await api.projects.readFile({
+            cwd: activeCwd,
+            relativePath: filePath,
+          });
+          const latest = tabStatesRef.current.get(tabId);
+          if (latest?.status !== "ready") {
+            return;
+          }
+          const fullRange = latest.model.getFullModelRange();
+          latest.model.applyEdits([{ range: fullRange, text: result.contents }]);
+          const newSavedVersionId = latest.model.getAlternativeVersionId();
+          setTabStates((prev) => {
+            const entry = prev.get(tabId);
+            if (entry?.status !== "ready") {
+              return prev;
+            }
+            return new Map(prev).set(tabId, {
+              ...entry,
+              savedVersionId: newSavedVersionId,
+            });
+          });
+          setDirtyTabIds((prev) => {
+            if (!prev.has(tabId)) {
+              return prev;
+            }
+            const next = new Set(prev);
+            next.delete(tabId);
+            return next;
+          });
+          setConflictTabIds((prev) => {
+            if (!prev.has(tabId)) {
+              return prev;
+            }
+            const next = new Set(prev);
+            next.delete(tabId);
+            return next;
+          });
+        } catch {
+          // Read failed — leave conflict banner up so the user can try
+          // again or pick "Keep mine".
+        }
+      })();
+    },
+    [environmentId, activeCwd],
+  );
 
   // Window-level keyboard shortcuts for editor mode (capture phase so
   // they fire regardless of focus and win over OS defaults). Bound for
@@ -641,6 +836,16 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
           return next;
         });
         setSaveError((prev) => (prev?.tabId === tabId ? null : prev));
+        // Saving = "we just wrote our version to disk". Any existing
+        // conflict marker is resolved by definition.
+        setConflictTabIds((prev) => {
+          if (!prev.has(tabId)) {
+            return prev;
+          }
+          const next = new Set(prev);
+          next.delete(tabId);
+          return next;
+        });
       } catch (err) {
         const message = err instanceof Error ? err.message : "Failed to save file.";
         setSaveError({ tabId, message });
@@ -880,6 +1085,8 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   // bar. Read live off the model so save-as language re-detection
   // (untitled → real file) reflects immediately.
   const activeLanguage = activeModel ? activeModel.getLanguageId() : null;
+  // Active tab has a disk-vs-buffer conflict — show the banner.
+  const activeHasConflict = activeTabId !== null && conflictTabIds.has(activeTabId);
 
   // Header label: file path if we have one (with a "(truncated)" hint
   // when the read was capped), otherwise the tab's display label
@@ -1067,6 +1274,29 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
             onCloseTab={onCloseTab}
             onNewUntitled={openUntitled}
           />
+          {activeHasConflict && activeTabId !== null ? (
+            <div className="flex h-8 shrink-0 items-center justify-between gap-3 border-b border-amber-500/40 bg-amber-500/10 px-3 text-xs">
+              <span className="min-w-0 truncate text-amber-700 dark:text-amber-300">
+                This file changed on disk while you had unsaved edits.
+              </span>
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => resolveConflict(activeTabId, "reload")}
+                  className="rounded-sm px-2 py-0.5 font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-200"
+                >
+                  Reload from disk
+                </button>
+                <button
+                  type="button"
+                  onClick={() => resolveConflict(activeTabId, "keep")}
+                  className="rounded-sm px-2 py-0.5 font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  Keep mine
+                </button>
+              </div>
+            </div>
+          ) : null}
           {/* The editor instance is mounted for the lifetime of editor
               mode — models swap in/out as tabs change. The loading /
               error / empty states render as an opaque overlay rather
