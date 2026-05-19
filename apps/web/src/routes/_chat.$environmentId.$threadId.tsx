@@ -32,6 +32,9 @@ const DIFF_INLINE_SIDEBAR_WIDTH_STORAGE_KEY = "chat_diff_sidebar_width";
 const DIFF_INLINE_DEFAULT_WIDTH = "clamp(28rem,48vw,44rem)";
 const DIFF_INLINE_SIDEBAR_MIN_WIDTH = 26 * 16;
 const COMPOSER_COMPACT_MIN_LEFT_CONTROLS_WIDTH_PX = 208;
+const EDITOR_INLINE_SIDEBAR_WIDTH_STORAGE_KEY = "aris_editor_inline_sidebar_width";
+const EDITOR_INLINE_DEFAULT_WIDTH = "clamp(32rem,52vw,56rem)";
+const EDITOR_INLINE_SIDEBAR_MIN_WIDTH = 30 * 16;
 
 const DiffPanelSheet = (props: {
   children: ReactNode;
@@ -165,6 +168,63 @@ const DiffPanelInlineSidebar = (props: {
   );
 };
 
+/**
+ * EditorInlineSidebar — the V2 editor as a right-side pane alongside
+ * chat, instead of a full-window swap. Modeled on
+ * `DiffPanelInlineSidebar`: shadcn `Sidebar` with built-in resize +
+ * localStorage persistence + offcanvas collapse. Closing the sidebar
+ * (via the rail or the editor's own "Back to Chat" button) clears
+ * `?view=editor` from the URL.
+ *
+ * EditorModeView is React.lazy'd so Monaco's chunk stays out of the
+ * cold-start bundle and only loads when the user first opens the
+ * editor pane.
+ */
+const EditorInlineSidebar = (props: {
+  editorOpen: boolean;
+  onCloseEditor: () => void;
+}) => {
+  const { editorOpen, onCloseEditor } = props;
+  const onOpenChange = useCallback(
+    (open: boolean) => {
+      if (!open) {
+        onCloseEditor();
+      }
+    },
+    [onCloseEditor],
+  );
+  return (
+    <SidebarProvider
+      defaultOpen={false}
+      open={editorOpen}
+      onOpenChange={onOpenChange}
+      className="w-auto min-h-0 flex-none bg-transparent"
+      style={{ "--sidebar-width": EDITOR_INLINE_DEFAULT_WIDTH } as React.CSSProperties}
+    >
+      <Sidebar
+        side="right"
+        collapsible="offcanvas"
+        className="border-l border-border bg-card text-foreground"
+        resizable={{
+          minWidth: EDITOR_INLINE_SIDEBAR_MIN_WIDTH,
+          storageKey: EDITOR_INLINE_SIDEBAR_WIDTH_STORAGE_KEY,
+        }}
+      >
+        <Suspense
+          fallback={
+            <div className="flex h-full items-center justify-center bg-background text-sm text-muted-foreground">
+              Loading editor...
+            </div>
+          }
+        >
+          {editorOpen ? <EditorModeView onExitToChat={onCloseEditor} /> : null}
+        </Suspense>
+        <SidebarRail />
+      </Sidebar>
+    </SidebarProvider>
+  );
+};
+
 function ChatThreadRouteView() {
   const navigate = useNavigate();
   const threadRef = Route.useParams({
@@ -276,26 +336,11 @@ function ChatThreadRouteView() {
     return null;
   }
 
-  // V2 editor mode is its own early-return branch — it occupies the same
-  // SidebarInset slot ChatView would, but deliberately doesn't entangle
-  // with the diff sheet/sidebar logic below. Suspense covers the
-  // React.lazy boundary while Monaco's chunk loads on first entry.
-  if (editorMode) {
-    return (
-      <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
-        <Suspense
-          fallback={
-            <div className="flex h-full items-center justify-center bg-background text-sm text-muted-foreground">
-              Loading editor...
-            </div>
-          }
-        >
-          <EditorModeView onExitToChat={exitToChat} />
-        </Suspense>
-      </SidebarInset>
-    );
-  }
-
+  // V2 editor is now an inline right-side pane (`EditorInlineSidebar`)
+  // rendered alongside ChatView and the diff sidebar — no longer a
+  // full-window swap. `?view=editor` opens the pane; the sidebar's own
+  // collapse + the editor's "Back to Chat" both call `exitToChat`,
+  // which clears the URL param.
   const shouldRenderDiffContent = diffOpen || hasOpenedDiff;
 
   if (!shouldUseDiffSheet) {
@@ -310,6 +355,7 @@ function ChatThreadRouteView() {
             routeKind="server"
           />
         </SidebarInset>
+        <EditorInlineSidebar editorOpen={editorMode} onCloseEditor={exitToChat} />
         <DiffPanelInlineSidebar
           diffOpen={diffOpen}
           onCloseDiff={closeDiff}
@@ -330,6 +376,7 @@ function ChatThreadRouteView() {
           routeKind="server"
         />
       </SidebarInset>
+      <EditorInlineSidebar editorOpen={editorMode} onCloseEditor={exitToChat} />
       <DiffPanelSheet diffOpen={diffOpen} onCloseDiff={closeDiff}>
         {shouldRenderDiffContent ? <LazyDiffPanel mode="sheet" /> : null}
       </DiffPanelSheet>
