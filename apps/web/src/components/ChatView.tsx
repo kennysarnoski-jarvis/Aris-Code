@@ -2629,6 +2629,19 @@ export default function ChatView(props: ChatViewProps) {
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     const api = readEnvironmentApi(environmentId);
+    // Answering an in-flight AskUserQuestion is not a new send — it's a
+    // response to a tool call the agent is already awaiting. Handle it
+    // BEFORE the `isWorking` guard below; otherwise the guard short-circuits
+    // (phase stays "running" while the question is on screen) and the Send
+    // button silently no-ops. The pending-input branch has its own
+    // responding-state gating downstream.
+    if (activePendingProgress) {
+      if (!api || !activeThread) {
+        return;
+      }
+      onAdvanceActivePendingUserInput();
+      return;
+    }
     // Slice 9.14: use `isWorking` instead of just isSendBusy/isConnecting.
     // `isWorking` includes phase==="running" — the actual "agentic turn is
     // mid-flight" state. Without this, user messages sent while Aris is
@@ -2638,10 +2651,6 @@ export default function ChatView(props: ChatViewProps) {
     // ignored even though Aris is actively working. Blocking sends here
     // forces "interrupt then resend" workflow which is the correct UX.
     if (!api || !activeThread || isWorking || sendInFlightRef.current) {
-      return;
-    }
-    if (activePendingProgress) {
-      onAdvanceActivePendingUserInput();
       return;
     }
     const sendCtx = composerRef.current?.getSendContext();

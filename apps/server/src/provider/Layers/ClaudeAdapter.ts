@@ -2564,12 +2564,25 @@ const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         }
 
         // Return the answers to the SDK in the expected format:
-        // { questions: [...], answers: { questionText: selectedLabel } }
+        // { questions: [...], answers: { questionText: selectedLabel } }.
+        // Internally the web client keys answers by `question.id` (which we
+        // derive from `q.header`), but the SDK expects keys to be the actual
+        // question text. Remap here so both shapes resolve correctly — if
+        // the caller already supplied question-text keys (see adapter tests),
+        // they pass through unchanged.
+        const answersRecord = answers as Record<string, unknown>;
+        const sdkAnswers: Record<string, unknown> = {};
+        for (const question of questions) {
+          const value = answersRecord[question.id] ?? answersRecord[question.question];
+          if (value !== undefined) {
+            sdkAnswers[question.question] = value;
+          }
+        }
         return {
           behavior: "allow",
           updatedInput: {
             questions: toolInput.questions,
-            answers,
+            answers: sdkAnswers,
           },
         } satisfies PermissionResult;
       });
