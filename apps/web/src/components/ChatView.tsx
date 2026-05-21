@@ -107,7 +107,8 @@ import { ProjectTodosPanel } from "./ProjectTodosPanel";
 import { MemoryPanel } from "./MemoryPanel";
 import { useArisProjectId } from "../useArisProjectId";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
-import { ChevronDownIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon } from "lucide-react";
+import { useResizablePaneWidth } from "./editor/useResizablePaneWidth";
 import { cn, randomUUID } from "~/lib/utils";
 import { toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
@@ -673,6 +674,30 @@ export default function ChatView(props: ChatViewProps) {
     select: (params) => parseDiffRouteSearch(params),
   });
   const { resolvedTheme } = useTheme();
+
+  // Right sidebar resize + collapse (Slice 4P-iii). Drag the handle on
+  // its left edge to resize; click the chevron to collapse to a thin
+  // re-expand strip. Both width and collapsed state persist across
+  // reloads.
+  const { width: rightSidebarWidth, onResizeHandleMouseDown: onRightSidebarResize } =
+    useResizablePaneWidth({
+      storageKey: "aris-chat-right-sidebar-width",
+      defaultWidth: 288,
+      minWidth: 220,
+      maxWidth: 600,
+    });
+  const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState<boolean>(
+    () =>
+      typeof window !== "undefined" &&
+      window.localStorage.getItem("aris-chat-right-sidebar-collapsed") === "true",
+  );
+  useEffect(() => {
+    window.localStorage.setItem(
+      "aris-chat-right-sidebar-collapsed",
+      rightSidebarCollapsed ? "true" : "false",
+    );
+  }, [rightSidebarCollapsed]);
+
   // Granular store selectors — avoid subscribing to prompt changes.
   const composerRuntimeMode = useComposerDraftStore(
     (store) => store.getComposerDraft(composerDraftTarget)?.runtimeMode ?? null,
@@ -3827,26 +3852,69 @@ export default function ChatView(props: ChatViewProps) {
          * todos are still DS-specific and conditionally rendered inside.
          */}
         {activeThread ? (
-          <div className="w-72 flex-shrink-0 border-l border-zinc-200 dark:border-zinc-800 overflow-y-auto flex flex-col gap-4 py-3">
-            {activeThread.session?.provider === "deepseek" && (
-              <>
-                <CoordinatorActivityPanel
+          rightSidebarCollapsed ? (
+            // Collapsed — thin re-expand strip with a chevron, so the
+            // user can always get the sidebar back without hunting a
+            // menu. Slice 4P-iii.
+            <button
+              type="button"
+              onClick={() => setRightSidebarCollapsed(false)}
+              className="flex w-6 flex-shrink-0 items-center justify-center border-l border-zinc-200 hover:bg-accent dark:border-zinc-800"
+              title="Show right sidebar"
+              aria-label="Show right sidebar"
+            >
+              <ChevronLeftIcon className="size-4 text-muted-foreground" aria-hidden />
+            </button>
+          ) : (
+            <>
+              {/* Drag handle — left edge of the sidebar, mirrors the
+                  editor's file-tree resize. */}
+              <div
+                onMouseDown={onRightSidebarResize}
+                className="w-1 flex-shrink-0 cursor-col-resize bg-zinc-200 transition-colors hover:bg-foreground/25 dark:bg-zinc-800"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize right sidebar"
+              />
+              <div
+                className="flex flex-shrink-0 flex-col gap-2 overflow-y-auto border-l border-zinc-200 py-3 dark:border-zinc-800"
+                style={{ width: `${rightSidebarWidth}px` }}
+              >
+                {/* Collapse button — top-right of the sidebar so it's
+                    always reachable regardless of which panels are
+                    visible below. */}
+                <div className="flex justify-end px-3">
+                  <button
+                    type="button"
+                    onClick={() => setRightSidebarCollapsed(true)}
+                    className="flex size-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
+                    title="Hide right sidebar"
+                    aria-label="Hide right sidebar"
+                  >
+                    <ChevronRightIcon className="size-4" aria-hidden />
+                  </button>
+                </div>
+                {activeThread.session?.provider === "deepseek" && (
+                  <>
+                    <CoordinatorActivityPanel
+                      threadId={activeThreadId}
+                      environmentId={activeThread.environmentId ?? null}
+                      provider={activeThread.session?.provider ?? null}
+                    />
+                    <ProjectTodosPanel
+                      threadId={activeThreadId}
+                      environmentId={activeThread.environmentId ?? null}
+                      provider={activeThread.session?.provider ?? null}
+                    />
+                  </>
+                )}
+                <MemoryPanel
                   threadId={activeThreadId}
                   environmentId={activeThread.environmentId ?? null}
-                  provider={activeThread.session?.provider ?? null}
                 />
-                <ProjectTodosPanel
-                  threadId={activeThreadId}
-                  environmentId={activeThread.environmentId ?? null}
-                  provider={activeThread.session?.provider ?? null}
-                />
-              </>
-            )}
-            <MemoryPanel
-              threadId={activeThreadId}
-              environmentId={activeThread.environmentId ?? null}
-            />
-          </div>
+              </div>
+            </>
+          )
         ) : null}
       </div>
       {/* end horizontal flex container */}

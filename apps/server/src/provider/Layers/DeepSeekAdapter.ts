@@ -110,8 +110,15 @@ import {
   setRequestReasoningEffort,
 } from "./DeepSeekOpenAIClient.ts";
 import { loadAllAgentTemplates } from "./ArisAgentTemplatesLoader.ts";
+import { loadAllCommands } from "./ArisCommandsLoader.ts";
 import { loadAllSkills } from "./ArisSkillsLoader.ts";
+import { createUseCommandTool } from "./ArisCommandsTool.ts";
 import { createUseSkillTool, type ForkExecutor, rewriteSlashCommand } from "./ArisSkillsTool.ts";
+import {
+  makeContinuousLearningPostToolUseHook,
+  makeContinuousLearningStopHook,
+} from "./ContinuousLearningHook.ts";
+import { wrapToolsWithHooks } from "./HookedTools.ts";
 import {
   appendToActiveWindow,
   makeRollingWindowConfig,
@@ -122,6 +129,7 @@ import {
 } from "./RollingWindowMemory.ts";
 import { makeHookBus } from "./HookBus.ts";
 import { makeSessionEndArchiveHook } from "./SessionEndArchiveHook.ts";
+import { makeSessionStartAgentsMdHook } from "./SessionStartAgentsMdHook.ts";
 import { makeSessionStartCrossThreadHook } from "./SessionStartCrossThreadHook.ts";
 import { makeStopActiveSummaryHook } from "./StopActiveSummaryHook.ts";
 import type OpenAI from "openai";
@@ -256,9 +264,18 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
   };
 
   const hookBus = makeHookBus();
+  hookBus.register(makeSessionStartAgentsMdHook());
   hookBus.register(makeSessionStartCrossThreadHook(rollingWindowConfig));
   hookBus.register(makeStopActiveSummaryHook({ rollingWindowConfig, lookupOpenAIClient }));
   hookBus.register(makeSessionEndArchiveHook({ rollingWindowConfig, lookupOpenAIClient }));
+  // Phase 3 — continuous-learning observation. Captures every model
+  // tool call to project-scoped JSONL (`~/.aris/projects/<key>/observations.jsonl`)
+  // and writes a turn-boundary marker on Stop. Set the stage for Phase 4's
+  // KG-ingest analyzer that embeds extracted patterns into `arisllm` for
+  // GAT-reranked retrieval. PostToolUse + Stop are fire-and-forget;
+  // observation failures never block the model.
+  hookBus.register(makeContinuousLearningPostToolUseHook());
+  hookBus.register(makeContinuousLearningStopHook());
 
   const sessions = new Map<ThreadId, DeepSeekSessionContext>();
 
@@ -496,6 +513,21 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
         });
       }
 
+      // Commands — load from `.aris/commands/<name>.md`. User-only
+      // surface (no `use_skill`-equivalent tool exposure to the
+      // model). Slash dispatch picks them up as a fallback after
+      // skills: a `/foo` token tries skills first, then commands.
+      // Same best-effort contract as the skills loader — per-file
+      // failures are surfaced as warnings, never throw.
+      const commandsResult = yield* Effect.promise(() =>
+        loadAllCommands({ workspaceRoot: ctx.session.cwd }),
+      );
+      if (commandsResult.errors.length > 0) {
+        yield* Effect.logWarning("Some DeepSeek commands failed to load", {
+          errors: commandsResult.errors.map((e) => `${e.path}: ${e.message}`),
+        });
+      }
+
       // Fork executor — when a skill declares `context: fork`, the
       // use_skill tool delegates here instead of returning the
       // rendered body to the parent. Spins up a fresh DeepSeek
@@ -573,7 +605,32 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
           cwd: ctx.session.cwd ?? process.cwd(),
         },
       });
-      const tools = useSkillTool ? [...baseTools, useSkillTool] : baseTools;
+      // Commands surface — exposed to the model the same way skills
+      // are. Lets Aris autonomously invoke `/build-fix`, `/refactor-clean`,
+      // etc. when the user's intent matches a command's purpose. Same
+      // dispatch path as `use_skill`: lookup → substitution → optional
+      // shell expansion → return rendered body to the model.
+      const useCommandTool = createUseCommandTool({
+        commands: commandsResult.commands,
+        shellExpansion: {
+          enabled: shellExpansionEnabled,
+          cwd: ctx.session.cwd ?? process.cwd(),
+        },
+      });
+      // Phase 3 — wrap every tool so PreToolUse / PostToolUse fire on
+      // invocation. Subscribers (continuous-learning observer, future
+      // guard rails, cost trackers) get a uniform view of every tool
+      // call without each tool having to opt in. Proxy-based wrap
+      // preserves the SDK's tool surface; only `.invoke` is replaced.
+      const rawTools = [
+        ...baseTools,
+        ...(useSkillTool ? [useSkillTool] : []),
+        ...(useCommandTool ? [useCommandTool] : []),
+      ];
+      const tools = wrapToolsWithHooks(rawTools, hookBus, {
+        threadId: ctx.session.threadId,
+        cwd: ctx.session.cwd,
+      });
 
       const agent = new Agent({
         name: "DeepSeek",
@@ -588,16 +645,19 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
       });
 
       // Slash-command dispatch. If the user's message starts with
-      // `/skillname`, rewrite it into the rendered skill body before
-      // we hand it to the SDK. Slash dispatch is always inline;
-      // `context: fork` is honored only when the model invokes
-      // use_skill itself. Returns null when there's no slash prefix
-      // or when the named skill isn't loaded, in which case the
-      // original text passes through unchanged.
+      // `/name`, rewrite it into the rendered body before we hand it
+      // to the SDK. Skills take precedence over commands — a name
+      // collision resolves to the skill (richer surface: model+effort
+      // overrides, fork mode, allowed-tools). Slash dispatch is
+      // always inline; `context: fork` is honored only when the model
+      // invokes use_skill itself. Returns null when there's no slash
+      // prefix or when the name doesn't match any skill OR command,
+      // in which case the original text passes through unchanged.
       const slashRewrite = yield* Effect.promise(() =>
         rewriteSlashCommand({
           text: userText,
           skills: skillsResult.skills,
+          commands: commandsResult.commands,
           shellExpansion: {
             enabled: shellExpansionEnabled,
             cwd: ctx.session.cwd ?? process.cwd(),

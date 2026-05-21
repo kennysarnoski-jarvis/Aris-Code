@@ -28,3 +28,10 @@ squashfs-root/
 apps/*/dist-electron/
 apps/*/.electron-runtime/
 .fuse_hidden*
+
+# Aris cloud-side / local-only — never commit
+local.py
+search.py
+*.bak
+scripts/kg/
+scripts/import-ecc.ts

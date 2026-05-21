@@ -78,6 +78,8 @@ import {
   makeConversationIdHolder,
   resolveProjectIdEffect,
 } from "./ArisOpenAIClient.ts";
+import { loadAllCommands } from "./ArisCommandsLoader.ts";
+import { createUseCommandTool } from "./ArisCommandsTool.ts";
 import { loadAllSkills } from "./ArisSkillsLoader.ts";
 import {
   createUseSkillTool,
@@ -401,6 +403,19 @@ const makeArisAdapter = Effect.fn("makeArisAdapter")(function* () {
           errors: skillsResult.errors.map((e) => `${e.path}: ${e.message}`),
         });
       }
+
+      // Commands — user-only slash-command entry points loaded from
+      // `.aris/commands/<name>.md`. Same best-effort contract as the
+      // skills loader. Surfaced to `rewriteSlashCommand` as a fallback
+      // when no skill matches a `/foo` prefix.
+      const commandsResult = yield* Effect.promise(() =>
+        loadAllCommands({ workspaceRoot: ctx.session.cwd }),
+      );
+      if (commandsResult.errors.length > 0) {
+        yield* Effect.logWarning("Some commands failed to load", {
+          errors: commandsResult.errors.map((e) => `${e.path}: ${e.message}`),
+        });
+      }
       const modelName = modelOverride ?? DEFAULT_MODEL;
 
       // Slice 32e — fork-mode executor. When a skill declares
@@ -512,7 +527,22 @@ const makeArisAdapter = Effect.fn("makeArisAdapter")(function* () {
           cwd: ctx.session.cwd ?? process.cwd(),
         },
       });
-      const tools = useSkillTool ? [...arisTools, useSkillTool] : arisTools;
+      // Commands surface — also exposed to the model so Aris can
+      // autonomously invoke a command when the user's intent matches.
+      // Same dispatch path as use_skill, simpler frontmatter (no fork
+      // mode, no allowed-tools, no model/effort overrides).
+      const useCommandTool = createUseCommandTool({
+        commands: commandsResult.commands,
+        shellExpansion: {
+          enabled: shellExpansionEnabled,
+          cwd: ctx.session.cwd ?? process.cwd(),
+        },
+      });
+      const tools = [
+        ...arisTools,
+        ...(useSkillTool ? [useSkillTool] : []),
+        ...(useCommandTool ? [useCommandTool] : []),
+      ];
       const agent = new Agent({
         name: "Aris",
         // System prompt is constructed server-side by `aris_server`
@@ -544,6 +574,7 @@ const makeArisAdapter = Effect.fn("makeArisAdapter")(function* () {
         rewriteSlashCommand({
           text: userText,
           skills: skillsResult.skills,
+          commands: commandsResult.commands,
           shellExpansion: {
             enabled: shellExpansionEnabled,
             cwd: ctx.session.cwd ?? process.cwd(),

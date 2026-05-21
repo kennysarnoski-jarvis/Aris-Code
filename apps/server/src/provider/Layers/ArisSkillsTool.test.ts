@@ -458,6 +458,87 @@ describe("rewriteSlashCommand", () => {
     if (!result) return;
     expect(result.args).toBe("line one\nline two\nline three");
   });
+
+  it("marks the matched target as kind: 'skill'", async () => {
+    const result = await rewriteSlashCommand({ text: "/debug stuck", skills });
+    expect(result).not.toBeNull();
+    if (!result) return;
+    expect(result.kind).toBe("skill");
+  });
+
+  // ---- command-fallback behavior (commands surface) ----
+
+  const commands = [
+    { name: "tdd", body: "Run TDD: $ARGUMENTS" },
+    { name: "checkpoint", body: "Save checkpoint with note: $ARGUMENTS" },
+    {
+      // Intentionally collides with the `debug` skill above to test
+      // skills-precedence-over-commands.
+      name: "debug",
+      body: "(command body that should be SHADOWED by the skill body)",
+    },
+  ];
+
+  it("falls back to commands when no skill matches", async () => {
+    const result = await rewriteSlashCommand({
+      text: "/tdd new login flow",
+      skills,
+      commands,
+    });
+    expect(result).not.toBeNull();
+    if (!result) return;
+    expect(result.kind).toBe("command");
+    expect(result.skillName).toBe("tdd");
+    expect(result.args).toBe("new login flow");
+    expect(result.text).toContain("The user invoked the `/tdd` command");
+    expect(result.text).toContain("Run TDD: new login flow");
+  });
+
+  it("skill takes precedence when a skill and command share a name", async () => {
+    const result = await rewriteSlashCommand({
+      text: "/debug websocket bug",
+      skills,
+      commands,
+    });
+    expect(result).not.toBeNull();
+    if (!result) return;
+    expect(result.kind).toBe("skill");
+    expect(result.text).toContain("Walk through the issue: websocket bug");
+    expect(result.text).not.toContain("SHADOWED");
+  });
+
+  it("returns null when neither skill nor command matches", async () => {
+    const result = await rewriteSlashCommand({
+      text: "/no-such-thing arg",
+      skills,
+      commands,
+    });
+    expect(result).toBeNull();
+  });
+
+  it("command body $ARGUMENTS substitution works the same as skills", async () => {
+    const result = await rewriteSlashCommand({
+      text: "/checkpoint preparing v2 release",
+      skills,
+      commands,
+    });
+    expect(result).not.toBeNull();
+    if (!result) return;
+    expect(result.text).toContain("Save checkpoint with note: preparing v2 release");
+  });
+
+  it("commands surface frames the directive as 'command' (not 'skill')", async () => {
+    const result = await rewriteSlashCommand({ text: "/tdd auth flow", skills, commands });
+    expect(result).not.toBeNull();
+    if (!result) return;
+    expect(result.text).toContain("`/tdd` command");
+    expect(result.text).not.toContain("`/tdd` skill");
+  });
+
+  it("undefined commands argument is equivalent to no fallback (skill-only behavior)", async () => {
+    const result = await rewriteSlashCommand({ text: "/tdd anything", skills });
+    expect(result).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

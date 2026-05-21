@@ -271,6 +271,11 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   const [conflictTabIds, setConflictTabIds] = useState<ReadonlySet<string>>(new Set());
   const conflictTabIdsRef = useRef(conflictTabIds);
   conflictTabIdsRef.current = conflictTabIds;
+  // Editor pane container — keyboard shortcuts (Cmd-S/W/P) attach to
+  // this element so they only fire when focus is inside the editor
+  // pane. Crucial now that the editor is a sibling of chat (Slice 4P-i)
+  // — a window-level listener would also catch Cmd-S in the composer.
+  const viewContainerRef = useRef<HTMLDivElement | null>(null);
   const openTabsRef = useRef(openTabs);
   openTabsRef.current = openTabs;
   const activeTabIdRef = useRef(activeTabId);
@@ -602,9 +607,7 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
             if (dirtyTabIdsRef.current.has(tabId)) {
               // Conflict: don't stomp the user's unsaved edits. The
               // banner lets them choose Reload from disk or Keep mine.
-              setConflictTabIds((prev) =>
-                prev.has(tabId) ? prev : new Set(prev).add(tabId),
-              );
+              setConflictTabIds((prev) => (prev.has(tabId) ? prev : new Set(prev).add(tabId)));
               return;
             }
             // Clean tab → silently reflect. `applyEdits` over the full
@@ -724,15 +727,21 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
     [environmentId, activeCwd],
   );
 
-  // Window-level keyboard shortcuts for editor mode (capture phase so
-  // they fire regardless of focus and win over OS defaults). Bound for
-  // the lifetime of editor mode — this view only exists in editor mode.
+  // Editor-pane keyboard shortcuts (capture phase so they win over OS
+  // defaults). Bound on the editor pane's container so they only fire
+  // when keydown originates inside the pane — Cmd-S in the chat
+  // composer next door does NOT trigger an editor save (Slice 4P-iv).
   //   Cmd/Ctrl-P — open the fuzzy file palette (beats the print shortcut)
   //   Cmd/Ctrl-W — close the active tab (beats closing the window);
   //                with no tab open it falls through to the default.
-  //   Cmd/Ctrl-S — save the active tab (works regardless of focus, so
-  //                Cmd-S still saves when you've just clicked the tree).
+  //   Cmd/Ctrl-S — save the active tab (works regardless of which
+  //                element inside the pane has focus — tree, tab strip,
+  //                Monaco).
   useEffect(() => {
+    const container = viewContainerRef.current;
+    if (!container) {
+      return;
+    }
     const handleKeyDown = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) {
         return;
@@ -755,9 +764,9 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
         onSaveRef.current();
       }
     };
-    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    container.addEventListener("keydown", handleKeyDown, { capture: true });
     return () => {
-      window.removeEventListener("keydown", handleKeyDown, { capture: true });
+      container.removeEventListener("keydown", handleKeyDown, { capture: true });
     };
   }, [onCloseTab]);
 
@@ -1116,7 +1125,10 @@ export default function EditorModeView(props: { onExitToChat: () => void }) {
   });
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
+    <div
+      ref={viewContainerRef}
+      className="flex h-full min-h-0 flex-col bg-background text-foreground"
+    >
       <header className="flex h-[52px] shrink-0 items-center gap-3 border-b border-border px-4">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <FileCode2Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden />

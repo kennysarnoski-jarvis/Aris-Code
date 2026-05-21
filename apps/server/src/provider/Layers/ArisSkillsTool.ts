@@ -445,11 +445,33 @@ function buildDescription(skills: ReadonlyArray<Skill>): string {
 // Slash-command rewriting (32h)
 // ---------------------------------------------------------------------------
 
+/**
+ * Minimal Command shape consumed by slash-command dispatch. We import
+ * `Command` lazily-shaped (just `name` + `body`) so this module stays
+ * decoupled from `ArisCommandsLoader.ts` and its type surface — the
+ * caller adapts whatever the loader returns.
+ */
+export interface SlashCommandTarget {
+  readonly name: string;
+  readonly body: string;
+}
+
 export interface RewriteSlashCommandOptions {
   /** Raw user message text. */
   readonly text: string;
   /** Loaded skills, after project-precedence resolution. */
   readonly skills: ReadonlyArray<Skill>;
+  /**
+   * Loaded commands, after project-precedence resolution. Optional —
+   * callers that don't have the commands loader plumbed in (legacy
+   * code paths, tests) can omit this and the dispatcher falls back to
+   * skills-only behavior. When present, commands are matched AFTER
+   * skills — a `/foo` token tries skills first, then commands. This
+   * makes skills the more powerful surface (model+effort overrides,
+   * fork mode, allowed-tools) while keeping commands as the
+   * lightweight entry-point surface.
+   */
+  readonly commands?: ReadonlyArray<SlashCommandTarget>;
   /**
    * Optional shell-expansion config — same shape as the use_skill
    * tool. When present and `enabled: true`, the rewritten body has
@@ -460,38 +482,51 @@ export interface RewriteSlashCommandOptions {
 }
 
 export interface RewriteSlashCommandResult {
-  /** Canonical name of the skill that matched the slash prefix. */
+  /** Whether the slash prefix matched a skill or a command. */
+  readonly kind: "skill" | "command";
+  /**
+   * Canonical name of the matched target (skill or command).
+   * Field name kept as `skillName` for backward-compatibility with
+   * pre-commands-surface callers; the new `kind` field disambiguates.
+   */
   readonly skillName: string;
-  /** Args portion of the original message (whitespace after the skill name). */
+  /** Args portion of the original message (whitespace after the name). */
   readonly args: string;
-  /** Rewritten user message — the rendered skill body, ready to send to the model. */
+  /** Rewritten user message — the rendered body, ready to send to the model. */
   readonly text: string;
 }
 
 /**
- * Detect a `/skillname args...` prefix on the user's message and
- * rewrite the message into the rendered skill body.
+ * Detect a `/<name> args...` prefix on the user's message and rewrite
+ * the message into the rendered target body. Tries SKILLS first, then
+ * COMMANDS — a skill named `foo` shadows a command named `foo`.
  *
  *   "/debug stuck on websocket"   →   <rendered debug body with $ARGUMENTS="stuck on websocket">
  *
  * Returns `null` when the message either doesn't start with a slash
- * OR starts with a slash but the name doesn't match a loaded skill
- * (so a literal "/path/to/file" or "/help me" passes through
- * unchanged when there's no `path` or `help` skill — we don't
- * hijack arbitrary slashes).
+ * OR starts with a slash but the name doesn't match any loaded skill
+ * or command (so a literal "/path/to/file" or "/help me" passes
+ * through unchanged when there's no `path` or `help` target — we
+ * don't hijack arbitrary slashes).
  *
  * Recognized syntax:
  *   `/<name>`                — name only, args are empty
  *   `/<name> <args...>`      — name + free-form args (rest of message)
  *   `/<name>\n<args...>`     — same, multi-line args allowed
  *
- * Behavior matches `use_skill` for the inline path:
- *   - Tool-restriction prefix prepended when `allowed-tools` is set.
- *   - `$ARGUMENTS` and `$ARG_<NAME>` substitution applied.
- *   - Shell expansion applied when configured.
- *   - `context: fork` is ignored — slash-command dispatch is
- *     intentionally inline. The model sees the expanded prompt as
- *     the user's input and continues normally.
+ * Behavior:
+ *   SKILL path (full feature set):
+ *     - Tool-restriction prefix prepended when `allowed-tools` is set.
+ *     - `$ARGUMENTS` and `$ARG_<NAME>` substitution applied.
+ *     - Shell expansion applied when configured.
+ *     - `context: fork` is ignored — slash dispatch is intentionally
+ *       inline. The model sees the expanded prompt as the user's
+ *       input and continues normally.
+ *   COMMAND path (lightweight):
+ *     - No tool restrictions (commands don't declare allowed-tools).
+ *     - Same `$ARGUMENTS` / `$ARG_<NAME>` substitution.
+ *     - Same shell expansion when configured.
+ *     - Same directive framing prefix as skills.
  */
 export async function rewriteSlashCommand(
   opts: RewriteSlashCommandOptions,
@@ -499,42 +534,81 @@ export async function rewriteSlashCommand(
   // Match "/" + name token + optional whitespace + remainder. The
   // name token greedily consumes non-whitespace, which means
   // `/debug-stuck-on-ws` would treat the whole hyphenated string as
-  // the skill name. Skill names are usually short and not hyphen-
-  // heavy, so this is fine in practice; if it bites we can tighten
-  // the name pattern to `[A-Za-z0-9_-]+` later.
+  // the name. Names are usually short and not hyphen-heavy, so this
+  // is fine in practice; if it bites we can tighten the pattern to
+  // `[A-Za-z0-9_-]+` later.
   const match = /^\/(\S+)(?:[ \t]+([\s\S]*))?$/.exec(opts.text);
   if (!match) return null;
 
-  const skillName = match[1]!;
+  const name = match[1]!;
   const args = (match[2] ?? "").trim();
-  const skill = opts.skills.find((s) => s.name === skillName);
-  if (!skill) return null;
 
-  let rendered = renderSkillForDispatch(
-    skill.body,
-    args.length > 0 ? args : undefined,
-    skill.frontmatter.allowedTools,
-  );
-  if (opts.shellExpansion?.enabled) {
-    const expanded = await expandShellSubstitutions(rendered, opts.shellExpansion);
+  // Skills take precedence over commands.
+  const skill = opts.skills.find((s) => s.name === name);
+  if (skill) {
+    return finalizeRewrite({
+      kind: "skill",
+      name,
+      args,
+      rendered: renderSkillForDispatch(
+        skill.body,
+        args.length > 0 ? args : undefined,
+        skill.frontmatter.allowedTools,
+      ),
+      shellExpansion: opts.shellExpansion,
+    });
+  }
+
+  // Commands as the fallback. The body goes through the same
+  // `expandSkillBody` substitution helper (`$ARGUMENTS` / `$ARG_*`)
+  // so author UX is identical between the two surfaces.
+  const command = opts.commands?.find((c) => c.name === name);
+  if (command) {
+    return finalizeRewrite({
+      kind: "command",
+      name,
+      args,
+      rendered: expandSkillBody(command.body, args.length > 0 ? args : undefined),
+      shellExpansion: opts.shellExpansion,
+    });
+  }
+
+  return null;
+}
+
+/**
+ * Apply shell expansion (when enabled) and the directive framing
+ * prefix, then return the final `RewriteSlashCommandResult`. Shared
+ * between skill and command paths so framing stays bit-identical.
+ */
+async function finalizeRewrite(input: {
+  kind: "skill" | "command";
+  name: string;
+  args: string;
+  rendered: string;
+  shellExpansion: ShellExpansionOptions | undefined;
+}): Promise<RewriteSlashCommandResult> {
+  let rendered = input.rendered;
+  if (input.shellExpansion?.enabled) {
+    const expanded = await expandShellSubstitutions(rendered, input.shellExpansion);
     rendered = expanded.text;
   }
 
-  // Slice 32h refinement — frame the rendered body as a directive,
-  // not a definition. Without this prefix, skill bodies that read
-  // like documentation (which most do — "## When the user asks for
-  // X, run Y") confuse the model into describing the skill rather
-  // than executing it. The framing makes the intent unambiguous:
-  // the user invoked this skill and expects the workflow to run.
-  const argsLine = args.length > 0 ? ` with arguments: ${args}` : "";
+  // Frame the rendered body as a directive, not a definition. Without
+  // this prefix, bodies that read like documentation (which most do)
+  // confuse the model into describing the workflow rather than
+  // executing it. The framing makes intent unambiguous: the user
+  // invoked this thing and expects the workflow to run.
+  const argsLine = input.args.length > 0 ? ` with arguments: ${input.args}` : "";
+  const surfaceLabel = input.kind === "skill" ? "skill" : "command";
   const framedText =
-    `The user invoked the \`/${skillName}\` skill${argsLine}. ` +
+    `The user invoked the \`/${input.name}\` ${surfaceLabel}${argsLine}. ` +
     `Execute the workflow below now — don't describe it, run it. ` +
     `Follow the body's instructions step by step, calling tools as needed.\n\n` +
     `---\n\n` +
     rendered;
 
-  return { skillName, args, text: framedText };
+  return { kind: input.kind, skillName: input.name, args: input.args, text: framedText };
 }
 
 /**

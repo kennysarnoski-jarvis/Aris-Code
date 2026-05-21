@@ -180,10 +180,7 @@ const DiffPanelInlineSidebar = (props: {
  * cold-start bundle and only loads when the user first opens the
  * editor pane.
  */
-const EditorInlineSidebar = (props: {
-  editorOpen: boolean;
-  onCloseEditor: () => void;
-}) => {
+const EditorInlineSidebar = (props: { editorOpen: boolean; onCloseEditor: () => void }) => {
   const { editorOpen, onCloseEditor } = props;
   const onOpenChange = useCallback(
     (open: boolean) => {
