@@ -1260,6 +1260,27 @@ const makeDeepSeekAdapter = Effect.fn("makeDeepSeekAdapter")(function* () {
               } as AgentInputItem,
             ]
           : []),
+        // Parallel-tool-call instruction — adapted faithfully from
+        // Anthropic's own agent system prompt. Without this, DeepSeek
+        // defaults to emitting one tool call per response, so an N-tool
+        // task costs N sequential model round-trips ("tool, pause,
+        // tool, pause"). Claude batches independent calls into one
+        // response → one round-trip. The OpenAI Agents SDK loop and the
+        // `parallel_tool_calls` API default already permit batched
+        // calls; this is purely about getting the model to use the
+        // affordance. Stable per-thread → stays in the prefix-cache
+        // band with the other operational nudges.
+        {
+          role: "system" as const,
+          content:
+            "PARALLEL TOOL CALLS: When you intend to call multiple tools and " +
+            "there are no dependencies between the calls, make all of the " +
+            "independent calls in the same response — one assistant message " +
+            "carrying multiple tool_calls. Only call tools one at a time when a " +
+            "later call genuinely needs a previous call's result. Batching " +
+            "independent reads, searches, and lookups is faster and is the " +
+            "expected behavior — do not default to one tool call per turn.",
+        } as AgentInputItem,
         // Anti-fabrication nudge — small, late, separate system
         // message for maximum recency bias. The persona block at
         // index 0 has the longer version, but it gets buried as
